@@ -21,6 +21,7 @@
 #include <SFML/Graphics.hpp>
 #include <Eigen/Dense>
 #include<Settings.h>
+#include <fractals/Fractal.hpp>
 
 #define MAX_DIST 20.f
 #define MAX_MARCHES 1000
@@ -197,6 +198,8 @@ protected:
   void MakeCameraRotation();
 
 private:
+  std::unique_ptr<Fractal> Frac() const;
+
   float           time;
   int             cur_level;
   bool            is_fullrun;

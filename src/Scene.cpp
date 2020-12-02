@@ -17,6 +17,7 @@
 #include "Scene.h"
 #include "Res.h"
 #include <iostream>
+#include <fractals/FractalInclude.hpp>
 
 static const float PI = 3.14159265359f;
 static const float ground_force = 0.008f;
@@ -1026,6 +1027,27 @@ void Scene::WriteShader(ComputeShader& shader)
 	shader.setUniform("time", time);
 }
 
+std::unique_ptr<Fractal> Scene::Frac() const {
+  const float frac_scale = frac_params_smooth[0];
+  const float frac_angle1 = frac_params_smooth[1];
+  const float frac_angle2 = frac_params_smooth[2];
+  const Eigen::Vector3f frac_shift = frac_params_smooth.segment<3>(3);
+
+  std::vector<std::unique_ptr<FoldableBase>> inner_folds{};
+  inner_folds.emplace_back(std::make_unique<FoldAbs>());
+  inner_folds.emplace_back(std::make_unique<FoldRotate>(Axis::Z, frac_angle1));
+  inner_folds.emplace_back(std::make_unique<FoldMenger>());
+  inner_folds.emplace_back(std::make_unique<FoldRotate>(Axis::X, frac_angle2));
+  inner_folds.emplace_back(std::make_unique<FoldScaleTranslate>(frac_scale, frac_shift));
+
+  auto series = std::make_unique<FoldSeries>(std::move(inner_folds));
+  auto loop = std::make_unique<FoldRepeat>(level_copy.FractalIter, std::move(series));
+
+  return std::make_unique<Fractal>(std::move(loop),
+      std::make_unique<ObjectBox>(Eigen::Vector3f(6.0, 6.0, 6.0))
+  );
+}
+
 //Hard-coded to match the fractal
 float Scene::DE(const Eigen::Vector3f& pt) const {
   //Easier to work with names
@@ -1037,6 +1059,8 @@ float Scene::DE(const Eigen::Vector3f& pt) const {
 
   Eigen::Vector4f p;
   p << pt, 1.0f;
+  float final_value_copy = Frac()->DistanceEstimator(p);
+
   for (int i = 0; i < level_copy.FractalIter; ++i) {
     //absFold
     p.segment<3>(0) = p.segment<3>(0).cwiseAbs();
@@ -1064,7 +1088,9 @@ float Scene::DE(const Eigen::Vector3f& pt) const {
     p.segment<3>(0) += frac_shift;
   }
   const Eigen::Vector3f a = p.segment<3>(0).cwiseAbs() - Eigen::Vector3f(6.0f, 6.0f, 6.0f);
-  return (std::min(std::max(std::max(a.x(), a.y()), a.z()), 0.0f) + a.cwiseMax(0.0f).norm()) / p.w();
+  float final_val = (std::min(std::max(std::max(a.x(), a.y()), a.z()), 0.0f) + a.cwiseMax(0.0f).norm()) / p.w();
+  assert(final_val == final_value_copy);
+  return final_val;
 }
 
 //Hard-coded to match the fractal
@@ -1080,6 +1106,7 @@ Eigen::Vector3f Scene::NP(const Eigen::Vector3f& pt) const {
   p_hist.clear();
   Eigen::Vector4f p;
   p << pt, 1.0f;
+  auto np = Frac()->NearestPoint(p);
   //Fold the point, keeping history
   for (int i = 0; i < level_copy.FractalIter; ++i) {
     //absFold
@@ -1152,6 +1179,7 @@ Eigen::Vector3f Scene::NP(const Eigen::Vector3f& pt) const {
       n[2] = -n[2];
     }
   }
+  assert(np == n);
   return n;
 }
 
@@ -1232,6 +1260,7 @@ Eigen::Vector3f Scene::MouseRayCast(int mousex, int mousey, float min_dist)
 {
 	Eigen::Vector2f screen_pos = Eigen::Vector2f((float)mousex / (float)WinX,1.f - (float)mousey/ (float)WinY);
 
+	std::cerr << screen_pos << std::endl;
 	Eigen::Vector2f uv = 2 * screen_pos - Eigen::Vector2f(1.f, 1.f);
 	uv.x() *= (float)ResX / (float)ResY;
 
