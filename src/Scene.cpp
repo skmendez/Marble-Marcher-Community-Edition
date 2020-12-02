@@ -1050,137 +1050,16 @@ std::unique_ptr<Fractal> Scene::Frac() const {
 
 //Hard-coded to match the fractal
 float Scene::DE(const Eigen::Vector3f& pt) const {
-  //Easier to work with names
-  const float frac_scale = frac_params_smooth[0];
-  const float frac_angle1 = frac_params_smooth[1];
-  const float frac_angle2 = frac_params_smooth[2];
-  const Eigen::Vector3f frac_shift = frac_params_smooth.segment<3>(3);
-  const Eigen::Vector3f frac_color = frac_params_smooth.segment<3>(6);
-
   Eigen::Vector4f p;
   p << pt, 1.0f;
-  float final_value_copy = Frac()->DistanceEstimator(p);
-
-  for (int i = 0; i < level_copy.FractalIter; ++i) {
-    //absFold
-    p.segment<3>(0) = p.segment<3>(0).cwiseAbs();
-    //rotZ
-    const float rotz_c = std::cos(frac_angle1);
-    const float rotz_s = std::sin(frac_angle1);
-    const float rotz_x = rotz_c*p.x() + rotz_s*p.y();
-    const float rotz_y = rotz_c*p.y() - rotz_s*p.x();
-    p.x() = rotz_x; p.y() = rotz_y;
-    //mengerFold
-    float a = std::min(p.x() - p.y(), 0.0f);
-    p.x() -= a; p.y() += a;
-    a = std::min(p.x() - p.z(), 0.0f);
-    p.x() -= a; p.z() += a;
-    a = std::min(p.y() - p.z(), 0.0f);
-    p.y() -= a; p.z() += a;
-    //rotX
-    const float rotx_c = std::cos(frac_angle2);
-    const float rotx_s = std::sin(frac_angle2);
-    const float rotx_y = rotx_c*p.y() + rotx_s*p.z();
-    const float rotx_z = rotx_c*p.z() - rotx_s*p.y();
-    p.y() = rotx_y; p.z() = rotx_z;
-    //scaleTrans
-    p *= frac_scale;
-    p.segment<3>(0) += frac_shift;
-  }
-  const Eigen::Vector3f a = p.segment<3>(0).cwiseAbs() - Eigen::Vector3f(6.0f, 6.0f, 6.0f);
-  float final_val = (std::min(std::max(std::max(a.x(), a.y()), a.z()), 0.0f) + a.cwiseMax(0.0f).norm()) / p.w();
-  assert(final_val == final_value_copy);
-  return final_val;
+  return Frac()->DistanceEstimator(p);
 }
 
 //Hard-coded to match the fractal
 Eigen::Vector3f Scene::NP(const Eigen::Vector3f& pt) const {
-  //Easier to work with names
-  const float frac_scale = frac_params_smooth[0];
-  const float frac_angle1 = frac_params_smooth[1];
-  const float frac_angle2 = frac_params_smooth[2];
-  const Eigen::Vector3f frac_shift = frac_params_smooth.segment<3>(3);
-  const Eigen::Vector3f frac_color = frac_params_smooth.segment<3>(6);
-
-  static std::vector<Eigen::Vector4f, Eigen::aligned_allocator<Eigen::Vector4f>> p_hist;
-  p_hist.clear();
   Eigen::Vector4f p;
   p << pt, 1.0f;
-  auto np = Frac()->NearestPoint(p);
-  //Fold the point, keeping history
-  for (int i = 0; i < level_copy.FractalIter; ++i) {
-    //absFold
-    p_hist.push_back(p);
-    p.segment<3>(0) = p.segment<3>(0).cwiseAbs();
-    //rotZ
-    const float rotz_c = std::cos(frac_angle1);
-    const float rotz_s = std::sin(frac_angle1);
-    const float rotz_x = rotz_c*p.x() + rotz_s*p.y();
-    const float rotz_y = rotz_c*p.y() - rotz_s*p.x();
-    p.x() = rotz_x; p.y() = rotz_y;
-    //mengerFold
-    p_hist.push_back(p);
-    float a = std::min(p.x() - p.y(), 0.0f);
-    p.x() -= a; p.y() += a;
-    a = std::min(p.x() - p.z(), 0.0f);
-    p.x() -= a; p.z() += a;
-    a = std::min(p.y() - p.z(), 0.0f);
-    p.y() -= a; p.z() += a;
-    //rotX
-    const float rotx_c = std::cos(frac_angle2);
-    const float rotx_s = std::sin(frac_angle2);
-    const float rotx_y = rotx_c*p.y() + rotx_s*p.z();
-    const float rotx_z = rotx_c*p.z() - rotx_s*p.y();
-    p.y() = rotx_y; p.z() = rotx_z;
-    //scaleTrans
-    p *= frac_scale;
-    p.segment<3>(0) += frac_shift;
-  }
-  //Get the nearest point
-  Eigen::Vector3f n = p.segment<3>(0).cwiseMax(-6.0f).cwiseMin(6.0f);
-  //Then unfold the nearest point (reverse order)
-  for (int i = 0; i < level_copy.FractalIter; ++i) {
-    //scaleTrans
-    n.segment<3>(0) -= frac_shift;
-    n /= frac_scale;
-    //rotX
-    const float rotx_c = std::cos(-frac_angle2);
-    const float rotx_s = std::sin(-frac_angle2);
-    const float rotx_y = rotx_c*n.y() + rotx_s*n.z();
-    const float rotx_z = rotx_c*n.z() - rotx_s*n.y();
-    n.y() = rotx_y; n.z() = rotx_z;
-    //mengerUnfold
-    p = p_hist.back(); p_hist.pop_back();
-    const float mx = std::max(p[0], p[1]);
-    if (std::min(p[0], p[1]) < std::min(mx, p[2])) {
-      std::swap(n[1], n[2]);
-    }
-    if (mx < p[2]) {
-      std::swap(n[0], n[2]);
-    }
-    if (p[0] < p[1]) {
-      std::swap(n[0], n[1]);
-    }
-    //rotZ
-    const float rotz_c = std::cos(-frac_angle1);
-    const float rotz_s = std::sin(-frac_angle1);
-    const float rotz_x = rotz_c*n.x() + rotz_s*n.y();
-    const float rotz_y = rotz_c*n.y() - rotz_s*n.x();
-    n.x() = rotz_x; n.y() = rotz_y;
-    //absUnfold
-    p = p_hist.back(); p_hist.pop_back();
-    if (p[0] < 0.0f) {
-      n[0] = -n[0];
-    }
-    if (p[1] < 0.0f) {
-      n[1] = -n[1];
-    }
-    if (p[2] < 0.0f) {
-      n[2] = -n[2];
-    }
-  }
-  assert(np == n);
-  return n;
+  return Frac()->NearestPoint(p);
 }
 
 bool Scene::MarbleCollision(float& delta_v) {
