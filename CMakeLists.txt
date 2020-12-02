@@ -84,9 +84,12 @@ else()
 endif()
 
 #ADD A COMMAND TO COPY THE FILES FROM GAME_FOLDER TO COMPILATION FOLDER
-add_custom_command(TARGET MarbleMarcher PRE_BUILD
+add_custom_target(Assets)
+add_dependencies(MarbleMarcher Assets)
+
+add_custom_command(TARGET Assets PRE_BUILD
                    COMMAND ${CMAKE_COMMAND} -E copy_directory
-                       ${CMAKE_SOURCE_DIR}/game_folder $<TARGET_FILE_DIR:MarbleMarcher>)
+                       ${CMAKE_SOURCE_DIR}/game_folder ${CMAKE_CURRENT_BINARY_DIR})
 
 if(WIN32)
 	if(BIT EQUAL 32)
