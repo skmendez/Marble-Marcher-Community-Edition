@@ -1,6 +1,21 @@
 vec3 sky_color(in vec3 pos)
 {
 	pos = normalize(pos);
+
+	float x = pos.x;
+	float y = pos.y;
+	float z = pos.z;
+
+	float a = 0.0;
+	float b = 0.0;
+	      if ((abs(x)>=abs(y))&&(abs(x)>=abs(z))){ y/=x; z/=x; if (x>=0) x=1.0; else x=-1.0; a = y; b = z;}
+	else if ((abs(y)>=abs(x))&&(abs(y)>=abs(z))){ x/=y; z/=y; if (y>=0) y=1.0; else y=-1.0;  a = x; b = z;}
+	else if ((abs(z)>=abs(x))&&(abs(z)>=abs(y))){ x/=z; y/=z; if (z>=0) z=1.0; else z=-1.0;  a = x; b = y;}
+
+	vec2 textureCoord = vec2(a, b);
+
+	vec3 base_color = texture(iTexture2, (textureCoord + 1.0)/2.0).xyz;
+
 	// Atmosphere Scattering
 	vec3 fsun = LIGHT_DIRECTION;
 	float brightnees = exp(-sqrt(pow(abs(min(5*(pos.y-0.01),0)),2)+0.));
@@ -14,7 +29,10 @@ vec3 sky_color(in vec3 pos)
 	vec3 extinction = mix(exp(-exp(-((pos.y + fsun.y * 4.0) * (exp(-pos.y * 16.0) + 0.1) / 80.0) / Br) * (exp(-pos.y * 16.0) + 0.1) * Kr / Br) * exp(-pos.y * exp(-pos.y * 8.0 ) * 4.0) * exp(-pos.y * 2.0) * 4.0, vec3(1.0 - exp(fsun.y)) * 0.2, -fsun.y * 0.2 + 0.5);
 	vec3 sky_col = brightnees* 3.0 / (8.0 * 3.14) * (1.0 + mu * mu) * (Kr + Km * (1.0 - g * g) / (2.0 + g * g) / pow(1.0 + g * g - 2.0 * g * mu, 1.5)) / (Br + Bm) * extinction;
 	sky_col = 0.4*clamp(sky_col,0.001,15.);
-	return pow(sky_col,vec3(1.f/gamma_sky)); 
+	const float alpha = 0.0225;
+	const float beta = 1.0;
+
+	return pow(sky_col,vec3(1.f/gamma_sky)) * alpha + base_color * beta;
 }
 
 vec3 refraction(vec3 rd, vec3 n, float p) {

@@ -1,5 +1,6 @@
 uniform sampler2D iTexture0;
 uniform sampler2D iTexture1;
+uniform sampler2D iTexture2;
 
 ///Original MM distance estimators
 
