@@ -36,6 +36,11 @@ class FoldScaleTranslate : public FoldableBase {
     buf << "p.xyz += " << frac_shift_->GetGLSLVariable() << ";\n";
   }
 
+  void UpdateUniforms(unsigned int ProgramID) const override {
+    frac_scale_->UpdateUniform(ProgramID);
+    frac_shift_->UpdateUniform(ProgramID);
+  }
+
  private:
   std::shared_ptr<GLSLVariable<float>> frac_scale_;
   std::shared_ptr<GLSLVariable<Eigen::Vector3f>> frac_shift_;

@@ -33,6 +33,11 @@ class Fractal : public ObjectBase {
     base_->GLSL(buf);
   }
 
+  void UpdateUniforms(unsigned int ProgramID) const override {
+    fold_->UpdateUniforms(ProgramID);
+    base_->UpdateUniforms(ProgramID);
+  }
+
  private:
 
   std::unique_ptr<FoldableBase> fold_;

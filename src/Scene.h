@@ -186,6 +186,8 @@ public:
   sf::Sound sound_shatter;
   sf::SoundBuffer buff_shatter;
 
+  Fractal * getFrac() { return &frac_; }
+
 protected:
   void SetLevel(int level);
 

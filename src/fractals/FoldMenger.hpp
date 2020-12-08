@@ -46,6 +46,8 @@ class FoldMenger : public FoldableBase {
   void GLSL(GLSLFractalCode& buf) const override {
     buf << "mengerFold(p);\n";
   }
+
+  void UpdateUniforms(unsigned int ProgramID) const override {}
 };
 
 

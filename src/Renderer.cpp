@@ -9,7 +9,7 @@ Renderer::Renderer(int w, int h, std::string config_file)
 	Initialize(w, h, config_file);
 }
 
-Renderer::Renderer(std::string config_file)
+Renderer::Renderer(std::string config_file, Fractal *frac) : frac_(frac)
 {
 	LoadConfigs(config_file);
 }
@@ -146,7 +146,7 @@ void Renderer::Initialize(int w, int h, std::string config_f)
 	}
 
 	illumination_texture = GenerateTexture(width, height);
-	weight_shader = ComputeShader(compute_folder + "/auto_exposure/auto_exposure_weighting.glsl");
+	weight_shader = ComputeShader(compute_folder + "/auto_exposure/auto_exposure_weighting.glsl", frac_);
 
 	config.close();
 }
@@ -238,7 +238,7 @@ void Renderer::SetOutputTexture(sf::Texture & tex)
 
 void Renderer::LoadShader(std::string shader_file)
 {
-	shader_pipeline.push_back(ComputeShader(shader_file));
+	shader_pipeline.push_back(ComputeShader(shader_file, frac_));
 }
 
 std::vector<std::string> Renderer::GetConfigurationsList()

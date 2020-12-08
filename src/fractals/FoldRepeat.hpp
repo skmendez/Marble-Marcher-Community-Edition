@@ -43,6 +43,11 @@ class FoldRepeat : public FoldableBase {
     buf << "}\n";
   }
 
+  void UpdateUniforms(unsigned int ProgramID) const override {
+    iterations_->UpdateUniform(ProgramID);
+    inner_fold_->UpdateUniforms(ProgramID);
+  }
+
 
  private:
   std::shared_ptr<GLSLVariable<int>> iterations_;

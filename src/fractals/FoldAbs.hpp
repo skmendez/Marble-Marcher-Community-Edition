@@ -38,6 +38,8 @@ class FoldAbs : public FoldableBase {
   void GLSL(GLSLFractalCode& buf) const override {
     buf << "p.xyz = abs(p.xyz);\n";
   }
+
+  void UpdateUniforms(unsigned int ProgramID) const override {}
 };
 
 

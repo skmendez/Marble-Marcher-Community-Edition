@@ -72,12 +72,12 @@ float de_capsule(vec4 p, float h, float r) {
 //   Main DEs
 //##########################################
 
-#here frac
+#here <de>
+
+/*
 float de_fractal(vec4 p) {
 	float d = 1.0 / 0.0;
-	//mat2 rmZ = mat2(c1, s1, -s1, c1);
-	//mat2 rmX = mat2(c2, s2, -s2, c2);
-	for (int i = 0; i < FRACTAL_ITER; ++i) {
+	for (int iter_i = 0; iter_i < FRACTAL_ITER; iter_i++) {
 		p.xyz = abs(p.xyz);
 		p.xy *= iFracRot1;
 		mengerFold(p);
@@ -85,22 +85,10 @@ float de_fractal(vec4 p) {
 		p *= iFracScale;
 		p.xyz += iFracShift;
 	}
-	d = de_box(p, vec3(6, 6.0, 6.0));
+	d = de_box(p, vec3(6.00000, 6.00000, 6.00000));
 	return d;
 }
-/*
-float de_fractal(vec4 p) 
-{
-	for (int i = 0; i < FRACTAL_ITER; ++i) {
-		p.xyz = abs(p.xyz);
-		rotZ(p, s1, c1);
-		mengerFold(p);
-		rotX(p, s2, c2);
-		p *= iFracScale;
-		p.xyz += iFracShift;
-	}
-	return de_box(p, vec3(6.0));
-}*/
+*/
 
 vec4 col_fractal(vec4 p) 
 {

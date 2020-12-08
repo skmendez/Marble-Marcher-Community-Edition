@@ -27,6 +27,10 @@ class ObjectBox : public ObjectBase {
     buf << "d = de_box(p, " << box_shape_->GetGLSLVariable() << ");" << std::endl;
   }
 
+  void UpdateUniforms(unsigned int ProgramID) const override {
+    box_shape_->UpdateUniform(ProgramID);
+  }
+
  private:
   std::shared_ptr<GLSLVariable<Eigen::Vector3f>> box_shape_;
 };

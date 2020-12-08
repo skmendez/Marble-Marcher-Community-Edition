@@ -962,18 +962,21 @@ void Scene::WriteShader(ComputeShader& shader)
 	shader.setUniform("iMarbleRad", level_copy.marble_rad);
 	shader.setUniform("iFlagScale", level_copy.planet ? -level_copy.marble_rad : level_copy.marble_rad);
 
-  shader.setUniform(*g_frac_scale);
-	//shader.setUniform("iFracScale", frac_params_smooth[0]);
+	frac_.UpdateUniforms(shader.getNativeHandle());
 
-	shader.setUniform(*g_rot_mat1);
-  shader.setUniform(*g_rot_mat2);
+  //shader.setUniform(*g_frac_scale);
+  //shader.setUniform("iFracScale", frac_params_smooth[0]);
 
-	//shader.setUniform("iFracAng1", frac_params_smooth[1]);
-	//shader.setUniform("iFracAng2", frac_params_smooth[2]);
+  //shader.setUniform(*g_rot_mat1);
+  //shader.setUniform(*g_rot_mat2);
 
-	shader.setUniform(*g_frac_shift);
+  //shader.setUniform("iFracAng1", frac_params_smooth[1]);
+  //shader.setUniform("iFracAng2", frac_params_smooth[2]);
 
-	//shader.setUniform("iFracShift", vec3(frac_params_smooth[3], frac_params_smooth[4], frac_params_smooth[5]));
+  //shader.setUniform(*g_frac_shift);
+
+
+  //shader.setUniform("iFracShift", vec3(frac_params_smooth[3], frac_params_smooth[4], frac_params_smooth[5]));
 	shader.setUniform("iFracCol", vec3(frac_params_smooth[6], frac_params_smooth[7], frac_params_smooth[8]));
 
 	shader.setUniform("SHADOWS_ENABLED", Shadows_Enabled);

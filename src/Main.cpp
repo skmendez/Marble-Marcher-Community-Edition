@@ -76,12 +76,12 @@ int main(int argc, char *argv[]) {
 	
 	//all declarations
 	sf::RenderWindow window;
-  
-	Renderer rend(main_config);
-	sf::Texture main_txt, screenshot_txt;
-	
+
 	//Create the fractal scene
 	Scene scene(level_music);
+
+  Renderer rend(main_config, scene.getFrac());
+  sf::Texture main_txt, screenshot_txt;
 	//Create the old menus
 	Overlays overlays(&scene);
 	sf::Clock clock;

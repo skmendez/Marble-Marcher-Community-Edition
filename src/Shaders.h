@@ -23,6 +23,8 @@ namespace fs = std::filesystem;
 
 #ifdef _WIN32
 #include <Windows.h>
+#include <fractals/Fractal.hpp>
+
 #define ERROR_MSG(x) MessageBox(nullptr, TEXT(x), TEXT("ERROR"), MB_OK);
 #else
 #include<iostream>
@@ -37,9 +39,9 @@ public:
 	GLuint ProgramID;
 
 	ComputeShader();
-	ComputeShader(const std::string file_path);
+	ComputeShader(const std::string file_path, Fractal *frac);
 
-	void LoadShader(const std::string file_path);
+	void LoadShader(const std::string file_path, Fractal *frac);
 
 	void Run(vec2 global);
 
@@ -53,14 +55,14 @@ public:
 	void setUniform(int i, GLuint tid);
   template<typename T> void setUniform(GLSLUniform<T>& var) {
     glUseProgram(ProgramID);
-    var.SetUniform(ProgramID);
+    var.UpdateUniform(ProgramID);
   }
 	void setCameraObj(std::string name, gl_camera cam);
 	void setCamera(gl_camera cam);
 
 	GLuint getNativeHandle();
 
-	std::string PreprocessIncludes(const fs::path & filename, int level = 0);
+	std::string PreprocessIncludes(const fs::path& filename, Fractal *frac, int level = 0);
 
 	void SaveErrors(const fs::path & filename, std::string code, std::string errors);
 

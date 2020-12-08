@@ -1,3 +1,4 @@
+#include <fractals/GLSLCodeFactory.hpp>
 #include "Shaders.h"
 bool initialized = false;
 
@@ -13,9 +14,9 @@ ComputeShader::ComputeShader()
 
 }
 
-ComputeShader::ComputeShader(const std::string file_path)
+ComputeShader::ComputeShader(const std::string file_path, Fractal *frac)
 {
-	LoadShader(file_path);
+  LoadShader(file_path, frac);
 }
 
 std::string ComputeShader::LoadFileText(const fs::path& path)
@@ -42,13 +43,13 @@ void ComputeShader::Delete()
 }
 
 
-void ComputeShader::LoadShader(const std::string file_path)
+void ComputeShader::LoadShader(const std::string file_path, Fractal *frac)
 {
 		// Create the shaders
 		GLuint ComputeShaderID = glCreateShader(GL_COMPUTE_SHADER);
 
 		// Read the Compute Shader code from the file
-		std::string ComputeShaderCode = PreprocessIncludes(fs::path(file_path));
+		std::string ComputeShaderCode = PreprocessIncludes(fs::path(file_path), frac, 0);
 
 		GLint Result = GL_FALSE;
 		int InfoLogLength;
@@ -205,14 +206,15 @@ bool INIT()
 }
 
 
-std::string ComputeShader::PreprocessIncludes(const fs::path& filename, int level /*= 0 */)
+std::string ComputeShader::PreprocessIncludes(const fs::path& filename, Fractal *frac, int level /*= 0 */)
 {
 	if (level > 32)
 		ERROR_MSG("Header inclusion depth limit reached, might be caused by cyclic header inclusion");
 	using namespace std;
 
 	//match regular expression
-	static const regex re(R"(^[ ]*#include\s*["<](.*)[">].*)");
+	static const regex include_re(R"(^[ ]*#include\s*["<](.*)[">].*)");
+	static const regex fractal_re(R"(^[ ]*#here\s+<(.*)>.*)");
 	stringstream input;
 	stringstream output;
 	input << LoadFileText(filename);
@@ -221,11 +223,16 @@ std::string ComputeShader::PreprocessIncludes(const fs::path& filename, int leve
 	string line;
 	while (std::getline(input, line))
 	{
-		if (regex_search(line, matches, re))
+		if (regex_search(line, matches, include_re))
 		{
 			//add the code from the included file
 			std::string include_file = compute_folder + "/" + matches[1].str();
-			output << PreprocessIncludes(include_file, level + 1) << endl;
+			output << PreprocessIncludes(include_file, frac, level + 1) << endl;
+		} else if (regex_search(line, matches, fractal_re)) {
+      std::string pos_type = matches[1].str(); // Either de or col
+      if (pos_type == "de") {
+        output << GLSLCodeFactory::GenerateDistanceEstimator(*frac) << endl;
+      }
 		}
 		else
 		{

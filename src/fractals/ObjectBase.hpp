@@ -14,6 +14,7 @@ class ObjectBase : public GLSLBase {
   [[nodiscard]] virtual float DistanceEstimator(Eigen::Vector4f p) const = 0;
   [[nodiscard]] virtual Eigen::Vector3f NearestPoint(Eigen::Vector4f p) const = 0;
   void GLSL(GLSLFractalCode& buf) const override = 0;
+  void UpdateUniforms(unsigned int ProgramID) const override = 0;
 };
 
 

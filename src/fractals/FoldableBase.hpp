@@ -21,8 +21,7 @@ class FoldableBase : public GLSLBase {
 
   virtual void Unfold(FoldHistory& p_hist, Eigen::Vector3f& n) const = 0;
   virtual void GLSL(GLSLFractalCode& buf) const = 0;
- private:
-
+  void UpdateUniforms(unsigned int ProgramID) const override = 0;
 };
 
 #endif //FOLDABLEBASE_HPP_

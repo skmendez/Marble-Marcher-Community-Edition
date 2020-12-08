@@ -36,6 +36,12 @@ class FoldSeries : public FoldableBase {
     }
   }
 
+  void UpdateUniforms(unsigned int ProgramID) const override {
+    for (auto it = inner_folds_.begin(); it != inner_folds_.end(); ++it) {
+      it->get()->UpdateUniforms(ProgramID);
+    }
+  }
+
  private:
   std::vector<std::unique_ptr<FoldableBase>> inner_folds_;
 };

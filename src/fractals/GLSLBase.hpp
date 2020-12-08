@@ -25,11 +25,19 @@ class GLSLFractalCode : private std::streambuf, public std::ostream {
     return ss_.str();
   }
 
+  void SetPassType(bool is_color) {
+    is_color_ = is_color;
+  }
+
+  bool isColorPass() const {
+    return is_color_;
+  }
+
  protected:
   int overflow(int ch) override {
     if (start_of_line && ch != '\n') {
       for (int i = 0; i < indent_length; i++) {
-        ss_.put(' ');
+        ss_.put(indent_char_);
       }
     }
     start_of_line = ch == '\n';
@@ -38,16 +46,19 @@ class GLSLFractalCode : private std::streambuf, public std::ostream {
   }
 
  private:
+  bool is_color_ = false;
   std::stringstream ss_{};
   bool start_of_line = true;
   int indent_length = 0;
-  static const int indent_amount_ = 4;
+  static const int indent_amount_ = 1;
+  static const char indent_char_ = '\t';
 };
 
 
 class GLSLBase {
  public:
   virtual void GLSL(GLSLFractalCode& buf) const = 0;
+  virtual void UpdateUniforms(unsigned int ProgramID) const = 0;
 };
 
 

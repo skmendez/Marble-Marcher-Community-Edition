@@ -30,14 +30,22 @@ class FoldRotate : public FoldableBase {
     switch (rotation_axis_) {
       case Axis::X:
         vars = "yz";
+        break;
       case Axis::Y:
         vars = "xz";
+        break;
       case Axis::Z:
         vars = "xy";
+        break;
     }
 
     buf << "p." << vars << " *= " << rot_mat_->GetGLSLVariable() << ";\n";
   }
+
+  void UpdateUniforms(unsigned int ProgramID) const override {
+    rot_mat_->UpdateUniform(ProgramID);
+  }
+
  private:
   Eigen::Vector3f Rotate(bool unrotate, Eigen::Vector3f p) const {
     // We'll assume that we are rotating on the X plane by default;
@@ -59,7 +67,6 @@ class FoldRotate : public FoldableBase {
     return static_cast<Axis>((orig + rotation_axis_) % 3);
   }
 
- private:
   const Axis rotation_axis_;
   std::shared_ptr<GLSLVariable<Eigen::Matrix2f>> rot_mat_;
 };
