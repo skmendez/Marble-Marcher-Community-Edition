@@ -18,13 +18,13 @@ ComputeShader::ComputeShader(const std::string file_path)
 	LoadShader(file_path);
 }
 
-std::string ComputeShader::LoadFileText(fs::path path)
+std::string ComputeShader::LoadFileText(const fs::path& path)
 {
 	std::string text;
 	std::ifstream TextStream(path, std::ios::in);
 	if (TextStream.is_open())
 	{
-		std::string Line = "";
+		std::string Line;
 		while (getline(TextStream, Line))
 			text += Line + "\n";
 		TextStream.close();
@@ -154,6 +154,12 @@ void ComputeShader::setUniform(int i, GLuint tid)
 	glUniform1i(A, i);
 }
 
+template <typename T>
+void ComputeShader::setUniform(const GLSLUniform<T>& var) {
+  glUseProgram(ProgramID);
+  var.SetUniform(ProgramID);
+}
+
 void ComputeShader::setCameraObj(std::string name, gl_camera cam)
 {
 	setUniform(name + ".position", cam.position);
@@ -212,7 +218,7 @@ std::string ComputeShader::PreprocessIncludes(const fs::path& filename, int leve
 	using namespace std;
 
 	//match regular expression
-	static const regex re("^[ ]*#include\\s*[\"<](.*)[\">].*");
+	static const regex re(R"(^[ ]*#include\s*["<](.*)[">].*)");
 	stringstream input;
 	stringstream output;
 	input << LoadFileText(filename);

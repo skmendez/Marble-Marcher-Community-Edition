@@ -9,40 +9,45 @@
 #include <ostream>
 #include <iostream>
 
-class IndentableOStreamBuf : private std::streambuf, public std::ostream {
+class GLSLFractalCode : private std::streambuf, public std::ostream {
  public:
-  explicit IndentableOStreamBuf(std::ostream& dest) : std::ostream(this), dest_(dest) {}
+  explicit GLSLFractalCode() : std::ostream(this) {}
   void IncreaseIndent() {
-    myIndent = std::string(myIndent.size() + indent_amount_, ' ');
+    indent_length += indent_amount_;
   }
 
   void DecreaseIndent() {
-    assert(myIndent.size() >= indent_amount_);
-    myIndent = std::string(myIndent.size() - indent_amount_, ' ');
+    assert(indent_length >= indent_amount_);
+    indent_length = std::max(indent_length - indent_amount_, 0);
+  }
+
+  [[nodiscard]] std::string get() const {
+    return ss_.str();
   }
 
  protected:
-  virtual int overflow(int ch) {
-    if (myIsAtStartOfLine && ch != '\n') {
-      dest_.write(myIndent.data(), myIndent.size());
+  int overflow(int ch) override {
+    if (start_of_line && ch != '\n') {
+      for (int i = 0; i < indent_length; i++) {
+        ss_.put(' ');
+      }
     }
-    myIsAtStartOfLine = ch == '\n';
-    dest_.put(ch);
+    start_of_line = ch == '\n';
+    ss_.put(ch);
     return ch;
   }
 
-
  private:
-  std::ostream& dest_;
-  bool myIsAtStartOfLine = true;
-  std::string myIndent = std::string();
-static const int indent_amount_ = 4;
+  std::stringstream ss_{};
+  bool start_of_line = true;
+  int indent_length = 0;
+  static const int indent_amount_ = 4;
 };
 
 
 class GLSLBase {
  public:
-  virtual void GLSL(IndentableOStreamBuf& buf) = 0;
+  virtual void GLSL(GLSLFractalCode& buf) const = 0;
 };
 
 

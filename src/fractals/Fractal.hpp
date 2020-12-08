@@ -14,24 +14,26 @@ class Fractal : public ObjectBase {
   Fractal(std::unique_ptr<FoldableBase> fold, std::unique_ptr<ObjectBase> base) :
   fold_(std::move(fold)), base_(std::move(base)) {}
 
-  float DistanceEstimator(Eigen::Vector4f p) override {
+  float DistanceEstimator(Eigen::Vector4f p) const override {
     fold_->Fold(p);
     return base_->DistanceEstimator(p);
   }
 
-  Eigen::Vector3f NearestPoint(Eigen::Vector4f p) override {
+  Eigen::Vector3f NearestPoint(Eigen::Vector4f p) const override {
     static FoldHistory p_hist;
     p_hist.clear();
     fold_->Fold(p, p_hist);
-
     Eigen::Vector3f n = base_->NearestPoint(p);
-
     fold_->Unfold(p_hist, n);
     return n;
   }
 
- private:
+  void GLSL(GLSLFractalCode& buf) const override {
+    fold_->GLSL(buf);
+    base_->GLSL(buf);
+  }
 
+ private:
 
   std::unique_ptr<FoldableBase> fold_;
   std::unique_ptr<ObjectBase> base_;

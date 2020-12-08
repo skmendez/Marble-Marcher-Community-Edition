@@ -12,16 +12,16 @@ class FoldAbs : public FoldableBase {
  public:
   FoldAbs() {}
 
-  void Fold(Eigen::Vector4f& p) override {
+  void Fold(Eigen::Vector4f& p) const override {
     p.segment<3>(0) = p.segment<3>(0).cwiseAbs();
   }
 
-  void Fold(Eigen::Vector4f& p, FoldHistory& p_hist) override {
+  void Fold(Eigen::Vector4f& p, FoldHistory& p_hist) const override {
     p_hist.push_back(p);
     Fold(p);
   }
 
-  void Unfold(FoldHistory& p_hist, Eigen::Vector3f& n) override {
+  void Unfold(FoldHistory& p_hist, Eigen::Vector3f& n) const override {
     Eigen::Vector4f p = p_hist.back(); p_hist.pop_back();
 
     if (p[0] < 0.0f) {
@@ -35,7 +35,9 @@ class FoldAbs : public FoldableBase {
     }
   }
 
-
+  void GLSL(GLSLFractalCode& buf) const override {
+    buf << "p.xyz = abs(p.xyz);\n";
+  }
 };
 
 

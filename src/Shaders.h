@@ -5,6 +5,7 @@
 #include <GL/glew.h>
 #endif
 
+#include <fractals/GLSLVariable.hpp>
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <SFML/Graphics.hpp>
@@ -50,6 +51,7 @@ public:
 	void setUniform(std::string name, glm::vec3 X);
 	void setUniform(std::string name, glm::vec2 X);
 	void setUniform(int i, GLuint tid);
+  template<typename T> void setUniform(const GLSLUniform<T>& var);
 	void setCameraObj(std::string name, gl_camera cam);
 	void setCamera(gl_camera cam);
 
@@ -59,7 +61,7 @@ public:
 
 	void SaveErrors(const fs::path & filename, std::string code, std::string errors);
 
-	std::string LoadFileText(fs::path path);
+	std::string LoadFileText(const fs::path& path);
 
 	void Delete();
 

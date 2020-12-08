@@ -17,7 +17,6 @@
 #include "Scene.h"
 #include "Res.h"
 #include <iostream>
-#include <fractals/FractalInclude.hpp>
 
 static const float PI = 3.14159265359f;
 static const float ground_force = 0.008f;
@@ -250,6 +249,22 @@ Scene::Scene(sf::Music* level_music) :
 }
 Eigen::Vector3f Scene::GetVelocity() {
 	return marble_vel;
+}
+
+Fractal Scene::GetInitialFrac() const {
+
+  std::vector<std::unique_ptr<FoldableBase>> inner_folds{};
+  inner_folds.emplace_back(std::make_unique<FoldAbs>());
+  inner_folds.emplace_back(std::make_unique<FoldRotate>(Axis::Z, g_rot_mat1));
+  inner_folds.emplace_back(std::make_unique<FoldMenger>());
+  inner_folds.emplace_back(std::make_unique<FoldRotate>(Axis::X, g_rot_mat2));
+  inner_folds.emplace_back(std::make_unique<FoldScaleTranslate>(g_frac_scale, g_frac_shift));
+
+  auto series = std::make_unique<FoldSeries>(std::move(inner_folds));
+  auto loop = std::make_unique<FoldRepeat>(g_frac_iter, std::move(series));
+
+  auto box = std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(6.0, 6.0, 6.0));
+  return Fractal{std::move(loop), std::make_unique<ObjectBox>(box)};
 }
 
 void Scene::LoadLevel(int level) {
@@ -1027,42 +1042,49 @@ void Scene::WriteShader(ComputeShader& shader)
 	shader.setUniform("time", time);
 }
 
-std::unique_ptr<Fractal> Scene::Frac() const {
-  const float frac_scale = frac_params_smooth[0];
+void Scene::UpdateFrac() {
+  g_frac_iter->SetVar(level_copy.FractalIter);
+  g_frac_scale->SetVar(frac_params_smooth[0]);
   const float frac_angle1 = frac_params_smooth[1];
+  Eigen::Matrix2f mat1;
+  const float c1 = cos(frac_angle1);
+  const float s1 = sin(frac_angle1);
+  mat1 << c1, s1, -s1, c1;
   const float frac_angle2 = frac_params_smooth[2];
+  Eigen::Matrix2f mat2;
+  const float c2 = cos(frac_angle2);
+  const float s2 = sin(frac_angle2);
+  mat2 << c2, s2, -s2, c2;
+
+  g_rot_mat1->SetVar(mat1);
+  g_rot_mat2->SetVar(mat2);
+
   const Eigen::Vector3f frac_shift = frac_params_smooth.segment<3>(3);
-
-  std::vector<std::unique_ptr<FoldableBase>> inner_folds{};
-  inner_folds.emplace_back(std::make_unique<FoldAbs>());
-  inner_folds.emplace_back(std::make_unique<FoldRotate>(Axis::Z, frac_angle1));
-  inner_folds.emplace_back(std::make_unique<FoldMenger>());
-  inner_folds.emplace_back(std::make_unique<FoldRotate>(Axis::X, frac_angle2));
-  inner_folds.emplace_back(std::make_unique<FoldScaleTranslate>(frac_scale, frac_shift));
-
-  auto series = std::make_unique<FoldSeries>(std::move(inner_folds));
-  auto loop = std::make_unique<FoldRepeat>(level_copy.FractalIter, std::move(series));
-
-  return std::make_unique<Fractal>(std::move(loop),
-      std::make_unique<ObjectBox>(Eigen::Vector3f(6.0, 6.0, 6.0))
-  );
+  g_frac_shift->SetVar(frac_shift);
 }
 
 //Hard-coded to match the fractal
 float Scene::DE(const Eigen::Vector3f& pt) const {
   Eigen::Vector4f p;
   p << pt, 1.0f;
-  return Frac()->DistanceEstimator(p);
+  static bool printed = false;
+  if (!printed) {
+    auto code = GLSLCodeFactory::GenerateDistanceEstimator(frac_);
+    std::cerr << code << std::endl;
+    printed = true;
+  }
+  return frac_.DistanceEstimator(p);
 }
 
 //Hard-coded to match the fractal
 Eigen::Vector3f Scene::NP(const Eigen::Vector3f& pt) const {
   Eigen::Vector4f p;
   p << pt, 1.0f;
-  return Frac()->NearestPoint(p);
+  return frac_.NearestPoint(p);
 }
 
 bool Scene::MarbleCollision(float& delta_v) {
+  UpdateFrac();
   //Check if the distance estimate indicates a collision
   const float de = DE(marble_pos);
   if (de >= marble_rad) {

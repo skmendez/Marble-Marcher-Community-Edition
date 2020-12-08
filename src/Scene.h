@@ -17,11 +17,12 @@
 #pragma once
 
 #include "Level.h"
+#include <Eigen/Dense>
+#include <fractals/FractalInclude.hpp>
+#include <fractals/GLSLCodeFactory.hpp>
 #include <SFML/Audio.hpp>
 #include <SFML/Graphics.hpp>
-#include <Eigen/Dense>
 #include<Settings.h>
-#include <fractals/Fractal.hpp>
 
 #define MAX_DIST 20.f
 #define MAX_MARCHES 1000
@@ -198,7 +199,23 @@ protected:
   void MakeCameraRotation();
 
 private:
-  std::unique_ptr<Fractal> Frac() const;
+  Fractal Scene::GetInitialFrac() const;
+  std::shared_ptr<GLSLUniform<float>> g_frac_scale =
+      std::make_shared<GLSLUniform<float>>(0, "iFracScale");
+
+  std::shared_ptr<GLSLUniform<Eigen::Vector3f>> g_frac_shift =
+      std::make_shared<GLSLUniform<Eigen::Vector3f>>(Eigen::Vector3f{}, "iFracShift");
+
+  std::shared_ptr<GLSLUniform<int>> g_frac_iter =
+      std::make_shared<GLSLUniform<int>>(0, "FRACTAL_ITER");
+
+  std::shared_ptr<GLSLUniform<Eigen::Matrix2f>> g_rot_mat1 =
+      std::make_shared<GLSLUniform<Eigen::Matrix2f>>(Eigen::Matrix2f{}, "iFracRot1");
+
+  std::shared_ptr<GLSLUniform<Eigen::Matrix2f>> g_rot_mat2 =
+      std::make_shared<GLSLUniform<Eigen::Matrix2f>>(Eigen::Matrix2f{}, "iFracRot2");
+
+  Fractal frac_ = GetInitialFrac();
 
   float           time;
   int             cur_level;
@@ -243,6 +260,8 @@ private:
   bool            disable_motion;
   bool            zoom_to_scale;
   float			  gravity;
+
+  void UpdateFrac();
 };
 
 int * GetReplayFrame();

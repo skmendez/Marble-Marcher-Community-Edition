@@ -12,19 +12,23 @@
 
 class ObjectBox : public ObjectBase {
  public:
-  explicit ObjectBox(Eigen::Vector3f box_shape) : box_shape_(std::move(box_shape)) {}
+  explicit ObjectBox(std::shared_ptr<GLSLVariable<Eigen::Vector3f>> box_shape) : box_shape_(std::move(box_shape)) {}
 
-  float DistanceEstimator(Eigen::Vector4f p) override {
-    const Eigen::Vector3f a = p.segment<3>(0).cwiseAbs() - box_shape_;
+  float DistanceEstimator(Eigen::Vector4f p) const override {
+    const Eigen::Vector3f a = p.segment<3>(0).cwiseAbs() - box_shape_->GetVar();
     return (std::min(std::max(std::max(a.x(), a.y()), a.z()), 0.0f) + a.cwiseMax(0.0f).norm()) / p.w();
   }
 
-  Eigen::Vector3f NearestPoint(Eigen::Vector4f p) override {
-    return p.segment<3>(0).cwiseMax(-box_shape_).cwiseMin(box_shape_);
+  Eigen::Vector3f NearestPoint(Eigen::Vector4f p) const override {
+    return p.segment<3>(0).cwiseMax(-box_shape_->GetVar()).cwiseMin(box_shape_->GetVar());
+  }
+
+  void GLSL(GLSLFractalCode& buf) const override {
+    buf << "d = de_box(p, " << box_shape_->GetGLSLVariable() << ");" << std::endl;
   }
 
  private:
-  Eigen::Vector3f box_shape_;
+  std::shared_ptr<GLSLVariable<Eigen::Vector3f>> box_shape_;
 };
 
 

@@ -14,7 +14,7 @@ class FoldMenger : public FoldableBase {
  public:
   FoldMenger() = default;
 
-  void Fold(Eigen::Vector4f& p) override {
+  void Fold(Eigen::Vector4f& p) const override {
     float a = std::min(p.x() - p.y(), 0.0f);
     p.x() -= a; p.y() += a;
     a = std::min(p.x() - p.z(), 0.0f);
@@ -23,12 +23,12 @@ class FoldMenger : public FoldableBase {
     p.y() -= a; p.z() += a;
   }
 
-  void Fold(Eigen::Vector4f& p, FoldHistory& p_hist) override {
+  void Fold(Eigen::Vector4f& p, FoldHistory& p_hist) const override {
     p_hist.push_back(p);
     Fold(p);
   }
 
-  void Unfold(FoldHistory& p_hist, Eigen::Vector3f& n) override {
+  void Unfold(FoldHistory& p_hist, Eigen::Vector3f& n) const override {
     Eigen::Vector4f p = p_hist.back(); p_hist.pop_back();
 
     const float mx = std::max(p[0], p[1]);
@@ -41,6 +41,10 @@ class FoldMenger : public FoldableBase {
     if (p[0] < p[1]) {
       std::swap(n[0], n[1]);
     }
+  }
+
+  void GLSL(GLSLFractalCode& buf) const override {
+    buf << "mengerFold(p);\n";
   }
 };
 
