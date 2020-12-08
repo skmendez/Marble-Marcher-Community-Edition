@@ -9,6 +9,7 @@
 #include "FoldAbs.hpp"
 #include "FoldMenger.hpp"
 #include "FoldModulo.hpp"
+#include "FoldPlane.hpp"
 #include "FoldRepeat.hpp"
 #include "FoldRotate.hpp"
 #include "FoldSeries.hpp"

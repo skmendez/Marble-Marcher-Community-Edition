@@ -288,6 +288,8 @@ std::shared_ptr<ObjectBase> Scene::GetInitialObject() const {
 
   auto fractal2 = std::make_unique<Fractal>(std::move(mod_series), std::move(smol_box));
 
+  return MengerSponge(g_frac_iter);
+
   return BlackRepeatingCubesInSphere();
 
   auto fractal = std::make_unique<Fractal>(std::move(series2), std::make_unique<ObjectBox>(std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(6.0, 6.0, 6.0))));
