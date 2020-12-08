@@ -18,7 +18,7 @@
 
 #include "Level.h"
 #include <Eigen/Dense>
-#include <fractals/FractalInclude.hpp>
+#include <fractals/ObjectBase.hpp>
 #include <fractals/GLSLCodeFactory.hpp>
 #include <SFML/Audio.hpp>
 #include <SFML/Graphics.hpp>

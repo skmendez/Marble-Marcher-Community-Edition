@@ -8,6 +8,8 @@
 #include "GLSLBase.hpp"
 #include "GLSLVariable.hpp"
 
+enum Axis {X = 0, Y = 1, Z = 2};
+
 using FoldHistory = std::vector<Eigen::Vector4f, Eigen::aligned_allocator<Eigen::Vector4f>>;
 
 class FoldableBase : public GLSLBase {

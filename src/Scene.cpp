@@ -16,6 +16,8 @@
 */
 #include "Scene.h"
 #include "Res.h"
+#include <fractals/FractalInclude.hpp>
+#include <fractals/StaticFractals.hpp>
 #include <iostream>
 
 static const float PI = 3.14159265359f;
@@ -272,13 +274,25 @@ std::shared_ptr<ObjectBase> Scene::GetInitialObject() const {
   outer_elements.emplace_back(std::move(loop));
   auto series2 = std::make_unique<FoldSeries>(std::move(outer_elements));
 
-  auto box = std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(6.0, 6.0, 6.0));
+  auto modulus_size = std::make_shared<GLSLConstant<float>>(1.0);
 
-  auto smol_box = std::make_unique<ObjectBox>(std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(2.0, 6.0, 2.0)));
+  auto smol_box = std::make_unique<ObjectBox>(std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(0.02, 0.02, 0.02)));
+  std::vector<std::unique_ptr<FoldableBase>> mod_folds{};
 
-  auto fractal = std::make_unique<Fractal>(std::move(series2), std::make_unique<ObjectBox>(box));
 
-  return std::make_shared<ObjectClosest>(std::move(smol_box), std::move(fractal));
+  mod_folds.emplace_back(std::make_unique<FoldModulo>(Axis::X, modulus_size));
+  mod_folds.emplace_back(std::make_unique<FoldModulo>(Axis::Y, modulus_size));
+  mod_folds.emplace_back(std::make_unique<FoldModulo>(Axis::Z, modulus_size));
+
+  auto mod_series = std::make_unique<FoldSeries>(std::move(mod_folds));
+
+  auto fractal2 = std::make_unique<Fractal>(std::move(mod_series), std::move(smol_box));
+
+  return BlackRepeatingCubesInSphere();
+
+  auto fractal = std::make_unique<Fractal>(std::move(series2), std::make_unique<ObjectBox>(std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(6.0, 6.0, 6.0))));
+
+  return std::make_shared<ObjectClosest>(std::move(fractal2), std::move(fractal));
 }
 
 void Scene::LoadLevel(int level) {

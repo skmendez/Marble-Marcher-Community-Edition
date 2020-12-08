@@ -2,24 +2,24 @@
 // Created by Sebastian on 12/8/2020.
 //
 
-#ifndef OBJECTCLOSEST_HPP_
-#define OBJECTCLOSEST_HPP_
+#ifndef OBJECTINTERSECT_HPP_
+#define OBJECTINTERSECT_HPP_
 
 #include "ObjectBase.hpp"
 
-class ObjectClosest : public ObjectBase {
+class ObjectIntersect : public ObjectBase {
  public:
-  ObjectClosest(std::unique_ptr<ObjectBase> left, std::unique_ptr<ObjectBase> right) :
-    left_(std::move(left)), right_(std::move(right)) {}
+  ObjectIntersect(std::unique_ptr<ObjectBase> left, std::unique_ptr<ObjectBase> right) :
+      left_(std::move(left)), right_(std::move(right)) {}
 
   float DistanceEstimator(Eigen::Vector4f p) const override {
-    return std::min(left_->DistanceEstimator(p), right_->DistanceEstimator(p));
+    return std::max(left_->DistanceEstimator(p), right_->DistanceEstimator(p));
   }
 
   Eigen::Vector3f NearestPoint(Eigen::Vector4f p) const override {
     float left_dist = left_->DistanceEstimator(p);
     float right_dist = right_->DistanceEstimator(p);
-    if (left_dist < right_dist) {
+    if (left_dist > right_dist) {
       return left_->NearestPoint(p);
     } else {
       return right_->NearestPoint(p);
@@ -35,7 +35,7 @@ class ObjectClosest : public ObjectBase {
       buf << "vec3 old_orbit = orbit;\n";
     }
     right_->GLSL(buf);
-    buf << "if (old_d < d) { d = old_d; ";
+    buf << "if (old_d > d) { d = old_d; ";
     if (buf.isColorPass()) {
       buf << " orbit = old_orbit; ";
     }
@@ -48,10 +48,9 @@ class ObjectClosest : public ObjectBase {
   }
 
  private:
-
   std::unique_ptr<ObjectBase> left_;
   std::unique_ptr<ObjectBase> right_;
 };
 
 
-#endif //OBJECTCLOSEST_HPP_
+#endif //OBJECTINTERSECT_HPP_

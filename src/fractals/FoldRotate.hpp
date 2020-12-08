@@ -5,8 +5,6 @@
 #ifndef FOLDROTATE_HPP_
 #define FOLDROTATE_HPP_
 
-enum Axis {X = 0, Y = 1, Z = 2};
-
 #include <utility>
 
 #include "FoldableBase.hpp"
