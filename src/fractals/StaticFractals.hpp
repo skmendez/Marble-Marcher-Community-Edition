@@ -11,10 +11,12 @@
 
 std::unique_ptr<ObjectBase> BlackRepeatingCubes() {
 
-  auto modulus_size = std::make_shared<GLSLConstant<float>>(1.0);
-  auto smol_box = std::make_unique<ObjectBox>(std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(0.02, 0.02, 0.02)));
+  auto modulus_size = std::make_shared<GLSLConstant<float>>(0.75f);
+  auto smol_box = std::make_unique<ObjectSphere>(std::make_shared<GLSLConstant<float>>(0.1f));
 
   std::vector<std::unique_ptr<FoldableBase>> mod_folds{};
+  mod_folds.emplace_back(std::make_unique<OrbitInit>(
+      std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(.90f, 0.80f, 0.56f))));
   mod_folds.emplace_back(std::make_unique<FoldModulo>(Axis::X, modulus_size));
   mod_folds.emplace_back(std::make_unique<FoldModulo>(Axis::Y, modulus_size));
   mod_folds.emplace_back(std::make_unique<FoldModulo>(Axis::Z, modulus_size));
@@ -23,6 +25,8 @@ std::unique_ptr<ObjectBase> BlackRepeatingCubes() {
 
   return std::make_unique<Fractal>(std::move(mod_series), std::move(smol_box));
 }
+
+
 
 std::unique_ptr<ObjectBase> BlackRepeatingCubesInSphere() {
   auto cubes = BlackRepeatingCubes();

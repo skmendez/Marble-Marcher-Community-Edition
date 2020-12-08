@@ -276,25 +276,9 @@ std::shared_ptr<ObjectBase> Scene::GetInitialObject() const {
 
   auto modulus_size = std::make_shared<GLSLConstant<float>>(1.0);
 
-  auto smol_box = std::make_unique<ObjectBox>(std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(0.02, 0.02, 0.02)));
-  std::vector<std::unique_ptr<FoldableBase>> mod_folds{};
-
-
-  mod_folds.emplace_back(std::make_unique<FoldModulo>(Axis::X, modulus_size));
-  mod_folds.emplace_back(std::make_unique<FoldModulo>(Axis::Y, modulus_size));
-  mod_folds.emplace_back(std::make_unique<FoldModulo>(Axis::Z, modulus_size));
-
-  auto mod_series = std::make_unique<FoldSeries>(std::move(mod_folds));
-
-  auto fractal2 = std::make_unique<Fractal>(std::move(mod_series), std::move(smol_box));
-
-  return MengerSphere(g_frac_iter, g_frac_color);
-
-  return BlackRepeatingCubesInSphere();
-
   auto fractal = std::make_unique<Fractal>(std::move(series2), std::make_unique<ObjectBox>(std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(6.0, 6.0, 6.0))));
 
-  return std::make_shared<ObjectClosest>(std::move(fractal2), std::move(fractal));
+  return std::make_shared<ObjectClosest>(std::move(BlackRepeatingCubesInSphere()), std::move(fractal));
 }
 
 void Scene::LoadLevel(int level) {

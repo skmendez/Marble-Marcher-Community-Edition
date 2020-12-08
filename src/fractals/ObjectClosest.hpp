@@ -27,17 +27,17 @@ class ObjectClosest : public ObjectBase {
   }
 
   void GLSL(GLSLFractalCode& buf) const override {
-    buf << "vec4 original_p = p;\n";
+    buf << "vec4 original_p_union = p;\n";
     left_->GLSL(buf);
-    buf << "float old_d = d;\n";
-    buf << "p = original_p;\n";
+    buf << "float old_d_union = d;\n";
+    buf << "p = original_p_union;\n";
     if (buf.isColorPass()) {
-      buf << "vec3 old_orbit = orbit;\n";
+      buf << "vec3 old_orbit_union = orbit;\n";
     }
     right_->GLSL(buf);
-    buf << "if (old_d < d) { d = old_d; ";
+    buf << "if (old_d_union < d) { d = old_d_union; ";
     if (buf.isColorPass()) {
-      buf << " orbit = old_orbit; ";
+      buf << " orbit = old_orbit_union; ";
     }
     buf << "}\n";
   }

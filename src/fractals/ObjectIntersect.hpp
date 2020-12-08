@@ -27,17 +27,17 @@ class ObjectIntersect : public ObjectBase {
   }
 
   void GLSL(GLSLFractalCode& buf) const override {
-    buf << "vec4 original_p = p;\n";
+    buf << "vec4 original_p_inter = p;\n";
     left_->GLSL(buf);
-    buf << "float old_d = d;\n";
-    buf << "p = original_p;\n";
+    buf << "float old_d_inter = d;\n";
+    buf << "p = original_p_inter;\n";
     if (buf.isColorPass()) {
-      buf << "vec3 old_orbit = orbit;\n";
+      buf << "vec3 old_orbit_inter = orbit;\n";
     }
     right_->GLSL(buf);
-    buf << "if (old_d > d) { d = old_d; ";
+    buf << "if (old_d_inter > d) { d = old_d_inter; ";
     if (buf.isColorPass()) {
-      buf << " orbit = old_orbit; ";
+      buf << " orbit = old_orbit_inter; ";
     }
     buf << "}\n";
   }
