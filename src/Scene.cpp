@@ -288,7 +288,7 @@ std::shared_ptr<ObjectBase> Scene::GetInitialObject() const {
 
   auto fractal2 = std::make_unique<Fractal>(std::move(mod_series), std::move(smol_box));
 
-  return MengerSphere(g_frac_iter);
+  return MengerSphere(g_frac_iter, g_frac_color);
 
   return BlackRepeatingCubesInSphere();
 
