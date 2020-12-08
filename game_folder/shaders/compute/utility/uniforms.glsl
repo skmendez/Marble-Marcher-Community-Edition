@@ -1,6 +1,10 @@
 uniform float iFracScale;
-uniform float iFracAng1;
-uniform float iFracAng2;
+//uniform float iFracAng1;
+//uniform float iFracAng2
+
+uniform mat2 iFracRot1;
+uniform mat2 iFracRot2;
+
 uniform vec3 iFracShift;
 uniform vec3 iFracCol;
 uniform vec3 iMarblePos;

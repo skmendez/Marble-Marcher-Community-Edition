@@ -147,7 +147,6 @@ public:
   void SnapCamera();
   void HideObjects();
 
-  void Write(sf::Shader& shader) const;
   void WriteLVL(int lvl)
   {
 	  cur_level = lvl;
@@ -199,7 +198,7 @@ protected:
   void MakeCameraRotation();
 
 private:
-  Fractal Scene::GetInitialFrac() const;
+  Fractal GetInitialFrac() const;
   std::shared_ptr<GLSLUniform<float>> g_frac_scale =
       std::make_shared<GLSLUniform<float>>(0, "iFracScale");
 

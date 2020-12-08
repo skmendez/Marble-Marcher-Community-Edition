@@ -1,7 +1,4 @@
 #pragma once
-#include <SFML/Audio.hpp>
-#include <SFML/Graphics.hpp>
-#include <SFML/OpenGL.hpp>
 #include <Localization.h>
 #include <map>
 #include <stack>
@@ -9,6 +6,9 @@
 #include <iterator>
 #include <functional>
 #include <stack>
+#include <SFML/Audio.hpp>
+#include <SFML/Graphics.hpp>
+#include <SFML/OpenGL.hpp>
 
 #ifdef _WIN32
 #define ERROR_MSG(x) MessageBox(nullptr, TEXT(x), TEXT("ERROR"), MB_OK);

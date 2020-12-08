@@ -900,66 +900,6 @@ void Scene::HideObjects() {
   marble_vel.setZero();
 }
 
-void Scene::Write(sf::Shader& shader) const {
-  shader.setUniform("iMat", sf::Glsl::Mat4(cam_mat.data()));
-
-  if (level_editor)
-  {
-	  shader.setUniform("iMarblePos", sf::Glsl::Vec3(level_copy.start_pos.x(), level_copy.start_pos.y(), level_copy.start_pos.z()));
-	  shader.setUniform("iFlagPos",  sf::Glsl::Vec3(level_copy.end_pos.x(), level_copy.end_pos.y(), level_copy.end_pos.z()));
-  }
-  else
-  {
-	  shader.setUniform("iMarblePos", free_camera ?
-		  sf::Glsl::Vec3(999.0f, 999.0f, 999.0f) :
-		  sf::Glsl::Vec3(marble_pos.x(), marble_pos.y(), marble_pos.z())
-	  );
-	  shader.setUniform("iFlagPos", free_camera ?
-		  sf::Glsl::Vec3(-999.0f, -999.0f, -999.0f) :
-		  sf::Glsl::Vec3(flag_pos.x(), flag_pos.y(), flag_pos.z())
-	  );
-  }
-
-  if (cam_mode != INTRO)
-  {
-	  shader.setUniform("LIGHT_DIRECTION", sf::Glsl::Vec3(level_copy.light_dir[0], level_copy.light_dir[1], level_copy.light_dir[2]));
-	  shader.setUniform("PBR_ENABLED", PBR_Enabled);
-	  shader.setUniform("PBR_METALLIC", level_copy.PBR_metal);
-	  shader.setUniform("PBR_ROUGHNESS", level_copy.PBR_roughness);
-  }
-  else
-  {
-	  shader.setUniform("LIGHT_DIRECTION", sf::Glsl::Vec3(LIGHT_DIRECTION[0], LIGHT_DIRECTION[1], LIGHT_DIRECTION[2]));
-	  shader.setUniform("PBR_ENABLED", PBR_Enabled);
-	  shader.setUniform("PBR_METALLIC", PBR_METALLIC);
-	  shader.setUniform("PBR_ROUGHNESS", PBR_ROUGHNESS);
-  }
-
-  shader.setUniform("BACKGROUND_COLOR", sf::Glsl::Vec3(level_copy.background_col[0], level_copy.background_col[1], level_copy.background_col[2]));
-  shader.setUniform("LIGHT_COLOR", sf::Glsl::Vec3(level_copy.light_col[0], level_copy.light_col[1], level_copy.light_col[2]));
-
-  shader.setUniform("iMarbleRad", level_copy.marble_rad);
-
-  shader.setUniform("iFlagScale", level_copy.planet ? -level_copy.marble_rad : level_copy.marble_rad);
-
-  shader.setUniform("iFracScale", frac_params_smooth[0]);
-  shader.setUniform("iFracAng1", frac_params_smooth[1]);
-  shader.setUniform("iFracAng2", frac_params_smooth[2]);
-  shader.setUniform("iFracShift", sf::Glsl::Vec3(frac_params_smooth[3], frac_params_smooth[4], frac_params_smooth[5]));
-  shader.setUniform("iFracCol", sf::Glsl::Vec3(frac_params_smooth[6], frac_params_smooth[7], frac_params_smooth[8]));
-
-  shader.setUniform("iExposure", exposure);
-
-
-  shader.setUniform("SHADOWS_ENABLED", Shadows_Enabled);
-  shader.setUniform("CAMERA_SIZE", camera_size*level_copy.marble_rad/0.035f);
-  shader.setUniform("FRACTAL_ITER", level_copy.FractalIter);
-  shader.setUniform("REFL_REFR_ENABLED", Refl_Refr_Enabled);
-  shader.setUniform("MARBLE_MODE", MarbleType);
-}
-
-
-
 void Scene::WriteRenderer(Renderer & rd)
 {
 	//Update the camera
@@ -983,6 +923,7 @@ void Scene::WriteRenderer(Renderer & rd)
 void Scene::WriteShader(ComputeShader& shader)
 {
 
+  UpdateFrac();
 	if (level_editor)
 	{
 		shader.setUniform("iMarblePos", vec3(level_copy.start_pos.x(), level_copy.start_pos.y(), level_copy.start_pos.z()));
@@ -1021,15 +962,25 @@ void Scene::WriteShader(ComputeShader& shader)
 	shader.setUniform("iMarbleRad", level_copy.marble_rad);
 	shader.setUniform("iFlagScale", level_copy.planet ? -level_copy.marble_rad : level_copy.marble_rad);
 
-	shader.setUniform("iFracScale", frac_params_smooth[0]);
-	shader.setUniform("iFracAng1", frac_params_smooth[1]);
-	shader.setUniform("iFracAng2", frac_params_smooth[2]);
-	shader.setUniform("iFracShift", vec3(frac_params_smooth[3], frac_params_smooth[4], frac_params_smooth[5]));
+  shader.setUniform(*g_frac_scale);
+	//shader.setUniform("iFracScale", frac_params_smooth[0]);
+
+	shader.setUniform(*g_rot_mat1);
+  shader.setUniform(*g_rot_mat2);
+
+	//shader.setUniform("iFracAng1", frac_params_smooth[1]);
+	//shader.setUniform("iFracAng2", frac_params_smooth[2]);
+
+	shader.setUniform(*g_frac_shift);
+
+	//shader.setUniform("iFracShift", vec3(frac_params_smooth[3], frac_params_smooth[4], frac_params_smooth[5]));
 	shader.setUniform("iFracCol", vec3(frac_params_smooth[6], frac_params_smooth[7], frac_params_smooth[8]));
 
 	shader.setUniform("SHADOWS_ENABLED", Shadows_Enabled);
 	shader.setUniform("FOG_ENABLED", Fog_Enabled);
-	shader.setUniform("FRACTAL_ITER", level_copy.FractalIter);
+
+  shader.setUniform(*g_frac_iter);
+	//shader.setUniform("FRACTAL_ITER", level_copy.FractalIter);
 	shader.setUniform("REFL_REFR_ENABLED", Refl_Refr_Enabled);
 	shader.setUniform("MARBLE_MODE", MarbleType);
 	shader.setUniform("FRACTAL_GLOW", SETTINGS.stg.fractal_glow);

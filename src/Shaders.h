@@ -51,7 +51,10 @@ public:
 	void setUniform(std::string name, glm::vec3 X);
 	void setUniform(std::string name, glm::vec2 X);
 	void setUniform(int i, GLuint tid);
-  template<typename T> void setUniform(const GLSLUniform<T>& var);
+  template<typename T> void setUniform(GLSLUniform<T>& var) {
+    glUseProgram(ProgramID);
+    var.SetUniform(ProgramID);
+  }
 	void setCameraObj(std::string name, gl_camera cam);
 	void setCamera(gl_camera cam);
 

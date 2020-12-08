@@ -3,7 +3,7 @@ uniform sampler2D iTexture1;
 
 ///Original MM distance estimators
 
-float s1 = sin(iFracAng1), c1 = cos(iFracAng1), s2 = sin(iFracAng2), c2 = cos(iFracAng2);
+//float s1 = sin(iFracAng1), c1 = cos(iFracAng1), s2 = sin(iFracAng2), c2 = cos(iFracAng2);
 
 //##########################################
 //   Space folding
@@ -71,15 +71,17 @@ float de_capsule(vec4 p, float h, float r) {
 //##########################################
 //   Main DEs
 //##########################################
+
+#here frac
 float de_fractal(vec4 p) {
 	float d = 1.0 / 0.0;
-	mat2 rmZ = mat2(c1, s1, -s1, c1);
-	mat2 rmX = mat2(c2, s2, -s2, c2);
+	//mat2 rmZ = mat2(c1, s1, -s1, c1);
+	//mat2 rmX = mat2(c2, s2, -s2, c2);
 	for (int i = 0; i < FRACTAL_ITER; ++i) {
 		p.xyz = abs(p.xyz);
-		p.xy *= rmZ;
+		p.xy *= iFracRot1;
 		mengerFold(p);
-		p.yz *= rmX;
+		p.yz *= iFracRot2;
 		p *= iFracScale;
 		p.xyz += iFracShift;
 	}
@@ -103,13 +105,13 @@ float de_fractal(vec4 p)
 vec4 col_fractal(vec4 p) 
 {
 	vec3 orbit = vec3(0.0);
-	mat2 rmZ = mat2(c1, s1, -s1, c1); 
-	mat2 rmX = mat2(c2, s2, -s2, c2);
+	//mat2 rmZ = mat2(c1, s1, -s1, c1);
+	//mat2 rmX = mat2(c2, s2, -s2, c2);
 	for (int i = 0; i < FRACTAL_ITER; ++i) {
 		p.xyz = abs(p.xyz);
-		p.xy *= rmZ; //rotation around z
+		p.xy *= iFracRot1; //rotation around z
 		mengerFold(p);
-		p.yz *= rmX; //rotation around x
+		p.yz *= iFracRot2; //rotation around x
 		p *= iFracScale;
 		p.xyz += iFracShift;
 		orbit = max(orbit, p.xyz*iFracCol);

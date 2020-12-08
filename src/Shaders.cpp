@@ -154,12 +154,6 @@ void ComputeShader::setUniform(int i, GLuint tid)
 	glUniform1i(A, i);
 }
 
-template <typename T>
-void ComputeShader::setUniform(const GLSLUniform<T>& var) {
-  glUseProgram(ProgramID);
-  var.SetUniform(ProgramID);
-}
-
 void ComputeShader::setCameraObj(std::string name, gl_camera cam)
 {
 	setUniform(name + ".position", cam.position);
