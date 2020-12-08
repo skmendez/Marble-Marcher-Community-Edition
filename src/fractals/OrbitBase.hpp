@@ -15,8 +15,15 @@ class OrbitBase : public FoldableBase {
 
   void Unfold(FoldHistory& p_hist, Eigen::Vector3f& n) const final {}
 
-  void GLSL(GLSLFractalCode& buf) const override = 0;
-  void UpdateUniforms(unsigned int ProgramID) const override = 0
+  void GLSL(GLSLFractalCode& buf) const final {
+    if (buf.isColorPass()) {
+      GLSLIfColor(buf);
+    }
+  }
+  void UpdateUniforms(unsigned int ProgramID) const override = 0;
+
+ protected:
+  virtual void GLSLIfColor(GLSLFractalCode& buf) const = 0;
 };
 
 

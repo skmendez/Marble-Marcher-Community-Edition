@@ -259,12 +259,21 @@ Fractal Scene::GetInitialFrac() const {
   inner_folds.emplace_back(std::make_unique<FoldMenger>());
   inner_folds.emplace_back(std::make_unique<FoldRotate>(Axis::X, g_rot_mat2));
   inner_folds.emplace_back(std::make_unique<FoldScaleTranslate>(g_frac_scale, g_frac_shift));
+  inner_folds.emplace_back(std::make_unique<OrbitMax>(g_frac_color));
 
   auto series = std::make_unique<FoldSeries>(std::move(inner_folds));
   auto loop = std::make_unique<FoldRepeat>(g_frac_iter, std::move(series));
 
+  std::vector<std::unique_ptr<FoldableBase>> outer_elements{};
+
+  outer_elements.emplace_back(std::make_unique<OrbitInit>(
+      std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(0.0, 0.0, 0.0))
+      ));
+  outer_elements.emplace_back(std::move(loop));
+  auto series2 = std::make_unique<FoldSeries>(std::move(outer_elements));
+
   auto box = std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(6.0, 6.0, 6.0));
-  return Fractal{std::move(loop), std::make_unique<ObjectBox>(box)};
+  return Fractal{std::move(series2), std::make_unique<ObjectBox>(box)};
 }
 
 void Scene::LoadLevel(int level) {
@@ -977,12 +986,12 @@ void Scene::WriteShader(ComputeShader& shader)
 
 
   //shader.setUniform("iFracShift", vec3(frac_params_smooth[3], frac_params_smooth[4], frac_params_smooth[5]));
-	shader.setUniform("iFracCol", vec3(frac_params_smooth[6], frac_params_smooth[7], frac_params_smooth[8]));
+	//shader.setUniform("iFracCol", vec3(frac_params_smooth[6], frac_params_smooth[7], frac_params_smooth[8]));
 
 	shader.setUniform("SHADOWS_ENABLED", Shadows_Enabled);
 	shader.setUniform("FOG_ENABLED", Fog_Enabled);
 
-  shader.setUniform(*g_frac_iter);
+  //shader.setUniform(*g_frac_iter);
 	//shader.setUniform("FRACTAL_ITER", level_copy.FractalIter);
 	shader.setUniform("REFL_REFR_ENABLED", Refl_Refr_Enabled);
 	shader.setUniform("MARBLE_MODE", MarbleType);
@@ -1015,6 +1024,9 @@ void Scene::UpdateFrac() {
 
   const Eigen::Vector3f frac_shift = frac_params_smooth.segment<3>(3);
   g_frac_shift->SetVar(frac_shift);
+
+  const Eigen::Vector3f frac_color = frac_params_smooth.segment<3>(6);
+  g_frac_color->SetVar(frac_color);
 }
 
 //Hard-coded to match the fractal

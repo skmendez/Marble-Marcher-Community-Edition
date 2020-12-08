@@ -216,6 +216,9 @@ private:
   std::shared_ptr<GLSLUniform<Eigen::Matrix2f>> g_rot_mat2 =
       std::make_shared<GLSLUniform<Eigen::Matrix2f>>(Eigen::Matrix2f{}, "iFracRot2");
 
+  std::shared_ptr<GLSLUniform<Eigen::Vector3f>> g_frac_color =
+      std::make_shared<GLSLUniform<Eigen::Vector3f>>(Eigen::Vector3f{}, "iFracCol");
+
   Fractal frac_ = GetInitialFrac();
 
   float           time;

@@ -13,5 +13,7 @@
 #include "FoldSeries.hpp"
 #include "FoldScaleTranslate.hpp"
 #include "ObjectBox.hpp"
+#include "OrbitInit.hpp"
+#include "OrbitMax.hpp"
 
 #endif //FRACTALINCLUDE_HPP_

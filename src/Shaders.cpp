@@ -232,6 +232,8 @@ std::string ComputeShader::PreprocessIncludes(const fs::path& filename, Fractal 
       std::string pos_type = matches[1].str(); // Either de or col
       if (pos_type == "de") {
         output << GLSLCodeFactory::GenerateDistanceEstimator(*frac) << endl;
+      } else if (pos_type == "col") {
+        output << GLSLCodeFactory::GenerateColor(*frac) << endl;
       }
 		}
 		else

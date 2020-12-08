@@ -90,22 +90,26 @@ float de_fractal(vec4 p) {
 }
 */
 
-vec4 col_fractal(vec4 p) 
-{
+#here <col>
+
+/*
+vec4 col_fractal(vec4 p) {
+	float d = 1.0 / 0.0;
 	vec3 orbit = vec3(0.0);
-	//mat2 rmZ = mat2(c1, s1, -s1, c1);
-	//mat2 rmX = mat2(c2, s2, -s2, c2);
-	for (int i = 0; i < FRACTAL_ITER; ++i) {
+	orbit = vec3(0.00000, 0.00000, 0.00000);
+	for (int iter_j = 0; iter_j < FRACTAL_ITER; iter_j++) {
 		p.xyz = abs(p.xyz);
-		p.xy *= iFracRot1; //rotation around z
+		p.xy *= iFracRot1;
 		mengerFold(p);
-		p.yz *= iFracRot2; //rotation around x
+		p.yz *= iFracRot2;
 		p *= iFracScale;
 		p.xyz += iFracShift;
-		orbit = max(orbit, p.xyz*iFracCol);
+		orbit = max(orbit, p.xyz * iFracCol);
 	}
-	return vec4(orbit, de_box(p, vec3(6.0)));
+	d = de_box(p, vec3(6.00000, 6.00000, 6.00000));
+	return vec4(orbit, d);
 }
+*/
 
 float de_marble(vec4 p) 
 {
