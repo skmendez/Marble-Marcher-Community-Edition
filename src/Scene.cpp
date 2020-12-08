@@ -593,6 +593,7 @@ void Scene::UpdateMarble(float dx, float dy) {
     float max_delta_v = 0.0f;
     for (int i = 0; i < num_phys_steps; ++i) {
       float force = marble_rad * gravity / num_phys_steps;
+      force = 0;
       if (gravity_type == 1) { force *= 0.25f; } else if (gravity_type == 2) { force *= 4.0f; }
       if (level_copy.planet) {
         marble_vel -= marble_pos.normalized() * force;
@@ -619,7 +620,19 @@ void Scene::UpdateMarble(float dx, float dy) {
     if (hyper_speed) { f *= 4.0f; }
     const float cs = std::cos(cam_look_x);
     const float sn = std::sin(cam_look_x);
-    const Eigen::Vector3f v(dx*cs - dy*sn, 0.0f, -dy*cs - dx*sn);
+//    const Eigen::Vector3f v(dx*cs - dy*sn, 0.0f, -dy*cs - dx*sn);
+    Eigen::Vector4f v2(dx, 0, 0, 0);
+
+    marble_mat.setIdentity();
+    MakeCameraRotation();
+
+    Eigen::Vector4f v1 = Eigen::Vector4f(0.0, 0.0, -FOCAL_DIST, 0.0);
+    Eigen::Vector4f ray = cam_mat * v1;
+    Eigen::Vector4f ray2 = cam_mat * v2;
+    const Eigen::Vector3f v(dy *ray[0] + ray2[0], dy *ray[1] + ray2[1], dy *ray[2] + ray2[2]);
+
+//    Eigen::Affine3f t(Eigen::AngleAxisf(dx * 0.01f, Eigen::Vector3f(ray[0], ray[1], ray[2])));
+//    cam_mat = cam_mat * t.matrix();
     marble_vel += (marble_mat * v) * f;
 
     //Apply friction
@@ -656,9 +669,9 @@ void Scene::UpdateMarble(float dx, float dy) {
   }
 
   //Check if marble passed the death barrier
-  if (marble_pos.y() < (enable_cheats ? -999.0f : level_copy.kill_y)) {
-    ResetLevel();
-  }
+//  if (marble_pos.y() < (enable_cheats ? -999.0f : level_copy.kill_y)) {
+//    ResetLevel();
+//  }
 }
 
 void Scene::UpdateIntro(bool ssaver) {
@@ -831,7 +844,15 @@ void Scene::UpdateCameraOnly(float dx, float dy, float dz) {
   //Update look direction
   cam_look_x += dx;
   cam_look_y += dy;
-  cam_look_y = std::min(std::max(cam_look_y, -PI / 2), PI / 2);
+//  cam_look_y = std::min(std::max(cam_look_y, -PI / 2), PI / 2);
+
+  float fake_cam_look_y = cam_look_y;
+
+  while (fake_cam_look_y > PI) { fake_cam_look_y -= 2 * PI; }
+  while (fake_cam_look_y < -PI) { fake_cam_look_y += 2 * PI; }
+  if (fake_cam_look_y < -PI/2 || fake_cam_look_y > PI/2) {
+    cam_look_x -= (dx + dx);
+  }
   while (cam_look_x > PI) { cam_look_x -= 2 * PI; }
   while (cam_look_x < -PI) { cam_look_x += 2 * PI; }
 
