@@ -13,7 +13,7 @@ class FoldPlane : public FoldableBase {
 
   void Fold(Eigen::Vector4f& p) const override {
     auto norm = normal_->GetVar();
-    p.segment<3>(0) += 2.f * std::min(0.f, p.segment<3>(0).dot(norm) - offset_->GetVar()) * norm;
+    p.segment<3>(0) -= 2.f * std::min(0.f, p.segment<3>(0).dot(norm) - offset_->GetVar()) * norm;
   }
 
   void Fold(Eigen::Vector4f& p, FoldHistory& p_hist) const override {
@@ -22,8 +22,7 @@ class FoldPlane : public FoldableBase {
   }
 
   void Unfold(FoldHistory& p_hist, Eigen::Vector3f& n) const override {
-    Eigen::Vector4f p = p_hist.back();
-
+    Eigen::Vector4f p = p_hist.back(); p_hist.pop_back();
     auto norm = normal_->GetVar();
     if (p.segment<3>(0).dot(norm) - offset_->GetVar() < 0.f) {
       n -= 2.f * (n.dot(norm) - offset_->GetVar()) * norm;

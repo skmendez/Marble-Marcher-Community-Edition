@@ -5,6 +5,8 @@
 #ifndef STATICFRACTALS_HPP_
 #define STATICFRACTALS_HPP_
 
+#include <utility>
+
 #include "FractalInclude.hpp"
 
 std::unique_ptr<ObjectBase> BlackRepeatingCubes() {
@@ -44,9 +46,25 @@ std::unique_ptr<ObjectBase> MengerSponge(std::shared_ptr<GLSLUniform<int>> depth
   auto series = std::make_unique<FoldSeries>(std::move(inner_folds));
   auto loop = std::make_unique<FoldRepeat>(depth, std::move(series));
 
-  auto box = std::make_unique<ObjectBox>(std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(2.f, 2.f, 2.f)));
+  auto box = std::make_unique<ObjectBox>(std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(1.f, 1.f, 1.f)));
 
-  return std::make_unique<Fractal>(std::move(loop), std::move(box));
+  auto final_scale = std::make_shared<GLSLConstant<float>>(.33f);
+  auto final_translate = std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(0.f, 0.f, 0.f));
+
+  std::vector<std::unique_ptr<FoldableBase>> final_folds{};
+  final_folds.emplace_back(std::make_unique<FoldScaleTranslate>(final_scale, final_translate));
+  final_folds.emplace_back(std::move(loop));
+
+  auto final_series = std::make_unique<FoldSeries>(std::move(final_folds));
+
+  return std::make_unique<Fractal>(std::move(final_series), std::move(box));
+}
+
+std::unique_ptr<ObjectBase> MengerSphere(std::shared_ptr<GLSLUniform<int>> depth) {
+  auto sponge = MengerSponge(std::move(depth));
+  auto sphere = std::make_unique<ObjectSphere>(std::make_shared<GLSLConstant<float>>(3.f));
+
+  return std::make_unique<ObjectDifference>(std::move(sponge), std::move(sphere));
 }
 
 #endif //STATICFRACTALS_HPP_

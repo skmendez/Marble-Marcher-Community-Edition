@@ -25,6 +25,7 @@ class Fractal : public ObjectBase {
     fold_->Fold(p, p_hist);
     Eigen::Vector3f n = base_->NearestPoint(p);
     fold_->Unfold(p_hist, n);
+    assert(p_hist.size() == 0);
     return n;
   }
 

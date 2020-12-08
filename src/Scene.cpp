@@ -288,7 +288,7 @@ std::shared_ptr<ObjectBase> Scene::GetInitialObject() const {
 
   auto fractal2 = std::make_unique<Fractal>(std::move(mod_series), std::move(smol_box));
 
-  return MengerSponge(g_frac_iter);
+  return MengerSphere(g_frac_iter);
 
   return BlackRepeatingCubesInSphere();
 
@@ -1068,16 +1068,25 @@ bool Scene::MarbleCollision(float& delta_v) {
   UpdateFrac();
   //Check if the distance estimate indicates a collision
   const float de = DE(marble_pos);
+
+  static int counter = 0;
+  counter++;
+  if (counter % 60 == 0) {
+    std::cerr << de << std::endl;
+  }
+
   if (de >= marble_rad) {
     return de < marble_rad * ground_ratio;
   }
 
   //Check if the marble has been crushed by the fractal
+
   if (de < marble_rad * 0.001f) {
     sound_shatter.play();
     marble_pos.y() = -9999.0f;
     return false;
   }
+
 
   //Find the nearest point and compute offset
   const Eigen::Vector3f np = NP(marble_pos);

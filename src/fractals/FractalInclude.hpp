@@ -17,6 +17,7 @@
 #include "ObjectBox.hpp"
 #include "ObjectSphere.hpp"
 #include "ObjectClosest.hpp"
+#include "ObjectDifference.hpp"
 #include "ObjectIntersect.hpp"
 #include "OrbitInit.hpp"
 #include "OrbitMax.hpp"
