@@ -14,7 +14,7 @@ ComputeShader::ComputeShader()
 
 }
 
-ComputeShader::ComputeShader(const std::string file_path, Fractal *frac)
+ComputeShader::ComputeShader(const std::string file_path, ObjectBase *frac)
 {
   LoadShader(file_path, frac);
 }
@@ -43,13 +43,17 @@ void ComputeShader::Delete()
 }
 
 
-void ComputeShader::LoadShader(const std::string file_path, Fractal *frac)
+void ComputeShader::LoadShader(const std::string file_path, ObjectBase *frac)
 {
 		// Create the shaders
 		GLuint ComputeShaderID = glCreateShader(GL_COMPUTE_SHADER);
 
 		// Read the Compute Shader code from the file
 		std::string ComputeShaderCode = PreprocessIncludes(fs::path(file_path), frac, 0);
+
+#ifndef NDEBUG
+		std::cerr << ComputeShaderCode;
+#endif
 
 		GLint Result = GL_FALSE;
 		int InfoLogLength;
@@ -206,7 +210,7 @@ bool INIT()
 }
 
 
-std::string ComputeShader::PreprocessIncludes(const fs::path& filename, Fractal *frac, int level /*= 0 */)
+std::string ComputeShader::PreprocessIncludes(const fs::path& filename, ObjectBase *frac, int level /*= 0 */)
 {
 	if (level > 32)
 		ERROR_MSG("Header inclusion depth limit reached, might be caused by cyclic header inclusion");

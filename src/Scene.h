@@ -186,7 +186,7 @@ public:
   sf::Sound sound_shatter;
   sf::SoundBuffer buff_shatter;
 
-  Fractal * getFrac() { return &frac_; }
+  std::shared_ptr<ObjectBase> getObject() { return frac_; }
 
 protected:
   void SetLevel(int level);
@@ -200,7 +200,7 @@ protected:
   void MakeCameraRotation();
 
 private:
-  Fractal GetInitialFrac() const;
+  std::shared_ptr<ObjectBase> GetInitialObject() const;
   std::shared_ptr<GLSLUniform<float>> g_frac_scale =
       std::make_shared<GLSLUniform<float>>(0, "iFracScale");
 
@@ -219,7 +219,7 @@ private:
   std::shared_ptr<GLSLUniform<Eigen::Vector3f>> g_frac_color =
       std::make_shared<GLSLUniform<Eigen::Vector3f>>(Eigen::Vector3f{}, "iFracCol");
 
-  Fractal frac_ = GetInitialFrac();
+  std::shared_ptr<ObjectBase> frac_ = GetInitialObject();
 
   float           time;
   int             cur_level;

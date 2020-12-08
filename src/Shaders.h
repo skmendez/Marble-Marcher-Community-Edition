@@ -39,9 +39,9 @@ public:
 	GLuint ProgramID;
 
 	ComputeShader();
-	ComputeShader(const std::string file_path, Fractal *frac);
+	ComputeShader(const std::string file_path, ObjectBase *frac);
 
-	void LoadShader(const std::string file_path, Fractal *frac);
+	void LoadShader(const std::string file_path, ObjectBase *frac);
 
 	void Run(vec2 global);
 
@@ -62,7 +62,7 @@ public:
 
 	GLuint getNativeHandle();
 
-	std::string PreprocessIncludes(const fs::path& filename, Fractal *frac, int level = 0);
+	std::string PreprocessIncludes(const fs::path& filename, ObjectBase *frac, int level = 0);
 
 	void SaveErrors(const fs::path & filename, std::string code, std::string errors);
 

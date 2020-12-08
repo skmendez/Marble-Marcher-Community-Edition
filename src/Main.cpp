@@ -80,7 +80,7 @@ int main(int argc, char *argv[]) {
 	//Create the fractal scene
 	Scene scene(level_music);
 
-  Renderer rend(main_config, scene.getFrac());
+  Renderer rend(main_config, scene.getObject().get());
   sf::Texture main_txt, screenshot_txt;
 	//Create the old menus
 	Overlays overlays(&scene);

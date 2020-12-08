@@ -13,6 +13,7 @@
 #include "FoldSeries.hpp"
 #include "FoldScaleTranslate.hpp"
 #include "ObjectBox.hpp"
+#include "ObjectClosest.hpp"
 #include "OrbitInit.hpp"
 #include "OrbitMax.hpp"
 

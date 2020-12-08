@@ -22,7 +22,7 @@ class Renderer
 {
 public:
 	Renderer(int w, int h, std::string config);
-	Renderer(std::string config_file, Fractal *frac);
+	Renderer(std::string config_file, ObjectBase *frac);
 	Renderer();
 
 	void LoadConfigs(std::string config_file);
@@ -63,5 +63,5 @@ private:
 
 	GLuint illumination_texture;
 	ComputeShader weight_shader;
-  Fractal *frac_;
+  ObjectBase *frac_;
 };

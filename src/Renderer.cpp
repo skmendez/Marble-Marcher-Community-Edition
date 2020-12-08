@@ -9,7 +9,7 @@ Renderer::Renderer(int w, int h, std::string config_file)
 	Initialize(w, h, config_file);
 }
 
-Renderer::Renderer(std::string config_file, Fractal *frac) : frac_(frac)
+Renderer::Renderer(std::string config_file, ObjectBase *frac) : frac_(frac)
 {
 	LoadConfigs(config_file);
 }

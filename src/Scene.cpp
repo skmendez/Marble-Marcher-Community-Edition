@@ -251,7 +251,7 @@ Eigen::Vector3f Scene::GetVelocity() {
 	return marble_vel;
 }
 
-Fractal Scene::GetInitialFrac() const {
+std::shared_ptr<ObjectBase> Scene::GetInitialObject() const {
 
   std::vector<std::unique_ptr<FoldableBase>> inner_folds{};
   inner_folds.emplace_back(std::make_unique<FoldAbs>());
@@ -273,7 +273,12 @@ Fractal Scene::GetInitialFrac() const {
   auto series2 = std::make_unique<FoldSeries>(std::move(outer_elements));
 
   auto box = std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(6.0, 6.0, 6.0));
-  return Fractal{std::move(series2), std::make_unique<ObjectBox>(box)};
+
+  auto smol_box = std::make_unique<ObjectBox>(std::make_shared<GLSLConstant<Eigen::Vector3f>>(Eigen::Vector3f(2.0, 6.0, 2.0)));
+
+  auto fractal = std::make_unique<Fractal>(std::move(series2), std::make_unique<ObjectBox>(box));
+
+  return std::make_shared<ObjectClosest>(std::move(smol_box), std::move(fractal));
 }
 
 void Scene::LoadLevel(int level) {
@@ -971,7 +976,7 @@ void Scene::WriteShader(ComputeShader& shader)
 	shader.setUniform("iMarbleRad", level_copy.marble_rad);
 	shader.setUniform("iFlagScale", level_copy.planet ? -level_copy.marble_rad : level_copy.marble_rad);
 
-	frac_.UpdateUniforms(shader.getNativeHandle());
+	frac_->UpdateUniforms(shader.getNativeHandle());
 
   //shader.setUniform(*g_frac_scale);
   //shader.setUniform("iFracScale", frac_params_smooth[0]);
@@ -1033,20 +1038,14 @@ void Scene::UpdateFrac() {
 float Scene::DE(const Eigen::Vector3f& pt) const {
   Eigen::Vector4f p;
   p << pt, 1.0f;
-  static bool printed = false;
-  if (!printed) {
-    auto code = GLSLCodeFactory::GenerateDistanceEstimator(frac_);
-    std::cerr << code << std::endl;
-    printed = true;
-  }
-  return frac_.DistanceEstimator(p);
+  return frac_->DistanceEstimator(p);
 }
 
 //Hard-coded to match the fractal
 Eigen::Vector3f Scene::NP(const Eigen::Vector3f& pt) const {
   Eigen::Vector4f p;
   p << pt, 1.0f;
-  return frac_.NearestPoint(p);
+  return frac_->NearestPoint(p);
 }
 
 bool Scene::MarbleCollision(float& delta_v) {
