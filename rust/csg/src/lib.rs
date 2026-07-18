@@ -23,6 +23,9 @@ pub mod fold;
 pub mod object;
 pub mod scenes;
 
+pub use fold::Fold;
+pub use object::Object;
+
 use glam::{Mat2, Vec2, Vec3, Vec4};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
