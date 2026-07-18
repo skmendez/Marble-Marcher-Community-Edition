@@ -1,0 +1,628 @@
+//! M3: WGSL code generation from a `Fold`/`Object` tree.
+//! See rust/DESIGN.md §5 and the C++ sources in
+//! src/fractals/GLSLBase.hpp, GLSLCodeFactory.hpp, Fold*.hpp's `GLSL()`
+//! methods, Object*.hpp's `GLSL()` methods, and the GLSL helpers in
+//! `game_folder/shaders/compute/utility/distance_estimators.glsl`
+//! (`de_sphere`, `de_box`, `mengerFold`, `planeFold`), ported to WGSL.
+
+use crate::{fold::Fold, object::Object, Axis};
+
+/// A string builder for generated WGSL: tracks indentation and a
+/// monotonically increasing fresh-name counter.
+///
+/// ⚠ Fixes two C++ bugs (DESIGN.md §5) — do not replicate them:
+///  - `FoldRepeat::GLSL` used a function-`static` depth counter for its loop
+///    variable name, which leaks across separate code-generation calls
+///    (regenerating a shader could produce different/colliding names).
+///  - `ObjectClosest`/`ObjectIntersect`/`ObjectDifference::GLSL` used fixed
+///    local names (`original_p_union`, `old_d_union`, ...), so a Union nested
+///    inside a Union (or Intersect inside Intersect, etc.) emits two `let`s
+///    with the same name, which is invalid WGSL (and would have been
+///    silently-wrong GLSL shadowing bugs).
+///
+/// Every generated local and loop variable goes through [`CodeWriter::fresh`]
+/// instead, so nested/repeated generation can never collide.
+pub struct CodeWriter {
+    out: String,
+    indent: usize,
+    /// Whether we're generating the color pass (`col_scene`) or the distance
+    /// pass (`de_scene`). Orbit statements (`OrbitInit`/`OrbitMax`) and the
+    /// orbit save/restore in combinators only emit when this is `true`.
+    pub color_pass: bool,
+    next_id: u32,
+}
+
+impl Default for CodeWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CodeWriter {
+    pub fn new() -> Self {
+        Self {
+            out: String::new(),
+            indent: 0,
+            color_pass: false,
+            next_id: 0,
+        }
+    }
+
+    /// Returns a name unique across the lifetime of this `CodeWriter`:
+    /// `{base}_{id}`.
+    pub fn fresh(&mut self, base: &str) -> String {
+        let id = self.next_id;
+        self.next_id += 1;
+        format!("{base}_{id}")
+    }
+
+    pub fn indent(&mut self) {
+        self.indent += 1;
+    }
+
+    pub fn dedent(&mut self) {
+        self.indent = self.indent.saturating_sub(1);
+    }
+
+    /// Appends one indented line (plus a trailing newline). An empty `line`
+    /// writes a blank line with no leading whitespace.
+    pub fn writeln(&mut self, line: &str) {
+        if line.is_empty() {
+            self.out.push('\n');
+            return;
+        }
+        for _ in 0..self.indent {
+            self.out.push_str("    ");
+        }
+        self.out.push_str(line);
+        self.out.push('\n');
+    }
+
+    pub fn finish(self) -> String {
+        self.out
+    }
+
+    /// Emit one [`Fold`] step. See the emission table in DESIGN.md §5.
+    fn emit_fold(&mut self, fold: &Fold) {
+        match fold {
+            Fold::Abs => self.writeln("p = vec4<f32>(abs(p.xyz), p.w);"),
+            Fold::Menger => self.writeln("menger_fold(&p);"),
+            Fold::Rotate { axis, mat } => {
+                // Cyclic component pairs (DESIGN.md §4): X->(y,z), Y->(z,x), Z->(x,y).
+                let func = match axis {
+                    Axis::X => "rot_yz",
+                    Axis::Y => "rot_zx",
+                    Axis::Z => "rot_xy",
+                };
+                self.writeln(&format!("p = {func}(p, {});", mat.wgsl()));
+            }
+            Fold::ScaleTranslate { scale, shift } => {
+                // Scale multiplies all 4 components (including w, the scale
+                // divisor); translate only affects xyz. Two statements
+                // because WGSL has no swizzle assignment (`p.xyz += ...`).
+                self.writeln(&format!("p = p * {};", scale.wgsl()));
+                self.writeln(&format!("p = vec4<f32>(p.xyz + {}, p.w);", shift.wgsl()));
+            }
+            Fold::Plane { normal, offset } => {
+                self.writeln(&format!(
+                    "p = plane_fold(p, {}, {});",
+                    normal.wgsl(),
+                    offset.wgsl()
+                ));
+            }
+            Fold::Modulo { axis, modulus } => {
+                let c = match axis {
+                    Axis::X => "x",
+                    Axis::Y => "y",
+                    Axis::Z => "z",
+                };
+                self.writeln(&format!("p.{c} = mod_fold(p.{c}, {});", modulus.wgsl()));
+            }
+            Fold::Series(folds) => {
+                for f in folds {
+                    self.emit_fold(f);
+                }
+            }
+            Fold::Repeat { count, inner } => {
+                let it = self.fresh("it");
+                self.writeln(&format!(
+                    "for (var {it}: i32 = 0; {it} < {}; {it}++) {{",
+                    count.wgsl()
+                ));
+                self.indent();
+                self.emit_fold(inner);
+                self.dedent();
+                self.writeln("}");
+            }
+            Fold::OrbitInit(v) => {
+                if self.color_pass {
+                    self.writeln(&format!("orbit = {};", v.wgsl()));
+                }
+            }
+            Fold::OrbitMax(v) => {
+                if self.color_pass {
+                    self.writeln(&format!("orbit = max(orbit, p.xyz * {});", v.wgsl()));
+                }
+            }
+        }
+    }
+
+    /// Emit one [`Object`] node. See the emission table in DESIGN.md §5.
+    fn emit_object(&mut self, obj: &Object) {
+        match obj {
+            Object::Sphere { radius } => {
+                self.writeln(&format!("d = de_sphere(p, {});", radius.wgsl()));
+            }
+            Object::Cuboid { half_extent } => {
+                self.writeln(&format!("d = de_box(p, {});", half_extent.wgsl()));
+            }
+            Object::Fractal { fold, base } => {
+                self.emit_fold(fold);
+                self.emit_object(base);
+            }
+            Object::Union(left, right) => self.emit_combine(left, right, Combine::Union),
+            Object::Intersect(left, right) => self.emit_combine(left, right, Combine::Intersect),
+            Object::Difference(left, right) => {
+                self.emit_combine(left, right, Combine::Difference)
+            }
+        }
+    }
+
+    /// Shared shape for `Union`/`Intersect`/`Difference` (DESIGN.md §5): save
+    /// `p` (and `orbit`, in the color pass) *before* the left child, save the
+    /// left child's `d` *after* it, restore `p`, emit the right child, then
+    /// compare. `Difference` negates the right child's `d` first.
+    fn emit_combine(&mut self, left: &Object, right: &Object, kind: Combine) {
+        let p_saved = self.fresh("p_save");
+        self.writeln(&format!("let {p_saved} = p;"));
+        self.emit_object(left);
+        let dl = self.fresh("dl");
+        self.writeln(&format!("let {dl} = d;"));
+        self.writeln(&format!("p = {p_saved};"));
+        let ol = if self.color_pass {
+            let name = self.fresh("ol");
+            self.writeln(&format!("let {name} = orbit;"));
+            Some(name)
+        } else {
+            None
+        };
+        self.emit_object(right);
+        if kind == Combine::Difference {
+            self.writeln("d = -d;");
+        }
+        let op = match kind {
+            Combine::Union => "<",
+            Combine::Intersect | Combine::Difference => ">",
+        };
+        match &ol {
+            Some(ol) => self.writeln(&format!(
+                "if ({dl} {op} d) {{ d = {dl}; orbit = {ol}; }}"
+            )),
+            None => self.writeln(&format!("if ({dl} {op} d) {{ d = {dl}; }}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Combine {
+    Union,
+    Intersect,
+    Difference,
+}
+
+/// Bindings + `SceneUniforms` (verified against bevy_sprite 0.16.1, material
+/// bind group 2 — DESIGN.md §5).
+const BINDINGS: &str = "\
+struct SceneUniforms {
+    cam_pos: vec4<f32>,
+    cam_right: vec4<f32>,
+    cam_up: vec4<f32>,
+    cam_forward: vec4<f32>,
+    marble: vec4<f32>,
+    sun: vec4<f32>,
+    sun_col: vec4<f32>,
+    bg_col: vec4<f32>,
+    misc: vec4<f32>,
+}
+
+@group(2) @binding(0) var<uniform> scene: SceneUniforms;
+@group(2) @binding(1) var<storage, read> params: array<vec4<f32>>;
+";
+
+/// Static WGSL helper library, ported from
+/// `game_folder/shaders/compute/utility/distance_estimators.glsl`
+/// (`de_sphere`, `de_box`, `mengerFold`, `planeFold`) plus a euclidean
+/// `fmodulo`/`mod_fold` pair (port of `FoldModulo`'s `fmodulo`) and
+/// `rot_xy`/`rot_yz`/`rot_zx` (replacing GLSL's in-place `p.xy *= mat`,
+/// which WGSL's no-swizzle-assignment rule forbids).
+const HELPERS: &str = "\
+fn de_sphere(p: vec4<f32>, r: f32) -> f32 {
+    return (length(p.xyz) - r) / p.w;
+}
+
+fn de_box(p: vec4<f32>, s: vec3<f32>) -> f32 {
+    let a = abs(p.xyz) - s;
+    return (min(max(max(a.x, a.y), a.z), 0.0) + length(max(a, vec3<f32>(0.0)))) / p.w;
+}
+
+fn menger_fold(p: ptr<function, vec4<f32>>) {
+    var a = min((*p).x - (*p).y, 0.0);
+    (*p).x -= a;
+    (*p).y += a;
+    a = min((*p).x - (*p).z, 0.0);
+    (*p).x -= a;
+    (*p).z += a;
+    a = min((*p).y - (*p).z, 0.0);
+    (*p).y -= a;
+    (*p).z += a;
+}
+
+fn plane_fold(p: vec4<f32>, n: vec3<f32>, o: f32) -> vec4<f32> {
+    let d = 2.0 * min(0.0, dot(p.xyz, n) - o);
+    return vec4<f32>(p.xyz - d * n, p.w);
+}
+
+// Euclidean modulo (result always in [0, b)); port of FoldModulo::fmodulo.
+fn fmodulo(a: f32, b: f32) -> f32 {
+    let r = a % b;
+    return select(r, r + b, r < 0.0);
+}
+
+fn mod_fold(x: f32, m: f32) -> f32 {
+    return abs(fmodulo(x - m * 0.5, m) - m * 0.5);
+}
+
+fn rot_xy(p: vec4<f32>, m: mat2x2<f32>) -> vec4<f32> {
+    let v = m * p.xy;
+    return vec4<f32>(v.x, v.y, p.z, p.w);
+}
+
+fn rot_yz(p: vec4<f32>, m: mat2x2<f32>) -> vec4<f32> {
+    let v = m * p.yz;
+    return vec4<f32>(p.x, v.x, v.y, p.w);
+}
+
+fn rot_zx(p: vec4<f32>, m: mat2x2<f32>) -> vec4<f32> {
+    let v = m * p.zx;
+    return vec4<f32>(v.y, p.y, v.x, p.w);
+}
+";
+
+/// Ray marcher + shading, appended after the scene functions in
+/// [`generate_shader`]. Kept deliberately simple (v1 — DESIGN.md §5); will
+/// grow toward MMCE's quality (shadows, fog, glow, GI) later.
+const MARCHER: &str = "\
+const MAX_STEPS: i32 = 256;
+const MAX_DIST: f32 = 30.0;
+
+fn map(p: vec3<f32>) -> f32 {
+    return de_scene(vec4<f32>(p, 1.0));
+}
+
+fn calc_normal(p: vec3<f32>, eps: f32) -> vec3<f32> {
+    let dx = vec3<f32>(eps, 0.0, 0.0);
+    let dy = vec3<f32>(0.0, eps, 0.0);
+    let dz = vec3<f32>(0.0, 0.0, eps);
+    return normalize(vec3<f32>(
+        map(p + dx) - map(p - dx),
+        map(p + dy) - map(p - dy),
+        map(p + dz) - map(p - dz),
+    ));
+}
+
+fn sphere_hit(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, r: f32) -> f32 {
+    let oc = ro - center;
+    let b = dot(oc, rd);
+    let c = dot(oc, oc) - r * r;
+    let h = b * b - c;
+    if (h < 0.0) {
+        return -1.0;
+    }
+    let t = -b - sqrt(h);
+    if (t < 0.0) {
+        return -1.0;
+    }
+    return t;
+}
+
+// Soft shadow via the standard sphere-tracing min-ratio technique.
+fn shadow(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
+    var t = 0.01;
+    var min_ratio = 1.0;
+    for (var i = 0; i < 64; i++) {
+        let d = map(ro + rd * t);
+        if (d < 0.0005) {
+            return 0.0;
+        }
+        min_ratio = min(min_ratio, d / t);
+        t = t + d;
+        if (t > MAX_DIST) {
+            break;
+        }
+    }
+    return clamp(8.0 * min_ratio, 0.0, 1.0);
+}
+
+// Vertical gradient of bg_col plus a sun disc/glow.
+fn sky(rd: vec3<f32>) -> vec3<f32> {
+    let t = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
+    var col = mix(scene.bg_col.rgb * 0.6, scene.bg_col.rgb, t);
+    let sun_amt = max(dot(rd, scene.sun.xyz), 0.0);
+    col += scene.sun_col.rgb * pow(sun_amt, 256.0) * 2.0;
+    col += scene.sun_col.rgb * pow(sun_amt, 8.0) * 0.3;
+    return col;
+}
+
+fn tonemap(col: vec3<f32>) -> vec3<f32> {
+    let x = col / (1.0 + col);
+    return pow(x, vec3<f32>(1.0 / 2.2));
+}
+
+@fragment
+fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
+    let ndc = vec2<f32>(mesh.uv.x * 2.0 - 1.0, 1.0 - mesh.uv.y * 2.0);
+    let aspect = scene.misc.x;
+    let ro = scene.cam_pos.xyz;
+    let rd = normalize(
+        scene.cam_right.xyz * ndc.x * aspect
+        + scene.cam_up.xyz * ndc.y
+        + scene.cam_forward.xyz * scene.cam_forward.w
+    );
+
+    var marble_t = -1.0;
+    if (scene.marble.w > 0.0) {
+        marble_t = sphere_hit(ro, rd, scene.marble.xyz, scene.marble.w);
+    }
+
+    var t = 0.0;
+    var iters = 0;
+    var hit_frac = false;
+    for (var i = 0; i < MAX_STEPS; i++) {
+        iters = i;
+        let d = map(ro + rd * t);
+        if (d < 2e-4 * max(t, 0.05)) {
+            hit_frac = true;
+            break;
+        }
+        t = t + d;
+        if (t > MAX_DIST) {
+            break;
+        }
+    }
+
+    let marble_hit = marble_t > 0.0 && (!hit_frac || marble_t < t);
+
+    if (marble_hit) {
+        let mp = ro + rd * marble_t;
+        let mn = normalize(mp - scene.marble.xyz);
+        let refl = reflect(rd, mn);
+        let fresnel = pow(1.0 - max(dot(-rd, mn), 0.0), 5.0);
+        let marble_col = mix(scene.bg_col.rgb * 0.5, sky(refl), 0.04 + 0.96 * fresnel);
+        return vec4<f32>(tonemap(marble_col), 1.0);
+    }
+
+    if (hit_frac) {
+        let p = ro + rd * t;
+        let eps = 1e-4 * max(t, 0.05);
+        let n = calc_normal(p, eps);
+        let col = col_scene(vec4<f32>(p, 1.0));
+        let base = clamp(col.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+        let diffuse = max(dot(n, scene.sun.xyz), 0.0);
+        let sh = shadow(p + n * 2.0 * eps, scene.sun.xyz);
+        let ambient = 0.3 + 0.4 * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0);
+        let ao = 1.0 - f32(iters) / f32(MAX_STEPS);
+        var color = base * (ambient + diffuse * sh) * ao;
+        color = mix(color, sky(rd), smoothstep(0.0, MAX_DIST, t));
+        return vec4<f32>(tonemap(color), 1.0);
+    }
+
+    return vec4<f32>(tonemap(sky(rd)), 1.0);
+}
+";
+
+/// Bindings decl + helpers, nothing else (DESIGN.md §5).
+pub fn generate_library() -> String {
+    let mut s = String::with_capacity(BINDINGS.len() + HELPERS.len() + 1);
+    s.push_str(BINDINGS);
+    s.push('\n');
+    s.push_str(HELPERS);
+    s
+}
+
+/// `de_scene` + `col_scene` for `obj` (DESIGN.md §5).
+pub fn generate_scene_functions(obj: &Object) -> String {
+    let mut w = CodeWriter::new();
+
+    w.color_pass = false;
+    w.writeln("fn de_scene(p_in: vec4<f32>) -> f32 {");
+    w.indent();
+    w.writeln("var p = p_in;");
+    w.writeln("var d = 1e20;");
+    w.emit_object(obj);
+    w.writeln("return d;");
+    w.dedent();
+    w.writeln("}");
+    w.writeln("");
+
+    w.color_pass = true;
+    w.writeln("fn col_scene(p_in: vec4<f32>) -> vec4<f32> {");
+    w.indent();
+    w.writeln("var p = p_in;");
+    w.writeln("var d = 1e20;");
+    w.writeln("var orbit = vec3<f32>(0.0);");
+    w.emit_object(obj);
+    w.writeln("return vec4<f32>(orbit, d);");
+    w.dedent();
+    w.writeln("}");
+
+    w.finish()
+}
+
+/// Full fragment shader for the app: import line + bindings + library +
+/// scene functions + ray marcher + `fragment` entry (DESIGN.md §5).
+pub fn generate_shader(obj: &Object) -> String {
+    let mut s = String::new();
+    s.push_str("#import bevy_sprite::mesh2d_vertex_output::VertexOutput\n\n");
+    s.push_str(&generate_library());
+    s.push('\n');
+    s.push_str(&generate_scene_functions(obj));
+    s.push_str("\n\n");
+    s.push_str(MARCHER);
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{scenes, IntValue, Params, ScalarValue, Vec3Value};
+
+    /// The concrete `VertexOutput` struct (verified against bevy_sprite
+    /// 0.16.1, DESIGN.md §5), substituted for the `#import` line so naga can
+    /// parse+validate the shader standalone (no naga_oil preprocessing).
+    const VERTEX_OUTPUT_STRUCT: &str = "\
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) world_position: vec4<f32>,
+    @location(1) world_normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+}
+";
+
+    fn full_source(obj: &Object) -> String {
+        let shader = generate_shader(obj);
+        let import_line = "#import bevy_sprite::mesh2d_vertex_output::VertexOutput\n";
+        assert!(
+            shader.contains(import_line),
+            "expected shader to start with the bevy_sprite import line"
+        );
+        shader.replacen(import_line, VERTEX_OUTPUT_STRUCT, 1)
+    }
+
+    /// Parse + validate `source` with naga; panic with the naga error
+    /// (naga errors carry line/column) and the full source on failure, so
+    /// test failures are debuggable without weakening validation.
+    fn validate_wgsl(source: &str) {
+        let module = match naga::front::wgsl::parse_str(source) {
+            Ok(m) => m,
+            Err(e) => panic!(
+                "WGSL parse error:\n{}\n\n--- source ---\n{source}",
+                e.emit_to_string(source)
+            ),
+        };
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::default(),
+        );
+        if let Err(e) = validator.validate(&module) {
+            panic!(
+                "WGSL validation error:\n{}\n\n--- source ---\n{source}",
+                e.emit_to_string(source)
+            );
+        }
+    }
+
+    fn sphere(r: f32) -> Object {
+        Object::Sphere {
+            radius: ScalarValue::Const(r),
+        }
+    }
+
+    fn cuboid(he: glam::Vec3) -> Object {
+        Object::Cuboid {
+            half_extent: Vec3Value::Const(he),
+        }
+    }
+
+    #[test]
+    fn demo_scene_shader_validates() {
+        let mut params = Params::new();
+        let (obj, _handles) = scenes::demo_scene(&mut params);
+        validate_wgsl(&full_source(&obj));
+    }
+
+    #[test]
+    fn nested_union_validates() {
+        // Regression test for the C++ ObjectClosest::GLSL bug: fixed local
+        // names (`original_p_union` etc.) collide when a Union is nested
+        // inside a Union.
+        let obj = Object::Union(
+            Box::new(Object::Union(
+                Box::new(sphere(1.0)),
+                Box::new(cuboid(glam::Vec3::splat(1.0))),
+            )),
+            Box::new(sphere(2.0)),
+        );
+        validate_wgsl(&full_source(&obj));
+    }
+
+    #[test]
+    fn nested_repeat_validates() {
+        // Regression test for the C++ FoldRepeat::GLSL bug: a function-static
+        // depth counter for the loop variable name, which is wrong for a
+        // Repeat nested inside a Repeat (both would want depth 0 freshly per
+        // call, or collide/drift across calls).
+        let inner = Fold::Repeat {
+            count: IntValue::Const(3),
+            inner: Box::new(Fold::Abs),
+        };
+        let outer = Fold::Repeat {
+            count: IntValue::Const(2),
+            inner: Box::new(inner),
+        };
+        let obj = Object::Fractal {
+            fold: outer,
+            base: Box::new(sphere(1.0)),
+        };
+        validate_wgsl(&full_source(&obj));
+    }
+
+    #[test]
+    fn generation_is_deterministic() {
+        let mut params = Params::new();
+        let (obj, _handles) = scenes::demo_scene(&mut params);
+        let a = generate_shader(&obj);
+        let b = generate_shader(&obj);
+        assert_eq!(a, b, "regenerating the same tree must be byte-identical");
+
+        // Also check generate_scene_functions independently (it's the entry
+        // point exercising CodeWriter's fresh-name counter directly).
+        let c = generate_scene_functions(&obj);
+        let d = generate_scene_functions(&obj);
+        assert_eq!(c, d);
+    }
+
+    #[test]
+    fn small_tree_snippets() {
+        let obj = Object::Union(
+            Box::new(sphere(1.0)),
+            Box::new(cuboid(glam::Vec3::new(2.0, 3.0, 4.0))),
+        );
+        let src = generate_scene_functions(&obj);
+        assert!(src.contains("de_sphere(p, 1.0)"), "{src}");
+        assert!(src.contains("de_box(p, vec3<f32>(2.0, 3.0, 4.0))"), "{src}");
+        assert!(src.contains("fn de_scene(p_in: vec4<f32>) -> f32 {"), "{src}");
+        assert!(
+            src.contains("fn col_scene(p_in: vec4<f32>) -> vec4<f32> {"),
+            "{src}"
+        );
+    }
+
+    #[test]
+    fn color_pass_only_has_orbit_statements() {
+        let mut params = Params::new();
+        let (obj, _handles) = scenes::demo_scene(&mut params);
+        let src = generate_scene_functions(&obj);
+
+        let split = src.find("fn col_scene").expect("col_scene present");
+        let (de_part, col_part) = src.split_at(split);
+
+        assert!(
+            !de_part.contains("orbit ="),
+            "de_scene must not contain orbit statements:\n{de_part}"
+        );
+        assert!(
+            col_part.contains("orbit ="),
+            "col_scene must contain orbit statements:\n{col_part}"
+        );
+    }
+}

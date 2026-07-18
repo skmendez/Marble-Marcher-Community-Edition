@@ -226,11 +226,14 @@ replaced when we chase MMCE quality):
   miss when `t > 30.0`. Track iteration count.
 - Normal: central differences of `de_scene`, step `1e-4 * max(t, 0.05)`.
 - Marble: analytic ray-sphere intersection; if closer than the fractal hit,
-  shade as glossy: `mix(sky(reflect(rd,n)), bg tint, fresnel)`.
+  shade as glossy: `mix(bg tint, sky(reflect(rd,n)), 0.04 + 0.96*fresnel)`
+  (fresnel weights the *reflection* — more reflective at grazing angles).
 - Fractal shading: `base = clamp(col_scene(hit).rgb, vec3(0), vec3(1))`;
   diffuse `max(dot(n, sun), 0)`; one shadow ray (march toward sun from
   `hit + n*2*eps`, soft factor `min(1, 8*min_ratio)`); ambient
-  `0.3 + 0.4*dot(n, up)`; AO from iteration count
+  `0.3 + 0.4*max(dot(n, up), 0)` (clamped — a negative ambient can push the
+  color negative and `pow` a negative base to NaN in the tonemapper); AO from
+  iteration count
   `1 - iters/256`; combine, then fog `mix(color, bg, smoothstep(0, 30, t))`.
 - Sky: vertical gradient of `bg_col` + sun disc glow. Tonemap: `x/(1+x)`,
   gamma 1/2.2.

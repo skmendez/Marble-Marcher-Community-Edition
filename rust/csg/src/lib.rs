@@ -19,6 +19,7 @@
 //!  - `codegen` (M3): WGSL generation from an `Object` tree
 //!  - `physics` (M5): marble/collider simulation against an `Object`
 
+pub mod codegen;
 pub mod fold;
 pub mod object;
 pub mod scenes;
