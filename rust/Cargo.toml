@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["csg", "app"]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+# Keep incremental rebuilds of our own code fast, but optimize dependencies
+# (bevy/wgpu are unusably slow fully unoptimized).
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
