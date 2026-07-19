@@ -8,22 +8,27 @@
 //! camera-relative thrust, no kill plane). Defaults to `Flying` (see
 //! `GravityMode`'s doc for why).
 //!
-//! WASD sign convention (`Rolling` mode; verified algebraically against
-//! `CameraOrbit`'s basis — rust/DESIGN.md §7): given `step_marble`'s
-//! camera-yaw-relative movement formula and `CameraOrbit`'s basis (forward
-//! points from the eye toward the target, i.e. roughly `-(sin(yaw), 0,
-//! cos(yaw))`), setting `dy = -1` for W yields velocity `+(sin(yaw), 0,
-//! cos(yaw))` — the direction from the target *away* from the eye, i.e. W
-//! rolls the marble away from the orbiting camera (and S rolls it back
-//! toward the camera). Setting `dx = +1` for D yields `+(cos(yaw), 0,
-//! -sin(yaw))`, which is exactly `CameraOrbit`'s `right` vector at zero
-//! pitch — D rolls the marble in the camera's screen-right direction. In
-//! `Flying` mode the same `dx`/`dy` inputs instead drive full 3D thrust
-//! along wherever the camera is actually pointed (see `step_marble`'s doc).
+//! WASD sign convention: setting `dy = -1` for W moves the marble *toward*
+//! the camera's eye position; S (`dy = +1`) moves it away, deeper along the
+//! view direction. Verified empirically (not just derived on paper) by
+//! logging `marble.pos` before/after holding each key against a live build
+//! and checking its displacement's dot product against the camera's
+//! `forward` vector — an earlier version of this comment claimed the
+//! opposite ("W rolls the marble away from the orbiting camera... S rolls
+//! it back toward the camera"), derived purely algebraically from
+//! `CameraOrbit`'s basis and never actually checked against a running
+//! build; that derivation had a sign error, which is exactly why the touch
+//! pinch gesture built on top of it (below) felt backwards to begin with.
+//! Setting `dx = +1` for D yields `+(cos(yaw), 0, -sin(yaw))`, which is
+//! exactly `CameraOrbit`'s `right` vector at zero pitch — D rolls the
+//! marble in the camera's screen-right direction (unaffected by the above
+//! correction). In `Flying` mode the same `dx`/`dy` inputs instead drive
+//! full 3D thrust along wherever the camera is actually pointed (see
+//! `step_marble`'s doc).
 //!
 //! Touch: a 2-finger pinch feeds an additional `dy` (on top of WASD's) via
 //! `touch::read_two_finger_gesture` — pinching in pulls the marble toward
-//! the camera (S-equivalent), pinching out pushes it away (W-equivalent).
+//! the camera (W-equivalent), pinching out pushes it away (S-equivalent).
 //! Read directly here (not via an `Update`-schedule intermediary) for the
 //! same reason WASD is: `Touches`, like `ButtonInput<KeyCode>`, is input
 //! state readable from any schedule, not something that needs per-frame

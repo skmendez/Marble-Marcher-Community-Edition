@@ -103,21 +103,31 @@ impl SceneKind {
                 rad: beware_of_bumps::MARBLE_RAD,
                 kill_y: beware_of_bumps::KILL_Y,
             },
-            // The sponge/sphere occupy roughly a +-1-unit region around the
-            // origin (verified: de(origin) ~= 1.4 for menger_sponge at our
-            // MENGER_DEPTH/color, i.e. comfortably outside any solid
-            // material, not embedded) -- spawning at the origin also
-            // matches where the scene's camera already looks by default
-            // (`setup`'s Menger camera override targets `Vec3::ZERO`).
-            // `rad = 0.05` is a reasonable size relative to that scale
-            // (small enough to fly into the sponge's recursive tunnels),
-            // chosen by visual inspection, not derived from any level data
-            // (there isn't any). `kill_y = -50.0` is a generous
-            // "fell way out of the structure" bound for if `G` is toggled
-            // to `Rolling` mode while in one of these scenes.
+            // `Vec3::ZERO` (the original spawn point, deep inside the
+            // sponge's internal void network) has de(origin) ~= 1.4 -- not
+            // embedded, but *occluded*: from the exterior corner view
+            // `setup`'s camera override actually uses, the origin sits
+            // behind the sponge's own outer walls, so the marble was
+            // invisible there no matter how large it was (confirmed: even
+            // `rad = 0.3` at the origin was still fully hidden). This spawn
+            // point instead sits in the open-air pocket just in front of
+            // that same exterior corner, along the camera's default view
+            // ray -- found by probing `Object::de` at points between the
+            // camera's eye and the origin (`rust/csg/examples/spawn_probe.rs`
+            // in git history) for a spot with a comfortable safety margin
+            // (de ~= 0.34, well clear of `rad` below) that's still close
+            // to the visible surface, not floating off in empty sky.
+            // `rad = 0.15` (up from the original 0.05) is sized to read
+            // clearly at the correspondingly closer orbit distance
+            // (`setup`'s Menger camera override, below) rather than for
+            // fitting through the sponge's recursive tunnels, since a
+            // marble spawned outside the structure doesn't need to.
+            // `kill_y = -50.0` is a generous "fell way out of the
+            // structure" bound for if `G` is toggled to `Rolling` mode
+            // while in one of these scenes.
             Self::MengerSponge | Self::MengerSphere => MarbleSpawn {
-                start: Vec3::ZERO,
-                rad: 0.05,
+                start: Vec3::new(3.32, 1.69, 3.22),
+                rad: 0.15,
                 kill_y: -50.0,
             },
         }
@@ -315,33 +325,37 @@ pub fn setup(
     // at the marble's actual resting-surface normal, at a marble_rad-scaled
     // distance — see its doc comment). The static display fractals are a
     // completely different world scale (menger_sponge/menger_sphere are
-    // roughly unit-scale after their final 0.33 shrink) and have no marble
-    // to aim at, so that default puts the camera embedded inside the
-    // fractal geometry (visibly: ray-marching noise/grain from being too
-    // close to/inside thin recursive struts). Use a plain, un-embedded view
-    // instead for those.
+    // roughly unit-scale after their final 0.33 shrink), so that default's
+    // yaw/pitch/distance don't make sense here — use a view tuned for these
+    // scenes' own scale instead.
     //
-    // `distance = 3.0` (the first value tried here) is *still* embedded:
-    // measured with a probe replicating this exact yaw/pitch/fov against
-    // `Object::de` (see git history / session notes), at distance 3.0 the
-    // camera sits close enough that most of the 32x18 sample grid hits the
-    // surface within `t ~= 0.4` world units, giving a normal-estimation
-    // epsilon (`1e-4 * max(t, 0.05)`) so tiny that `calc_normal`'s central
-    // difference is dominated by float32 noise -- ~85% of sampled pixels had
-    // a near-zero (degenerate/undefined-direction) raw normal, which is
-    // exactly the speckle/static look. Critically, this was reproduced
-    // identically across `MENGER_DEPTH` 2..14 -- the recursion depth is not
-    // the cause (deeper folds stop changing anything observable past about
-    // depth 7, since the coordinate pattern is by then self-similar). Once
-    // `distance` is large enough that hits land at `t` on the order of a
-    // few world units, degenerate normals drop to zero at every depth
-    // tried, confirming this is purely a "camera embedded in/hugging the
-    // geometry" problem, not a marcher-precision-vs-recursion-depth one.
+    // `yaw`/`pitch` were originally chosen (at `distance = 3.0`, then later
+    // `6.0`) to find an *un-embedded* view of the sponge's exterior corner:
+    // an early attempt at `distance = 3.0` put the camera close enough that
+    // most of a 32x18 probe grid hit the surface within `t ~= 0.4` world
+    // units, giving a normal-estimation epsilon (`1e-4 * max(t, 0.05)`) so
+    // tiny that `calc_normal`'s central difference was dominated by float32
+    // noise -- ~85% of sampled pixels had a degenerate raw normal, the exact
+    // speckle/static look. This was reproduced identically across
+    // `MENGER_DEPTH` 2..14 (recursion depth wasn't the cause), confirming a
+    // "camera embedded in/hugging the geometry" problem specific to being
+    // too close along *this* yaw/pitch's view ray -- the same yaw/pitch is
+    // kept here since it's a verified-safe viewing angle of the corner.
+    //
+    // `distance = 1.2` is tuned relative to the marble's spawn point
+    // (`spawn_params`, not the origin): since the camera always orbits
+    // `marble.pos` (`update_material`), and the marble now spawns in the
+    // open-air pocket just in front of the corner (see `spawn_params`'s doc
+    // for why, and how that point was found) rather than deep inside the
+    // sponge, this is a close, marble-centric framing -- similar in spirit
+    // to the Demo scene's own close default -- verified visually to show
+    // the marble prominently with the corner as a backdrop, no
+    // embedded-camera speckle.
     let is_menger = matches!(kind, SceneKind::MengerSponge | SceneKind::MengerSphere);
     if is_menger {
         camera_orbit.yaw = 0.8;
         camera_orbit.pitch = 0.35;
-        camera_orbit.distance = 6.0;
+        camera_orbit.distance = 1.2;
     }
 
     let (object, handles) = match kind {

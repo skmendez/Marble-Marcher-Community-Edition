@@ -84,21 +84,25 @@ fn pinch_delta_distance(prev_a: Vec2, prev_b: Vec2, cur_a: Vec2, cur_b: Vec2) ->
 
 /// Converts a pinch-distance delta (screen pixels/frame) into a `dy` value
 /// in `step_marble`'s WASD convention (physics_sys.rs's doc comment:
-/// `dy = +1` is S / toward-camera, `dy = -1` is W / away-from-camera).
-/// Confirmed mapping: pinch IN (fingers together, distance decreasing, the
-/// conventional "zoom out" motion) pulls the marble TOWARD the camera, so a
-/// *negative* `pinch_delta_distance` (distance shrinking) must produce a
-/// *positive* `dy` — hence the negation. `PINCH_SENSITIVITY` is a first-pass
-/// value (not yet feel-tuned on a real touchscreen): chosen so a brisk
-/// ~20px/frame pinch motion saturates to the same |dy| = 1 magnitude a held
-/// WASD key gives; `step_marble` already clamps combined `(dx, dy)`
-/// magnitude to 1, so overshooting this is harmless, just not meaningfully
-/// "more" force.
+/// `dy = -1` is W / toward-camera, `dy = +1` is S / away-from-camera).
+/// Pinch IN (fingers together, distance decreasing) pulls the marble
+/// TOWARD the camera, matching W — so a *negative* `pinch_delta_distance`
+/// (distance shrinking) must produce a *negative* `dy`, i.e. no sign flip
+/// needed at all. (An earlier version of this function negated the delta,
+/// on the belief that `dy = +1`/S was the toward-camera direction — that
+/// belief was backwards, verified empirically against a live build; see
+/// physics_sys.rs's WASD doc for how. That bug is exactly why pinching in
+/// used to send the marble away from the camera instead of toward it.)
+/// `PINCH_SENSITIVITY` is a first-pass value (not yet feel-tuned on a real
+/// touchscreen): chosen so a brisk ~20px/frame pinch motion saturates to
+/// the same |dy| = 1 magnitude a held WASD key gives; `step_marble` already
+/// clamps combined `(dx, dy)` magnitude to 1, so overshooting this is
+/// harmless, just not meaningfully "more" force.
 const PINCH_SENSITIVITY: f32 = 0.05;
 
 fn pinch_dy(prev_a: Vec2, prev_b: Vec2, cur_a: Vec2, cur_b: Vec2) -> f32 {
     let delta = pinch_delta_distance(prev_a, prev_b, cur_a, cur_b);
-    (-PINCH_SENSITIVITY * delta).clamp(-1.0, 1.0)
+    (PINCH_SENSITIVITY * delta).clamp(-1.0, 1.0)
 }
 
 /// Change in the angle of the line between two touches, this frame vs last
@@ -176,27 +180,27 @@ mod tests {
 
     #[test]
     fn pinch_in_moves_marble_toward_camera() {
-        // Fingers 10 units apart, moving to 6 units apart (pinching in /
-        // the "zoom out" motion) -- must give a positive dy (toward camera,
-        // per physics_sys.rs's S convention).
+        // Fingers 10 units apart, moving to 6 units apart (pinching in) --
+        // must give a negative dy (toward camera, per physics_sys.rs's W
+        // convention -- see that file's doc for how this was verified).
         let prev_a = Vec2::new(-5.0, 0.0);
         let prev_b = Vec2::new(5.0, 0.0);
         let cur_a = Vec2::new(-3.0, 0.0);
         let cur_b = Vec2::new(3.0, 0.0);
         let dy = pinch_dy(prev_a, prev_b, cur_a, cur_b);
-        assert!(dy > 0.0, "pinch-in should give positive (toward-camera) dy, got {dy}");
+        assert!(dy < 0.0, "pinch-in should give negative (toward-camera) dy, got {dy}");
     }
 
     #[test]
     fn pinch_out_moves_marble_away_from_camera() {
-        // Fingers 6 units apart, spreading to 10 units apart ("zoom in"
-        // motion) -- must give a negative dy (away from camera, W convention).
+        // Fingers 6 units apart, spreading to 10 units apart -- must give a
+        // positive dy (away from camera, S convention).
         let prev_a = Vec2::new(-3.0, 0.0);
         let prev_b = Vec2::new(3.0, 0.0);
         let cur_a = Vec2::new(-5.0, 0.0);
         let cur_b = Vec2::new(5.0, 0.0);
         let dy = pinch_dy(prev_a, prev_b, cur_a, cur_b);
-        assert!(dy < 0.0, "pinch-out should give negative (away-from-camera) dy, got {dy}");
+        assert!(dy > 0.0, "pinch-out should give positive (away-from-camera) dy, got {dy}");
     }
 
     #[test]
@@ -208,15 +212,15 @@ mod tests {
 
     #[test]
     fn pinch_dy_saturates_to_unit_range() {
-        // A huge, unrealistic single-frame pinch motion must still clamp to
-        // [-1, 1] (step_marble's own combined-magnitude clamp assumes
+        // A huge, unrealistic single-frame pinch-in motion must still clamp
+        // to [-1, 1] (step_marble's own combined-magnitude clamp assumes
         // roughly WASD-scale inputs).
         let prev_a = Vec2::new(-500.0, 0.0);
         let prev_b = Vec2::new(500.0, 0.0);
         let cur_a = Vec2::ZERO;
         let cur_b = Vec2::ZERO;
         let dy = pinch_dy(prev_a, prev_b, cur_a, cur_b);
-        assert_eq!(dy, 1.0);
+        assert_eq!(dy, -1.0);
     }
 
     #[test]

@@ -53,18 +53,27 @@ const SCALE_UP_THRESHOLD_MS: f64 = 14.0;
 /// jumping straight to a clamp extreme, so a resolution change isn't a
 /// visible "pop" — it compounds over repeated sustained-bad/good ticks,
 /// reaching the clamp range within a handful of adjustment intervals (at
-/// ~4/sec, see `ADJUST_INTERVAL_SECS`, that's still well under a second)
-/// rather than needing many.
+/// ~1 per `ADJUST_INTERVAL_SECS`, that's a few seconds, not instant).
 const SCALE_STEP_DOWN: f32 = 0.95;
 const SCALE_STEP_UP: f32 = 1.05;
 
-/// How often (seconds) the controller re-evaluates the scale. Throttled
-/// deliberately coarser than every frame: `FrameTimeWindow`'s own ~1s
-/// rolling average doesn't change meaningfully faster than this anyway, and
-/// re-checking faster would just mean more redundant (unchanged) decisions,
-/// not better ones. ~4/sec is frequent enough to feel responsive without
-/// being "every frame" churn.
-pub const ADJUST_INTERVAL_SECS: f64 = 0.25;
+/// How often (seconds) the controller re-evaluates the scale. Originally
+/// 0.25 (~4/sec), tuned assuming each adjustment was a cheap in-place
+/// texture resize — every *actual* scale change (not just re-evaluation)
+/// now rebuilds the render target as a whole new `Image` asset
+/// (`present::resize_marcher_render_target`'s doc explains why: resizing
+/// the same asset in place while a camera is actively rendering into it is
+/// a known upstream Bevy bug that permanently freezes that camera's
+/// output). That's a meaningfully heavier operation than a plain resize,
+/// and at 4/sec during a multi-second convergence (observed: 14 real
+/// resizes in 8 seconds under sustained load) it was visibly janky —
+/// reported as "a lot of screen jitter," not the smooth ramp this was
+/// supposed to be. Throttled much coarser here (a few adjustments over
+/// several seconds, not per-frame) trades a bit of convergence speed for
+/// actually looking smooth, which matters more for a background
+/// quality/perf tradeoff than shaving a couple of seconds off how fast it
+/// reacts to a real, sustained slowdown.
+pub const ADJUST_INTERVAL_SECS: f64 = 1.5;
 
 /// Given the current internal-resolution scale and the latest averaged
 /// frame time (ms), returns the next scale to use: steps down if frame time
