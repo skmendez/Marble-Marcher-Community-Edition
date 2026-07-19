@@ -6,13 +6,11 @@
 //! same `Object`/`Params` the shader renders, driven by WASD (camera-yaw
 //! relative) with `R` to force a respawn; the orbit camera follows it.
 
-mod adaptive_res;
 mod camera;
 mod debug_screenshot;
 mod fps_overlay;
 mod mrrm;
 mod physics_sys;
-mod present;
 mod render;
 mod touch;
 
@@ -20,7 +18,6 @@ use bevy::prelude::*;
 use bevy::sprite::Material2dPlugin;
 use bevy::window::WindowResolution;
 
-use adaptive_res::{adjust_resolution_scale, AdaptiveResolution};
 use camera::{orbit_camera_input, CameraOrbit};
 use debug_screenshot::DebugScreenshotPlugin;
 use fps_overlay::FpsOverlayPlugin;
@@ -29,9 +26,6 @@ use mrrm::{
     update_coarse_material, CoarseMarcherMaterial,
 };
 use physics_sys::marble_physics_tick;
-use present::{
-    resize_marcher_render_target, setup_present_pipeline, sync_present_quad_scale, PresentMaterial,
-};
 use render::{setup, sync_quad_scale, update_material, FineMarcherMaterial};
 use touch::touch_camera_input;
 
@@ -81,46 +75,22 @@ fn main() {
         }))
         .add_plugins(Material2dPlugin::<FineMarcherMaterial>::default())
         .add_plugins(Material2dPlugin::<CoarseMarcherMaterial>::default())
-        .add_plugins(Material2dPlugin::<PresentMaterial>::default())
         .add_plugins(FpsOverlayPlugin)
         .add_plugins(DebugScreenshotPlugin)
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<CameraOrbit>()
-        .init_resource::<AdaptiveResolution>()
-        // `setup_present_pipeline` looks up the `MarcherCamera` entity
-        // `setup` spawns (to redirect its render target to the offscreen
-        // image), so it must run strictly after it -- see present.rs.
         // `setup_mrrm_pipeline` (mrrm.rs) needs `setup`'s `SceneState` (the
         // scene tree + params buffer, to build the coarse shader/material)
         // and corrects `setup`'s placeholder `FineMarcherMaterial::coarse`
-        // handle once the real coarse render target exists -- chained last
-        // since neither ordering constraint requires it to run before
-        // `setup_present_pipeline`, just after `setup`.
-        .add_systems(
-            Startup,
-            (setup, setup_present_pipeline, setup_mrrm_pipeline).chain(),
-        )
+        // handle once the real coarse render target exists.
+        .add_systems(Startup, (setup, setup_mrrm_pipeline).chain())
         .add_systems(FixedUpdate, marble_physics_tick)
         .add_systems(
             Update,
             (
-                // Adaptive-resolution controller (adaptive_res.rs) first
-                // decides the scale, then the render target is actually
-                // resized to match (present.rs) -- both throttled
-                // internally, so this runs every frame cheaply -- and only
-                // then do the quad-scale-sync/uniform-writing systems run,
-                // so they always see this frame's final render-target size.
-                // `resize_coarse_render_target` (mrrm.rs) is keyed off the
-                // *fine* target's size, so it must run after
-                // `resize_marcher_render_target` resolves that for this
-                // frame; `sync_coarse_quad_scale`/`update_coarse_material`
-                // likewise need the coarse target's own size settled first.
-                adjust_resolution_scale,
-                resize_marcher_render_target,
                 resize_coarse_render_target,
                 sync_quad_scale,
                 sync_coarse_quad_scale,
-                sync_present_quad_scale,
                 orbit_camera_input,
                 touch_camera_input,
                 update_material,

@@ -16,14 +16,7 @@
 use bevy::input::touch::Touches;
 use bevy::prelude::*;
 
-use crate::camera::{CameraOrbit, PITCH_LIMIT, PITCH_SENSITIVITY, YAW_SENSITIVITY};
-
-/// Same sensitivity feel as mouse-drag (`camera.rs`'s `orbit_camera_input`):
-/// touch move deltas arrive in the same logical pixel units as
-/// `MouseMotion`'s, so reusing the identical constants keeps swipe and
-/// mouse-drag orbiting at the same speed.
-const SWIPE_YAW_SENSITIVITY: f32 = YAW_SENSITIVITY;
-const SWIPE_PITCH_SENSITIVITY: f32 = PITCH_SENSITIVITY;
+use crate::camera::CameraOrbit;
 
 /// A minimal, owned snapshot of one touch's current and previous-frame
 /// position — decoupled from `bevy::input::touch::Touch` (a borrowed,
@@ -105,15 +98,40 @@ fn pinch_dy(prev_a: Vec2, prev_b: Vec2, cur_a: Vec2, cur_b: Vec2) -> f32 {
     (PINCH_SENSITIVITY * delta).clamp(-1.0, 1.0)
 }
 
+/// Largest single-frame rotation treated as a genuine gesture rather than a
+/// tracking artifact — see `rotate_delta_angle`'s doc. About 130 degrees:
+/// comfortably above any plausible intentional two-finger twist in one
+/// ~16ms frame (the existing test suite's fastest case is a 90-degree
+/// rotation), comfortably below the ~180-degree jump a same-frame swap of
+/// which touch is "first" would produce.
+const MAX_PLAUSIBLE_ROTATE_DELTA: f32 = 2.3;
+
 /// Change in the angle of the line between two touches, this frame vs last
 /// (radians, wrapped to `[-PI, PI]` so a gesture crossing the +/-PI seam
-/// doesn't register as a near-full-turn jump). Fed 1:1 into `CameraOrbit::roll`
-/// — the standard, expected mapping for a two-finger rotate gesture (turn
-/// your fingers by X radians, the view rolls by X radians).
+/// doesn't register as a near-full-turn jump, then clamped to
+/// `MAX_PLAUSIBLE_ROTATE_DELTA`). Fed 1:1 into `CameraOrbit::roll` — the
+/// standard, expected mapping for a two-finger rotate gesture (turn your
+/// fingers by X radians, the view rolls by X radians).
+///
+/// The clamp guards against a specific failure mode reported as "pinching
+/// sometimes sends the ball sideways instead of straight toward/away from
+/// the camera": `active_snapshots_sorted` pairs touches by sorting on their
+/// `id`, assuming each id stays bound to the same physical finger for the
+/// gesture's duration. If a touch's reported id ever changes mid-gesture
+/// (a real possibility on some touchscreens/browsers, not just a
+/// theoretical one), the two snapshots this function compares could
+/// silently swap which one is "a" and which is "b" between frames — the
+/// pinch distance math is symmetric to that swap (harmless), but this
+/// angle is not: a swap flips it by very close to +/-PI in one single
+/// frame. Nothing about that spurious near-180-degree roll would be
+/// visually distinguishable from "camera suddenly spun," which combined
+/// with an otherwise-straight pinch push reads exactly as "the ball went
+/// sideways." Clamping (not dropping to zero) still lets a genuinely fast
+/// real rotation register, just not an implausible single-frame near-flip.
 fn rotate_delta_angle(prev_a: Vec2, prev_b: Vec2, cur_a: Vec2, cur_b: Vec2) -> f32 {
     let prev_angle = (prev_b - prev_a).to_angle();
     let cur_angle = (cur_b - cur_a).to_angle();
-    wrap_angle(cur_angle - prev_angle)
+    wrap_angle(cur_angle - prev_angle).clamp(-MAX_PLAUSIBLE_ROTATE_DELTA, MAX_PLAUSIBLE_ROTATE_DELTA)
 }
 
 fn wrap_angle(a: f32) -> f32 {
@@ -150,22 +168,20 @@ pub fn read_two_finger_gesture(touches: &Touches) -> Option<TwoFingerGesture> {
 }
 
 /// Touch-driven camera control (`Update` schedule, alongside
-/// `orbit_camera_input`): exactly 1 active touch swipes (orbits yaw/pitch,
-/// identical feel to mouse-drag); 2+ applies this frame's rotate delta to
-/// `roll` (the pinch half of a 2-touch gesture is read separately, directly
-/// inside the physics tick — see `physics_sys.rs`).
+/// `orbit_camera_input`): exactly 1 active touch swipes (`CameraOrbit::drag`,
+/// identical feel to mouse-drag — same sensitivity constants, applied via
+/// the same method); 2+ applies this frame's rotate delta to `roll` (the
+/// pinch half of a 2-touch gesture is read separately, directly inside the
+/// physics tick — see `physics_sys.rs`).
 pub fn touch_camera_input(touches: Res<Touches>, mut orbit: ResMut<CameraOrbit>) {
     let active_count = touches.iter().count();
     if active_count == 1 {
         if let Some(touch) = touches.iter().next() {
-            let delta = touch.delta();
-            orbit.yaw -= delta.x * SWIPE_YAW_SENSITIVITY;
-            orbit.pitch = (orbit.pitch - delta.y * SWIPE_PITCH_SENSITIVITY)
-                .clamp(-PITCH_LIMIT, PITCH_LIMIT);
+            orbit.drag(touch.delta());
         }
     } else if active_count >= 2 {
         if let Some(gesture) = read_two_finger_gesture(&touches) {
-            orbit.roll += gesture.rotate_delta;
+            orbit.roll(gesture.rotate_delta);
         }
     }
 }

@@ -29,6 +29,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, ShaderRef};
 use bevy::render::storage::ShaderStorageBuffer;
 use bevy::sprite::Material2d;
+use bevy::ui::IsDefaultUiCamera;
+use bevy::window::PrimaryWindow;
 
 use marble_csg::codegen::generate_shader;
 use marble_csg::physics::{Marble, PhysicsConfig};
@@ -40,7 +42,6 @@ use marble_csg::{Object, Params};
 
 use crate::camera::CameraOrbit;
 use crate::physics_sys::MarbleState;
-use crate::present::MarcherRenderTarget;
 
 /// Which scene to build, selected via `MM_SCENE=demo|classic_only|menger_sponge|menger_sphere`.
 /// Defaults to `MengerSponge` — this is what actually determines the
@@ -215,17 +216,15 @@ mod scene_uniforms_impl {
 }
 pub use scene_uniforms_impl::SceneUniforms;
 
-/// Marker for the ray-marcher's own camera -- distinguishes it from the
-/// present pass's camera (`present.rs`) so `present::setup_present_pipeline`
-/// can find it (to redirect its render target to the offscreen image) and
-/// so `sync_quad_scale`/other marcher-only systems don't need to guess which
-/// `Camera2d` entity is which.
+/// Marker for the ray-marcher's own camera -- distinguishes it from
+/// `mrrm.rs`'s `CoarseCamera` so marcher-only systems don't need to guess
+/// which `Camera2d` entity is which.
 #[derive(Component)]
 pub struct MarcherCamera;
 
-/// Marker for the ray-marcher's fullscreen quad -- distinguishes it from the
-/// present pass's fullscreen quad (`present::PresentQuad`), both of which
-/// are `Mesh2d` entities, so `sync_quad_scale` only scales this one.
+/// Marker for the ray-marcher's fullscreen quad -- distinguishes it from
+/// `mrrm.rs`'s coarse-pass quad, both of which are `Mesh2d` entities, so
+/// `sync_quad_scale` only scales this one.
 #[derive(Component)]
 pub struct MarcherQuad;
 
@@ -353,8 +352,7 @@ pub fn setup(
     // embedded-camera speckle.
     let is_menger = matches!(kind, SceneKind::MengerSponge | SceneKind::MengerSphere);
     if is_menger {
-        camera_orbit.yaw = 0.8;
-        camera_orbit.pitch = 0.35;
+        camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35);
         camera_orbit.distance = 1.2;
     }
 
@@ -407,23 +405,25 @@ pub fn setup(
 
     let params_buffer = storage_buffers.add(ShaderStorageBuffer::from(params.slots().to_vec()));
     // `coarse: Handle::default()` is a placeholder -- `mrrm::setup_mrrm_pipeline`
-    // (a Startup system chained to run after this one, same "spawn now,
-    // redirect once the real asset exists" pattern `present.rs` already uses
-    // for `MarcherCamera`'s render target) corrects it to the real coarse
-    // hit-distance render target once that `Image` exists. Every Startup
-    // system finishes before the first frame is ever rendered, so this
-    // placeholder is never actually read by the GPU.
+    // (a Startup system chained to run after this one) corrects it to the
+    // real coarse hit-distance render target once that `Image` exists.
+    // Every Startup system finishes before the first frame is ever
+    // rendered, so this placeholder is never actually read by the GPU.
     let material = materials.add(FineMarcherMaterial {
         scene: SceneUniforms::default(),
         params: params_buffer.clone(),
         coarse: Handle::default(),
     });
 
-    // Target is left at the default (the primary window) here;
-    // `present::setup_present_pipeline` (a Startup system chained to run
-    // right after this one) redirects it to the offscreen render target
-    // once that target `Image` exists.
-    commands.spawn((Camera2d, MarcherCamera));
+    // Renders straight to the primary window (no adaptive-resolution
+    // render-to-texture indirection -- removed after it turned out to cause
+    // visible jitter even throttled way down, not worth the complexity for
+    // now). `IsDefaultUiCamera` pins the FPS overlay (`fps_overlay.rs`) to
+    // this camera explicitly rather than relying on bevy_ui's "highest-order
+    // camera targeting the window" fallback -- there's only one
+    // window-targeting camera now, so the fallback would pick this one
+    // anyway, but being explicit doesn't depend on that staying true.
+    commands.spawn((Camera2d, MarcherCamera, IsDefaultUiCamera));
     commands.spawn((
         Mesh2d(meshes.add(Rectangle::new(1.0, 1.0).mesh())),
         MeshMaterial2d(material.clone()),
@@ -449,21 +449,18 @@ pub fn setup(
     });
 }
 
-/// Keeps the marcher quad's world size equal to its render target's pixel
-/// size every frame (cheap, robust across resizes — DESIGN.md §8). Since
-/// adaptive internal resolution (`adaptive_res.rs`/`present.rs`), the
-/// marcher no longer renders straight to the window: it renders into an
-/// offscreen `Image` (`MarcherRenderTarget`) that can be smaller than the
-/// window, so this is keyed off that render target's own current pixel
-/// size, not `Window::width()/height()` (that's `present::sync_present_quad_scale`'s
-/// job now, for the *present* quad which does still always fill the window).
+/// Keeps the fullscreen quad's world size equal to the window's pixel size
+/// every frame (cheap, robust across resizes — DESIGN.md §8).
 pub fn sync_quad_scale(
-    render_target: Res<MarcherRenderTarget>,
+    windows: Query<&Window, With<PrimaryWindow>>,
     mut quads: Query<&mut Transform, With<MarcherQuad>>,
 ) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
     for mut transform in &mut quads {
-        transform.scale.x = render_target.size.x as f32;
-        transform.scale.y = render_target.size.y as f32;
+        transform.scale.x = window.width();
+        transform.scale.y = window.height();
     }
 }
 
@@ -492,7 +489,7 @@ pub fn update_material(
     time: Res<Time>,
     orbit: Res<CameraOrbit>,
     marble_state: Res<MarbleState>,
-    render_target: Res<MarcherRenderTarget>,
+    windows: Query<&Window, With<PrimaryWindow>>,
     mut scene_state: ResMut<SceneState>,
     mut materials: ResMut<Assets<FineMarcherMaterial>>,
     mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
@@ -522,17 +519,10 @@ pub fn update_material(
         }
     }
 
-    // Sourced from the marcher's actual internal render target
-    // (`MarcherRenderTarget`, adaptively resized by
-    // `present::resize_marcher_render_target`) rather than the window: with
-    // adaptive internal resolution these can differ, and both this aspect
-    // ratio (the shader's horizontal FOV scaling) and `misc.z` (the
-    // shader's distance-scaled hit threshold) need to match what's actually
-    // being rendered pixel-for-pixel, not the window it's later upscaled
-    // into by the present pass.
-    let size = render_target.size;
-    let aspect = size.x as f32 / (size.y.max(1)) as f32;
-    let resolution_height = size.y as f32;
+    let (aspect, resolution_height) = windows
+        .single()
+        .map(|w| (w.width() / w.height().max(1.0), w.physical_height() as f32))
+        .unwrap_or((1.0, 1.0));
 
     // Every scene has a real marble now (`SceneKind::has_marble`): the
     // camera always follows it.

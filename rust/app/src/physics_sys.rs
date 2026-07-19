@@ -108,6 +108,20 @@ pub fn marble_physics_tick(
         dy += gesture.pinch_dy;
     }
 
+    // `step_marble` (marble_csg, a pure-logic crate with no bevy
+    // dependency) still takes yaw/pitch as separate scalars, so derive them
+    // fresh from `CameraOrbit::orientation` each tick rather than storing
+    // them anywhere: `forward = orientation * Vec3::NEG_Z` (`eye_and_basis`'s
+    // definition), and inverting the same spherical-coordinates formula
+    // `orientation_from_yaw_pitch` uses recovers `(yaw, pitch)`. This is a
+    // one-shot decomposition, not persistent state, so it can't accumulate
+    // the gimbal-lock behavior `CameraOrbit` itself was reworked to avoid —
+    // it's recomputed from the authoritative quaternion every single tick,
+    // never fed back into anything that remembers it between frames.
+    let forward = orbit.forward();
+    let cam_pitch = (-forward.y).asin();
+    let cam_yaw = (-forward.x).atan2(-forward.z);
+
     let kill_y = marble_state.kill_y;
     let start = marble_state.start_pos;
     let MarbleState { marble, cfg, .. } = &mut *marble_state;
@@ -116,8 +130,8 @@ pub fn marble_physics_tick(
         &scene.object,
         &scene.params,
         Vec2::new(dx, dy),
-        orbit.yaw,
-        orbit.pitch,
+        cam_yaw,
+        cam_pitch,
         cfg,
         kill_y,
         start,
