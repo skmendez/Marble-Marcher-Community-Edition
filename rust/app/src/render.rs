@@ -118,7 +118,12 @@ mod scene_uniforms_impl {
         pub sun_col: Vec4,
         /// rgb.
         pub bg_col: Vec4,
-        /// x aspect (w/h), y time seconds, z/w reserved.
+        /// x aspect (w/h), y time seconds, z render target height in
+        /// physical pixels (drives the marcher's distance-scaled hit
+        /// threshold -- see `codegen.rs`'s `MARCHER`; deliberately read from
+        /// a uniform each frame rather than a shader constant so a future
+        /// adaptive-render-resolution feature doesn't need this touched),
+        /// w reserved.
         pub misc: Vec4,
     }
 
@@ -393,10 +398,10 @@ pub fn update_material(
         }
     }
 
-    let aspect = windows
+    let (aspect, resolution_height) = windows
         .single()
-        .map(|w| w.width() / w.height().max(1.0))
-        .unwrap_or(1.0);
+        .map(|w| (w.width() / w.height().max(1.0), w.physical_height() as f32))
+        .unwrap_or((1.0, 1.0));
 
     // Only the Demo scene has a real marble: follow it with the camera and
     // render it; the static display fractals get a fixed origin-centered
@@ -421,7 +426,7 @@ pub fn update_material(
             sun: beware_of_bumps::sun_dir().extend(0.0),
             sun_col: beware_of_bumps::SUN_COL.extend(0.0),
             bg_col: beware_of_bumps::BG.extend(0.0),
-            misc: Vec4::new(aspect, t, 0.0, 0.0),
+            misc: Vec4::new(aspect, t, resolution_height, 0.0),
         };
     }
 }

@@ -294,6 +294,25 @@ fn rot_zx(p: vec4<f32>, m: mat2x2<f32>) -> vec4<f32> {
 const MARCHER: &str = "\
 const MAX_STEPS: i32 = 256;
 const MAX_DIST: f32 = 30.0;
+// Starting over-relaxation factor for the primary march (Enhanced Sphere
+// Tracing; ported from MMCE's ray_march, utility/ray_marching.glsl). MMCE
+// reads this from a runtime `overrelax` uniform we don't have a located
+// concrete value for; 1.2-1.5 is the well-established useful range in the
+// sphere-tracing literature for this technique -- picked 1.4 as a
+// reasonably aggressive middle value and verified visually (see codegen
+// tests / this change's commit message for before/after screenshots).
+const OVERRELAX: f32 = 1.4;
+// Floor for the distance-scaled hit threshold, so it never collapses to
+// (near-)zero extremely close to the camera/light. MMCE's equivalent is a
+// `MIN_DIST` uniform; we don't have one, so this is a fixed small constant.
+const MIN_HIT_DIST: f32 = 1e-5;
+const SHADOW_STEPS: i32 = 24;
+// Angular size (tangent of the half-angle) of the sun disc, controlling
+// shadow penumbra softness in the improved soft-shadow technique below --
+// MMCE passes this in as a per-scene `light_angle` parameter we don't have
+// a located concrete value for; 0.06 gives a fairly crisp but not
+// razor-hard directional-sun-like shadow, chosen by visual inspection.
+const LIGHT_ANGLE: f32 = 0.06;
 
 fn map(p: vec3<f32>) -> f32 {
     return de_scene(vec4<f32>(p, 1.0));
@@ -325,22 +344,49 @@ fn sphere_hit(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, r: f32) -> f32 {
     return t;
 }
 
-// Soft shadow via the standard sphere-tracing min-ratio technique.
-fn shadow(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
-    var t = 0.01;
-    var min_ratio = 1.0;
-    for (var i = 0; i < 64; i++) {
-        let d = map(ro + rd * t);
-        if (d < 0.0005) {
-            return 0.0;
-        }
-        min_ratio = min(min_ratio, d / t);
-        t = t + d;
+// Improved soft shadows via the closest-distance-to-the-cone technique
+// (Inigo Quilez's \"improved sphere tracing soft shadows\"; ported from
+// MMCE's shadow_march, utility/ray_marching.glsl), replacing the earlier
+// naive `min(d/t)` ratio approximation -- tracks the closest approach the
+// ray makes to any occluder along its path (via the y/d bookkeeping below,
+// not just each sample's own ratio), giving smoother, less banded
+// penumbras and converging in fewer steps for a given quality. `pixel_angle`
+// (see `fragment`'s doc) both terminates the march once further stepping
+// can't change anything visible and is used as the base occlusion test
+// (matching MMCE's `pos.w < max(fovray*dir.w, MIN_DIST)`).
+fn shadow(ro: vec3<f32>, rd: vec3<f32>, pixel_angle: f32) -> f32 {
+    var pos = ro;
+    var t = 0.0;
+    var h = map(pos);
+    var light_visibility = 1.0;
+    var ph = 1e5;
+    var d_de_dt = 0.0;
+    for (var i = 0; i < SHADOW_STEPS; i++) {
+        t += h;
+        pos += rd * h;
+        h = map(pos);
+
+        let y = h * h / (2.0 * ph);
+        let d = (h + ph) * 0.5 * (1.0 - d_de_dt);
+        let ang = d / (max(MIN_HIT_DIST, t - y) * LIGHT_ANGLE);
+        light_visibility = min(light_visibility, ang);
+
+        d_de_dt = d_de_dt * 0.75 + 0.25 * (h - ph) / ph;
+        ph = h;
+
         if (t > MAX_DIST) {
             break;
         }
+        if (h < max(t * pixel_angle, MIN_HIT_DIST)) {
+            return 0.0;
+        }
     }
-    return clamp(8.0 * min_ratio, 0.0, 1.0);
+    light_visibility = clamp(light_visibility, 0.0, 1.0);
+    // Same \"looks better and is more physically accurate for a circular
+    // light source\" remap MMCE applies (an arcsine-based curve rather than
+    // returning the raw linear visibility).
+    let lv2 = light_visibility * 2.0 - 1.0;
+    return 0.5 + (lv2 * sqrt(max(1.0 - lv2 * lv2, 0.0)) + asin(clamp(lv2, -1.0, 1.0))) / 3.14159265;
 }
 
 // Vertical gradient of bg_col plus a sun disc/glow.
@@ -369,26 +415,76 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         + scene.cam_forward.xyz * scene.cam_forward.w
     );
 
+    // Angular size of one pixel (small-angle tangent, radians-ish), used as
+    // a distance-scaled hit threshold (MMCE's \"fovray\"/cone-angle
+    // technique, utility/camera.glsl's `fovray` and ray_marching.glsl's
+    // `angle` parameter): once a step's DE value is smaller than the
+    // physical size one pixel covers at the current distance, further
+    // refinement isn't visually distinguishable, so the march can stop.
+    // `cam_forward.w` is the focal length used to build `rd` above
+    // (`f = 1/tan(halfFOV)`, vertical), so `atan(1/f)` recovers the
+    // vertical half-FOV; dividing the full vertical FOV by the vertical
+    // pixel count (`misc.z`) gives the per-pixel angular size. This
+    // threshold naturally scales with actual render resolution (via
+    // `misc.z`, read fresh each frame) rather than being a shader constant,
+    // so a future adaptive-resolution feature changing render scale won't
+    // need this touched.
+    let half_fov = atan(1.0 / scene.cam_forward.w);
+    let pixel_angle = 2.0 * half_fov / max(scene.misc.z, 1.0);
+
     var marble_t = -1.0;
     if (scene.marble.w > 0.0) {
         marble_t = sphere_hit(ro, rd, scene.marble.xyz, scene.marble.w);
     }
 
+    // Over-relaxed sphere tracing with backtrack-on-overstep (Enhanced
+    // Sphere Tracing; ported from MMCE's ray_march, utility/ray_marching.glsl)
+    // instead of naive `t += d` stepping: takes bigger-than-safe steps
+    // (`omega > 1`) to converge faster through well-behaved regions, and
+    // when a step turns out to have overshot the surface, backs off and
+    // relaxes `omega` toward 1 (more conservative) rather than tunneling
+    // through. Also tracks the best (lowest relative-error) candidate hit
+    // point seen so far, matching MMCE's `candidate_td`/`candidate_error` --
+    // not currently used for a fallback \"soft hit\" if the loop exhausts
+    // without a clean break (that's treated as a miss, same as before this
+    // change), but kept since it's needed for `t` to reflect the tightest
+    // point found once the break condition below fires.
     var t = 0.0;
+    var prev_h = 0.0;
+    var omega = OVERRELAX;
+    var candidate_t = 0.0;
+    var candidate_err = 1e20;
     var iters = 0;
     var hit_frac = false;
     for (var i = 0; i < MAX_STEPS; i++) {
         iters = i;
-        let d = map(ro + rd * t);
-        if (d < 2e-4 * max(t, 0.05)) {
-            hit_frac = true;
-            break;
-        }
-        t = t + d;
         if (t > MAX_DIST) {
             break;
         }
+        let h = map(ro + rd * t);
+        if (prev_h * omega > max(h, 0.0) + max(prev_h, 0.0)) {
+            t += (1.0 - omega) * prev_h;
+            prev_h = 0.0;
+            omega = (omega - 1.0) * 0.55 + 1.0;
+        } else {
+            let err = h / max(t, MIN_HIT_DIST);
+            if (err < candidate_err) {
+                candidate_err = err;
+                candidate_t = t;
+                if (h < 0.0) {
+                    hit_frac = true;
+                    break;
+                }
+                if (h < max(t * pixel_angle, MIN_HIT_DIST)) {
+                    hit_frac = true;
+                    break;
+                }
+            }
+            t += h * omega;
+            prev_h = h;
+        }
     }
+    t = candidate_t;
 
     let marble_hit = marble_t > 0.0 && (!hit_frac || marble_t < t);
 
@@ -441,7 +537,7 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         // negative and NaN in `tonemap`'s `pow`.
         let base = clamp(col.rgb / (1.0 + abs(col.rgb)), vec3<f32>(0.0), vec3<f32>(1.0));
         let diffuse = max(dot(n, scene.sun.xyz), 0.0);
-        let sh = shadow(p + n * 2.0 * eps, scene.sun.xyz);
+        let sh = shadow(p + n * 2.0 * eps, scene.sun.xyz, pixel_angle);
         let ambient = 0.3 + 0.4 * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0);
         let ao = 1.0 - f32(iters) / f32(MAX_STEPS);
         var color = base * (ambient + diffuse * sh) * ao;
