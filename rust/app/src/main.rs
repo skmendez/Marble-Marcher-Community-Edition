@@ -39,6 +39,27 @@ fn main() {
             primary_window: Some(Window {
                 title: "Marble Marcher CSG (Bevy)".into(),
                 resolution: window_resolution(),
+                // Web-only (no-op on native, per bevy_window 0.16.1's
+                // `Window::fit_canvas_to_parent` doc comment): makes the
+                // wasm/WebGPU build's canvas track its parent element's
+                // *actual* CSS size (bevy_winit sets the canvas's inline
+                // style to `width/height: 100%` of its parent at creation
+                // — see bevy_winit 0.16.1 `system.rs::create_windows`),
+                // which winit's own `ResizeObserver` on the canvas then
+                // reports as real `WindowResized` events. Without this,
+                // winit hard-codes the canvas's inline pixel size to the
+                // startup `window_resolution()` (`web_sys::set_canvas_size`
+                // at window creation), which beats `web/index.html`'s CSS
+                // `canvas { width: 100vw; height: 100vh }` rule (inline
+                // style always wins over a stylesheet type-selector) — so a
+                // browser/viewport resize only visually stretches the
+                // fixed-resolution canvas via that CSS instead of actually
+                // re-rendering at the new size, which reads as blur/
+                // stretching. `sync_quad_scale`/`update_material`
+                // (render.rs) already recompute the quad scale and shader
+                // aspect from `Window` every frame, so once real
+                // `WindowResized` events flow, resize-follow is free.
+                fit_canvas_to_parent: true,
                 ..default()
             }),
             ..default()
