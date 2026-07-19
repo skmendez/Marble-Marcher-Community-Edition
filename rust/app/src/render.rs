@@ -4,6 +4,12 @@
 //! Bind group layout (must match `marble_csg::codegen::BINDINGS`, group 2):
 //!   binding 0: `scene: SceneUniforms` (uniform)
 //!   binding 1: `params: array<vec4<f32>>` (read-only storage)
+//!   binding 2: `coarse_tex: texture_2d<f32>` (MRRM coarse pre-pass's cached
+//!   hit-distance render target -- `mrrm.rs`; fine pass
+//!   ([`FineMarcherMaterial`]) only. The coarse pass's own material
+//!   ([`crate::mrrm::CoarseMarcherMaterial`]) has no binding 2 -- see that
+//!   module's doc for why coarse/fine are two separate `Material2d`s with
+//!   two separate generated shader modules instead of one shared one.
 //!
 //! Deviation from DESIGN.md §8: the design sketches `params` as a bare
 //! `Vec<Vec4>` field with `#[storage(1, read_only)]`. In bevy_render
@@ -18,6 +24,7 @@
 //! recompile — the design's actual intent, just via an asset indirection).
 
 use bevy::asset::weak_handle;
+use bevy::image::Image;
 use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, ShaderRef};
 use bevy::render::storage::ShaderStorageBuffer;
@@ -166,12 +173,17 @@ mod scene_uniforms_impl {
         pub sun_col: Vec4,
         /// rgb.
         pub bg_col: Vec4,
-        /// x aspect (w/h), y time seconds, z render target height in
-        /// physical pixels (drives the marcher's distance-scaled hit
-        /// threshold -- see `codegen.rs`'s `MARCHER`; deliberately read from
-        /// a uniform each frame rather than a shader constant so a future
-        /// adaptive-render-resolution feature doesn't need this touched),
-        /// w reserved.
+        /// x aspect (w/h), y time seconds, z *this pass's own* render target
+        /// height in physical pixels (drives the marcher's distance-scaled
+        /// hit threshold -- see `codegen.rs`'s `MARCH_CORE`; deliberately
+        /// read from a uniform each frame rather than a shader constant so
+        /// adaptive-render-resolution doesn't need this touched -- and
+        /// "this pass's own": the fine and coarse materials each write
+        /// their *own* render target's height here, not the other's, since
+        /// each pass's cone-angle threshold must match its own resolution),
+        /// w MRRM on/off flag (fine pass only -- `mrrm::mrrm_enabled`, see
+        /// `update_material`'s doc; unused/always 0 on the coarse pass's
+        /// own material, which doesn't read it).
         pub misc: Vec4,
     }
 
@@ -207,15 +219,26 @@ pub struct MarcherCamera;
 #[derive(Component)]
 pub struct MarcherQuad;
 
+/// The fine (full-resolution) marcher's material. Two bindings unchanged
+/// from pre-MRRM (`scene`/`params`), plus the MRRM coarse pre-pass's cached
+/// hit-distance render target (`mrrm.rs`) as a third -- no paired `#[sampler]`
+/// binding: the generated shader only ever reads this texture with
+/// `textureLoad` (exact texel, matching the coarse pass's own texel grid),
+/// never `textureSample`, so no sampler is needed at all. See
+/// `marble_csg::codegen::COARSE_TEXTURE_BINDING`'s doc for a known,
+/// environment-specific (llvmpipe-only) crash this exact data flow triggers
+/// in this project's native test sandbox -- not a bug in this binding/shader.
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
-pub struct MarcherMaterial {
+pub struct FineMarcherMaterial {
     #[uniform(0)]
     pub scene: SceneUniforms,
     #[storage(1, read_only)]
     pub params: Handle<ShaderStorageBuffer>,
+    #[texture(2)]
+    pub coarse: Handle<Image>,
 }
 
-impl Material2d for MarcherMaterial {
+impl Material2d for FineMarcherMaterial {
     fn fragment_shader() -> ShaderRef {
         MARCHER_SHADER_HANDLE.into()
     }
@@ -270,7 +293,7 @@ pub struct SceneState {
     pub object: Object,
     pub params: Params,
     pub handles: SceneHandles,
-    pub material: Handle<MarcherMaterial>,
+    pub material: Handle<FineMarcherMaterial>,
     pub params_buffer: Handle<ShaderStorageBuffer>,
 }
 
@@ -280,7 +303,7 @@ pub struct SceneState {
 pub fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<MarcherMaterial>>,
+    mut materials: ResMut<Assets<FineMarcherMaterial>>,
     mut shaders: ResMut<Assets<Shader>>,
     mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
     mut camera_orbit: ResMut<CameraOrbit>,
@@ -369,9 +392,17 @@ pub fn setup(
     );
 
     let params_buffer = storage_buffers.add(ShaderStorageBuffer::from(params.slots().to_vec()));
-    let material = materials.add(MarcherMaterial {
+    // `coarse: Handle::default()` is a placeholder -- `mrrm::setup_mrrm_pipeline`
+    // (a Startup system chained to run after this one, same "spawn now,
+    // redirect once the real asset exists" pattern `present.rs` already uses
+    // for `MarcherCamera`'s render target) corrects it to the real coarse
+    // hit-distance render target once that `Image` exists. Every Startup
+    // system finishes before the first frame is ever rendered, so this
+    // placeholder is never actually read by the GPU.
+    let material = materials.add(FineMarcherMaterial {
         scene: SceneUniforms::default(),
         params: params_buffer.clone(),
+        coarse: Handle::default(),
     });
 
     // Target is left at the default (the primary window) here;
@@ -449,7 +480,7 @@ pub fn update_material(
     marble_state: Res<MarbleState>,
     render_target: Res<MarcherRenderTarget>,
     mut scene_state: ResMut<SceneState>,
-    mut materials: ResMut<Assets<MarcherMaterial>>,
+    mut materials: ResMut<Assets<FineMarcherMaterial>>,
     mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
 ) {
     let t = time.elapsed_secs();
@@ -506,7 +537,13 @@ pub fn update_material(
             sun: beware_of_bumps::sun_dir().extend(0.0),
             sun_col: beware_of_bumps::SUN_COL.extend(0.0),
             bg_col: beware_of_bumps::BG.extend(0.0),
-            misc: Vec4::new(aspect, t, resolution_height, 0.0),
+            // w: MRRM on/off (`crate::mrrm::mrrm_enabled`) -- a uniform flag
+            // rather than skipping the coarse pass/texture binding entirely,
+            // so every frame's cameras/passes are identical whether MRRM is
+            // on or off and an `MM_MRRM=0` vs `MM_MRRM=1` A/B screenshot
+            // comparison at a fixed camera state only ever differs in this
+            // one value (see `mrrm::mrrm_enabled`'s doc).
+            misc: Vec4::new(aspect, t, resolution_height, if crate::mrrm::mrrm_enabled() { 1.0 } else { 0.0 }),
         };
     }
 }

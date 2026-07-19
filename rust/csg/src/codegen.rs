@@ -288,10 +288,47 @@ fn rot_zx(p: vec4<f32>, m: mat2x2<f32>) -> vec4<f32> {
 }
 ";
 
-/// Ray marcher + shading, appended after the scene functions in
-/// [`generate_shader`]. Kept deliberately simple (v1 — DESIGN.md §5); will
-/// grow toward MMCE's quality (shadows, fog, glow, GI) later.
-const MARCHER: &str = "\
+/// Extra binding the *fine* marcher shader alone needs, on top of the
+/// `scene`/`params` bindings every pass shares (`BINDINGS` above): the
+/// coarse pass's cached hit-distance render target (MRRM — see `mrrm.rs` in
+/// the app crate), read with `textureLoad` (exact texel, no sampler needed)
+/// rather than `textureSample` -- a coarse texel is already a
+/// many-fine-pixels-wide approximation, so exact sampling loses nothing an
+/// interpolated sample would have given anyway.
+///
+/// ⚠ Known issue, environment-specific, *not* a bug in this shader: on this
+/// project's llvmpipe (Mesa's software Vulkan renderer, used as this
+/// project's native/CI fallback where no real GPU is available) test
+/// environment, feeding *any* value derived from a texture fetch of this
+/// binding -- via `textureLoad` here, or `textureSample` (tried as a
+/// candidate fix, produced an identical result) -- into the fine march
+/// loop's starting `t` (`march_scene` in `MARCH_CORE`, a 256-iteration
+/// branchy loop) reproducibly segfaults llvmpipe's shader JIT. Root-caused
+/// by careful bisection (see this change's session notes/commit message for
+/// the full trail): naga validates the generated shader without error;
+/// simpler variants (the texture fetch computed but *not* fed to
+/// `march_scene`, or fed into a tiny/trivial loop) run without crashing;
+/// the `MM_MRRM=0` fallback (which never executes this data flow at
+/// runtime, since the `if` guarding it is skipped) never crashes either.
+/// This points at a genuine llvmpipe JIT compiler limitation triggered by
+/// this specific code shape, not a spec violation or logic error -- real
+/// GPU drivers (native Vulkan/Metal/DX12) and the browser WebGPU backend
+/// this project also targets (`--features web`) are a completely different
+/// code path and not expected to share it. Shipped as originally designed
+/// (`textureLoad`, no sampler) since that's the simpler, more obviously
+/// correct approach and switching to `textureSample` bought nothing.
+/// Verify this change's actual on-screen behavior on real GPU hardware or
+/// in a browser build before relying on llvmpipe-only testing.
+const COARSE_TEXTURE_BINDING: &str = "\
+@group(2) @binding(2) var coarse_tex: texture_2d<f32>;
+";
+
+/// The over-relaxed march loop + its supporting constants, shared verbatim
+/// (DESIGN.md-style "no duplicated logic") between the coarse pass
+/// (`COARSE_MARCHER`) and the fine pass (`MARCHER`) -- both call
+/// `march_scene` with their own starting `t`/`pixel_angle`; only what happens
+/// before (ray setup) and after (miss sentinel vs. full shading) differs.
+const MARCH_CORE: &str = "\
 const MAX_STEPS: i32 = 256;
 const MAX_DIST: f32 = 30.0;
 // Starting over-relaxation factor for the primary march (Enhanced Sphere
@@ -306,6 +343,152 @@ const OVERRELAX: f32 = 1.4;
 // (near-)zero extremely close to the camera/light. MMCE's equivalent is a
 // `MIN_DIST` uniform; we don't have one, so this is a fixed small constant.
 const MIN_HIT_DIST: f32 = 1e-5;
+
+fn map(p: vec3<f32>) -> f32 {
+    return de_scene(vec4<f32>(p, 1.0));
+}
+
+// Result of `march_scene`: `t` is the best (lowest relative-error) candidate
+// distance found (see the loop's `candidate_t` bookkeeping below); `hit`
+// is false for a MAX_DIST/MAX_STEPS miss (matches the pre-MRRM `hit_frac`
+// semantics exactly -- callers must not treat `t` as meaningful when `hit`
+// is false); `iters` is the loop iteration the break/exhaustion happened at,
+// needed by the fine pass's ambient-occlusion term.
+struct MarchResult {
+    t: f32,
+    hit: bool,
+    iters: i32,
+}
+
+// Over-relaxed sphere tracing with backtrack-on-overstep (Enhanced Sphere
+// Tracing; ported from MMCE's ray_march, utility/ray_marching.glsl) instead
+// of naive `t += d` stepping: takes bigger-than-safe steps (`omega > 1`) to
+// converge faster through well-behaved regions, and when a step turns out to
+// have overshot the surface, backs off and relaxes `omega` toward 1 (more
+// conservative) rather than tunneling through. Also tracks the best
+// (lowest relative-error) candidate hit point seen so far, matching MMCE's
+// `candidate_td`/`candidate_error` -- not currently used for a fallback
+// \"soft hit\" if the loop exhausts without a clean break (that's treated as
+// a miss, same as before this change), but kept since it's needed for `t`
+// to reflect the tightest point found once the break condition below fires.
+//
+// `t0` is the starting distance -- `0.0` for a from-the-camera march (the
+// coarse pass always, and the fine pass when MRRM is disabled or the coarse
+// pass reported a miss for this texel), or the MRRM coarse-pass's
+// backed-off hit-distance guess otherwise (`render.rs`/`mrrm.rs`). Starting
+// past zero is exactly as safe as starting at zero: `candidate_err`'s
+// distance-scaled threshold and the backtrack-on-overstep logic don't assume
+// `t0 == 0` anywhere, so a wrong (too-far or too-near) `t0` just costs extra
+// steps or triggers a backtrack, never a missed/incorrect hit -- see
+// `render.rs`'s `fragment` doc for why this makes MRRM safe even when the
+// coarse guess is wrong.
+fn march_scene(ro: vec3<f32>, rd: vec3<f32>, t0: f32, pixel_angle: f32) -> MarchResult {
+    var t = t0;
+    var prev_h = 0.0;
+    var omega = OVERRELAX;
+    var candidate_t = t0;
+    var candidate_err = 1e20;
+    var iters = 0;
+    var hit_frac = false;
+    for (var i = 0; i < MAX_STEPS; i++) {
+        iters = i;
+        if (t > MAX_DIST) {
+            break;
+        }
+        let h = map(ro + rd * t);
+        if (prev_h * omega > max(h, 0.0) + max(prev_h, 0.0)) {
+            t += (1.0 - omega) * prev_h;
+            prev_h = 0.0;
+            omega = (omega - 1.0) * 0.55 + 1.0;
+        } else {
+            let err = h / max(t, MIN_HIT_DIST);
+            if (err < candidate_err) {
+                candidate_err = err;
+                candidate_t = t;
+                if (h < 0.0) {
+                    hit_frac = true;
+                    break;
+                }
+                if (h < max(t * pixel_angle, MIN_HIT_DIST)) {
+                    hit_frac = true;
+                    break;
+                }
+            }
+            t += h * omega;
+            prev_h = h;
+        }
+    }
+    return MarchResult(candidate_t, hit_frac, iters);
+}
+";
+
+/// Coarse MRRM pre-pass fragment shader (see `mrrm.rs` in the app crate):
+/// marches `de_scene` from `t=0` exactly like the fine pass used to
+/// pre-MRRM, but skips all shading (no `calc_normal`/`col_scene`/`shadow`)
+/// and writes just the resulting hit distance -- or `-1.0` on a miss -- into
+/// the R channel of its render target (G/B unused, A=1), for the fine pass
+/// to read back as a starting-`t` guess.
+///
+/// Returns a full `vec4<f32>` (not a bare `f32`) even though only R is
+/// meaningful: Bevy's 2D camera pipeline always draws into an intermediate
+/// "main texture" at a fixed format it picks itself -- `bevy_render`
+/// 0.16.1's `prepare_view_targets` uses `ViewTarget::TEXTURE_FORMAT_HDR`
+/// (`Rgba16Float`) when the camera has `hdr: true` set (`mrrm.rs`'s
+/// `CoarseCamera`), or `TextureFormat::bevy_default()` otherwise -- *not*
+/// whatever format the camera's actual target `Image` is; a later
+/// (`bevy_core_pipeline::upscaling`) full-screen blit pass converts that
+/// intermediate into the real target's actual format. Both of those
+/// intermediate formats are 4-channel, so the draw pipeline's fragment
+/// output must be a `vec4<f32>` regardless of the destination texture's own
+/// channel count -- returning a bare scalar here mismatches what the base
+/// `Mesh2dPipeline` pipeline descriptor declares and fails pipeline
+/// validation (confirmed by trying it: \"RenderPipeline ... uses
+/// attachments with formats \\[Some(Rgba8UnormSrgb)\\]\" vs. our
+/// pipeline's declared format).
+///
+/// Named `fragment` (not `fragment_coarse`) even though it lives in its own
+/// module, separate from the fine shader's `fragment` below: bevy_sprite's
+/// `Mesh2dPipeline` hardcodes the fragment stage's entry-point name to
+/// `\"fragment\"` for every `Material2d` (verified in bevy_sprite 0.16.1's
+/// `mesh2d/mesh.rs::specialize`, which only lets a material swap the shader
+/// *module* via `Material2d::fragment_shader()`, not the entry-point name) --
+/// so this has to be its own complete WGSL module (its own `de_scene`/
+/// `col_scene`/`march_scene` copies, generated fresh by
+/// `generate_coarse_shader`) rather than a second entry point coexisting
+/// with `fragment` in the same module `generate_shader` produces.
+const COARSE_MARCHER: &str = "\
+@fragment
+fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
+    let ndc = vec2<f32>(mesh.uv.x * 2.0 - 1.0, 1.0 - mesh.uv.y * 2.0);
+    let aspect = scene.misc.x;
+    let ro = scene.cam_pos.xyz;
+    let rd = normalize(
+        scene.cam_right.xyz * ndc.x * aspect
+        + scene.cam_up.xyz * ndc.y
+        + scene.cam_forward.xyz * scene.cam_forward.w
+    );
+
+    // Cone-angle threshold computed from *this* (coarse) pass's own
+    // resolution (`scene.misc.z` here is the coarse render target's height,
+    // written per-frame by `mrrm.rs` -- deliberately not the fine
+    // resolution): a coarse texel covers many fine pixels' worth of solid
+    // angle, so using the fine cone angle would let this march step past
+    // thin geometry a real fine ray would actually hit.
+    let half_fov = atan(1.0 / scene.cam_forward.w);
+    let pixel_angle = 2.0 * half_fov / max(scene.misc.z, 1.0);
+
+    let result = march_scene(ro, rd, 0.0, pixel_angle);
+    if (result.hit) {
+        return vec4<f32>(result.t, 0.0, 0.0, 1.0);
+    }
+    return vec4<f32>(-1.0, 0.0, 0.0, 1.0);
+}
+";
+
+/// Ray marcher + shading, appended after the scene functions in
+/// [`generate_shader`]. Kept deliberately simple (v1 — DESIGN.md §5); will
+/// grow toward MMCE's quality (shadows, fog, glow, GI) later.
+const MARCHER: &str = "\
 const SHADOW_STEPS: i32 = 24;
 // Angular size (tangent of the half-angle) of the sun disc, controlling
 // shadow penumbra softness in the improved soft-shadow technique below --
@@ -313,10 +496,6 @@ const SHADOW_STEPS: i32 = 24;
 // a located concrete value for; 0.06 gives a fairly crisp but not
 // razor-hard directional-sun-like shadow, chosen by visual inspection.
 const LIGHT_ANGLE: f32 = 0.06;
-
-fn map(p: vec3<f32>) -> f32 {
-    return de_scene(vec4<f32>(p, 1.0));
-}
 
 fn calc_normal(p: vec3<f32>, eps: f32) -> vec3<f32> {
     let dx = vec3<f32>(eps, 0.0, 0.0);
@@ -437,54 +616,45 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         marble_t = sphere_hit(ro, rd, scene.marble.xyz, scene.marble.w);
     }
 
-    // Over-relaxed sphere tracing with backtrack-on-overstep (Enhanced
-    // Sphere Tracing; ported from MMCE's ray_march, utility/ray_marching.glsl)
-    // instead of naive `t += d` stepping: takes bigger-than-safe steps
-    // (`omega > 1`) to converge faster through well-behaved regions, and
-    // when a step turns out to have overshot the surface, backs off and
-    // relaxes `omega` toward 1 (more conservative) rather than tunneling
-    // through. Also tracks the best (lowest relative-error) candidate hit
-    // point seen so far, matching MMCE's `candidate_td`/`candidate_error` --
-    // not currently used for a fallback \"soft hit\" if the loop exhausts
-    // without a clean break (that's treated as a miss, same as before this
-    // change), but kept since it's needed for `t` to reflect the tightest
-    // point found once the break condition below fires.
-    var t = 0.0;
-    var prev_h = 0.0;
-    var omega = OVERRELAX;
-    var candidate_t = 0.0;
-    var candidate_err = 1e20;
-    var iters = 0;
-    var hit_frac = false;
-    for (var i = 0; i < MAX_STEPS; i++) {
-        iters = i;
-        if (t > MAX_DIST) {
-            break;
-        }
-        let h = map(ro + rd * t);
-        if (prev_h * omega > max(h, 0.0) + max(prev_h, 0.0)) {
-            t += (1.0 - omega) * prev_h;
-            prev_h = 0.0;
-            omega = (omega - 1.0) * 0.55 + 1.0;
-        } else {
-            let err = h / max(t, MIN_HIT_DIST);
-            if (err < candidate_err) {
-                candidate_err = err;
-                candidate_t = t;
-                if (h < 0.0) {
-                    hit_frac = true;
-                    break;
-                }
-                if (h < max(t * pixel_angle, MIN_HIT_DIST)) {
-                    hit_frac = true;
-                    break;
-                }
-            }
-            t += h * omega;
-            prev_h = h;
+    // MRRM (multi-resolution ray marching): start this march from the
+    // coarse pre-pass's cached hit distance for this pixel instead of the
+    // camera (`t=0`), skipping almost all of the empty-space traversal
+    // neighboring pixels in the same coarse texel already redid
+    // independently. `scene.misc.w` is the MRRM on/off toggle (`MM_MRRM`,
+    // see `render.rs::update_material`) -- kept as a uniform flag rather
+    // than an entity/system toggle so the *shape* of every frame is
+    // identical whether MRRM is on or off (same cameras, same passes run),
+    // which is what makes the A/B comparison this feature was verified with
+    // trustworthy: only this one value differs between the two runs.
+    var t0 = 0.0;
+    if (scene.misc.w > 0.5) {
+        let coarse_dims = vec2<i32>(textureDimensions(coarse_tex));
+        let texel = clamp(
+            vec2<i32>(mesh.uv * vec2<f32>(coarse_dims)),
+            vec2<i32>(0),
+            coarse_dims - vec2<i32>(1),
+        );
+        let coarse_t = textureLoad(coarse_tex, texel, 0).r;
+        if (coarse_t > 0.0) {
+            // Back off by roughly one coarse-pixel's angular footprint at
+            // that depth, computed from the coarse pass's *own* resolution
+            // (`coarse_dims`, not this pass's `pixel_angle`) -- a real
+            // surface just outside the coarse sample's exact ray direction
+            // (which the coarse pass, marching along a slightly different
+            // ray through the same texel, wouldn't have seen) must still
+            // land inside the fine march's search space, not be skipped
+            // past by starting exactly on top of (or beyond) the coarse
+            // guess. The over-relaxed march's backtrack-on-overstep handles
+            // the rest -- see `march_scene`'s doc.
+            let coarse_pixel_angle = 2.0 * half_fov / max(f32(coarse_dims.y), 1.0);
+            t0 = max(0.0, coarse_t - coarse_t * coarse_pixel_angle);
         }
     }
-    t = candidate_t;
+
+    let march = march_scene(ro, rd, t0, pixel_angle);
+    let t = march.t;
+    let hit_frac = march.hit;
+    let iters = march.iters;
 
     let marble_hit = marble_t > 0.0 && (!hit_frac || marble_t < t);
 
@@ -587,16 +757,47 @@ pub fn generate_scene_functions(obj: &Object) -> String {
     w.finish()
 }
 
-/// Full fragment shader for the app: import line + bindings + library +
-/// scene functions + ray marcher + `fragment` entry (DESIGN.md §5).
+/// Full fragment shader for the app's *fine* (full-resolution) marcher pass:
+/// import line, bindings, the MRRM coarse-texture binding, library, scene
+/// functions, shared march core, fine-only shading, and the `fragment`
+/// entry (DESIGN.md §5). Reads back `mrrm.rs`'s coarse pre-pass render
+/// target as a starting-distance guess (see `MARCHER`'s `fragment` doc).
 pub fn generate_shader(obj: &Object) -> String {
+    let mut s = String::new();
+    s.push_str("#import bevy_sprite::mesh2d_vertex_output::VertexOutput\n\n");
+    s.push_str(&generate_library());
+    s.push('\n');
+    s.push_str(COARSE_TEXTURE_BINDING);
+    s.push('\n');
+    s.push_str(&generate_scene_functions(obj));
+    s.push_str("\n\n");
+    s.push_str(MARCH_CORE);
+    s.push('\n');
+    s.push_str(MARCHER);
+    s
+}
+
+/// Full fragment shader for the app's MRRM *coarse* pre-pass (`mrrm.rs`):
+/// import line + bindings (no coarse-texture binding -- this pass doesn't
+/// read one) + library + scene functions + shared march core + the coarse
+/// `fragment` entry (see `COARSE_MARCHER`'s doc for why this is a wholly
+/// separate module from [`generate_shader`]'s, not a second entry point in
+/// the same one). Deliberately regenerates `de_scene`/`col_scene` from the
+/// same `obj` tree rather than sharing a compiled module with the fine
+/// shader -- cheap (shader generation/compilation is a one-time
+/// startup/scene-change cost, not per-frame), and it's what lets this pass's
+/// bind-group layout have no `coarse_tex` binding at all instead of the fine
+/// pass's.
+pub fn generate_coarse_shader(obj: &Object) -> String {
     let mut s = String::new();
     s.push_str("#import bevy_sprite::mesh2d_vertex_output::VertexOutput\n\n");
     s.push_str(&generate_library());
     s.push('\n');
     s.push_str(&generate_scene_functions(obj));
     s.push_str("\n\n");
-    s.push_str(MARCHER);
+    s.push_str(MARCH_CORE);
+    s.push('\n');
+    s.push_str(COARSE_MARCHER);
     s
 }
 
@@ -623,6 +824,18 @@ struct VertexOutput {
         assert!(
             shader.contains(import_line),
             "expected shader to start with the bevy_sprite import line"
+        );
+        shader.replacen(import_line, VERTEX_OUTPUT_STRUCT, 1)
+    }
+
+    /// Same substitution as [`full_source`], for the MRRM coarse pre-pass
+    /// shader (`generate_coarse_shader`) instead of the fine one.
+    fn full_coarse_source(obj: &Object) -> String {
+        let shader = generate_coarse_shader(obj);
+        let import_line = "#import bevy_sprite::mesh2d_vertex_output::VertexOutput\n";
+        assert!(
+            shader.contains(import_line),
+            "expected coarse shader to start with the bevy_sprite import line"
         );
         shader.replacen(import_line, VERTEX_OUTPUT_STRUCT, 1)
     }
@@ -705,6 +918,48 @@ struct VertexOutput {
         validate_wgsl(&full_source(&obj));
     }
 
+    // The same three shapes as above, run through the MRRM coarse-pass
+    // generator (`generate_coarse_shader`) instead -- its `fragment` entry,
+    // bind-group layout, and lack of a `coarse_tex` binding are different
+    // enough from the fine shader's (see `COARSE_MARCHER`'s doc) to warrant
+    // independent naga validation rather than assuming "the fine shader
+    // parses" implies "the coarse one does too".
+    #[test]
+    fn demo_scene_coarse_shader_validates() {
+        let mut params = Params::new();
+        let (obj, _handles) = scenes::demo_scene(&mut params);
+        validate_wgsl(&full_coarse_source(&obj));
+    }
+
+    #[test]
+    fn nested_union_coarse_shader_validates() {
+        let obj = Object::Union(
+            Box::new(Object::Union(
+                Box::new(sphere(1.0)),
+                Box::new(cuboid(glam::Vec3::splat(1.0))),
+            )),
+            Box::new(sphere(2.0)),
+        );
+        validate_wgsl(&full_coarse_source(&obj));
+    }
+
+    #[test]
+    fn nested_repeat_coarse_shader_validates() {
+        let inner = Fold::Repeat {
+            count: IntValue::Const(3),
+            inner: Box::new(Fold::Abs),
+        };
+        let outer = Fold::Repeat {
+            count: IntValue::Const(2),
+            inner: Box::new(inner),
+        };
+        let obj = Object::Fractal {
+            fold: outer,
+            base: Box::new(sphere(1.0)),
+        };
+        validate_wgsl(&full_coarse_source(&obj));
+    }
+
     #[test]
     fn generation_is_deterministic() {
         let mut params = Params::new();
@@ -713,11 +968,33 @@ struct VertexOutput {
         let b = generate_shader(&obj);
         assert_eq!(a, b, "regenerating the same tree must be byte-identical");
 
+        let a_coarse = generate_coarse_shader(&obj);
+        let b_coarse = generate_coarse_shader(&obj);
+        assert_eq!(
+            a_coarse, b_coarse,
+            "regenerating the same tree's coarse shader must be byte-identical"
+        );
+
         // Also check generate_scene_functions independently (it's the entry
         // point exercising CodeWriter's fresh-name counter directly).
         let c = generate_scene_functions(&obj);
         let d = generate_scene_functions(&obj);
         assert_eq!(c, d);
+    }
+
+    #[test]
+    fn coarse_shader_has_no_coarse_texture_binding() {
+        // The coarse pass must never reference its own output -- if it did,
+        // that would be a real bug (either a bind-group layout mismatch at
+        // runtime, since `CoarseMarcherMaterial` has no such binding, or --
+        // worse -- a self-referential sample of not-yet-written data).
+        let mut params = Params::new();
+        let (obj, _handles) = scenes::demo_scene(&mut params);
+        let src = generate_coarse_shader(&obj);
+        assert!(
+            !src.contains("coarse_tex"),
+            "coarse shader must not reference a coarse_tex binding:\n{src}"
+        );
     }
 
     #[test]
