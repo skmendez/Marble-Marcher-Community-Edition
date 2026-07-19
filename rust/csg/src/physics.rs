@@ -25,15 +25,19 @@ use glam::{Vec2, Vec3};
 use crate::{Object, Params};
 
 /// Which physics model [`step_marble`] uses. See the module doc for what
-/// each mode is a port of.
+/// each mode is a port of. Defaults to `Flying`: the default deployed scene
+/// (`SceneKind::MengerSponge`, see `app/src/render.rs`) has no authored
+/// level data (start position tuned to rest on a surface, kill plane,
+/// etc.) the way the demo level does, so free-flight is the sensible
+/// default there; `G` still toggles to `Rolling` at any time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GravityMode {
     /// Original MMCE marble-rolling physics: gravity, kill plane, horizontal
     /// camera-yaw-relative movement.
-    #[default]
     Rolling,
     /// This branch's experimental zero-gravity free-flight mechanic: no
     /// gravity, no kill plane, full 3D camera-relative thrust.
+    #[default]
     Flying,
 }
 
@@ -378,7 +382,12 @@ mod tests {
     #[test]
     fn marble_falls_and_settles() {
         let (object, params) = setup_demo();
-        let cfg = PhysicsConfig::default();
+        // Explicit Rolling: these tests exercise gravity/kill-plane
+        // behavior, which is no longer PhysicsConfig::default()'s mode.
+        let cfg = PhysicsConfig {
+            mode: GravityMode::Rolling,
+            ..PhysicsConfig::default()
+        };
         let rad = beware_of_bumps::MARBLE_RAD;
         let start = beware_of_bumps::START;
         let drop_from = start + Vec3::new(0.0, 0.5, 0.0);
@@ -448,7 +457,12 @@ mod tests {
     #[test]
     fn marble_at_start_is_immediately_stable() {
         let (object, params) = setup_demo();
-        let cfg = PhysicsConfig::default();
+        // Explicit Rolling: these tests exercise gravity/kill-plane
+        // behavior, which is no longer PhysicsConfig::default()'s mode.
+        let cfg = PhysicsConfig {
+            mode: GravityMode::Rolling,
+            ..PhysicsConfig::default()
+        };
         let rad = beware_of_bumps::MARBLE_RAD;
         let start = beware_of_bumps::START;
         let mut marble = Marble::spawn(start, rad);
@@ -532,6 +546,13 @@ mod tests {
         let mut marble = Marble::spawn(drop_from, rad);
         let kill_y = beware_of_bumps::KILL_Y;
 
+        // Explicit Rolling: this test relies on gravity to make the marble
+        // fall at all, which is no longer PhysicsConfig::default()'s mode.
+        let cfg = PhysicsConfig {
+            mode: GravityMode::Rolling,
+            ..PhysicsConfig::default()
+        };
+
         const MAX_TICKS: u32 = 20_000;
         let mut event = StepEvent::None;
         for _ in 0..MAX_TICKS {
@@ -542,7 +563,7 @@ mod tests {
                 Vec2::ZERO,
                 0.0,
                 0.0,
-                &PhysicsConfig::default(),
+                &cfg,
                 kill_y,
                 start,
             );
@@ -570,7 +591,12 @@ mod tests {
         // `rad`, so this exercises the nearest-point push-out branch).
         let body_pos = Vec3::new(5.005, 0.0, 0.0);
         let mut vel = Vec3::new(-0.5, 0.0, 0.0);
-        let cfg = PhysicsConfig::default();
+        // Explicit Rolling: these tests exercise gravity/kill-plane
+        // behavior, which is no longer PhysicsConfig::default()'s mode.
+        let cfg = PhysicsConfig {
+            mode: GravityMode::Rolling,
+            ..PhysicsConfig::default()
+        };
 
         let samples = [SamplePoint {
             offset: Vec3::ZERO,

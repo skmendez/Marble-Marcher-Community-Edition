@@ -20,7 +20,7 @@ use bevy::window::WindowResolution;
 use camera::{orbit_camera_input, CameraOrbit};
 use debug_screenshot::DebugScreenshotPlugin;
 use fps_overlay::FpsOverlayPlugin;
-use physics_sys::{marble_physics_tick, MarbleState};
+use physics_sys::marble_physics_tick;
 use render::{setup, sync_quad_scale, update_material, MarcherMaterial};
 use touch::touch_camera_input;
 
@@ -73,7 +73,6 @@ fn main() {
         .add_plugins(DebugScreenshotPlugin)
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<CameraOrbit>()
-        .init_resource::<MarbleState>()
         .add_systems(Startup, setup)
         .add_systems(FixedUpdate, marble_physics_tick)
         .add_systems(

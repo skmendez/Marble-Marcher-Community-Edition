@@ -25,6 +25,7 @@ use bevy::sprite::Material2d;
 use bevy::window::PrimaryWindow;
 
 use marble_csg::codegen::generate_shader;
+use marble_csg::physics::{Marble, PhysicsConfig};
 use marble_csg::scenes::{
     beware_of_bumps, classic, demo_scene, menger_sphere, menger_sponge, set_fractal_params,
     set_menger_params, ClassicHandles, MengerHandles,
@@ -34,13 +35,19 @@ use marble_csg::{Object, Params};
 use crate::camera::CameraOrbit;
 use crate::physics_sys::MarbleState;
 
-/// Which scene to build, selected via `MM_SCENE=demo|menger_sponge|menger_sphere`
-/// (default `demo`). Only `Demo` has an actual marble/level tuning (start
-/// position, kill plane, `ang1` animation support) — the other two are
-/// `StaticFractals.hpp`'s standalone display fractals (C++ `MengerSponge`/
-/// `MengerSphere`), ported for their own sake, not as playable levels; the
-/// marble is hidden and its physics tick skipped for them (see
-/// `physics_sys::marble_physics_tick` and `update_material` below).
+/// Which scene to build, selected via `MM_SCENE=demo|classic_only|menger_sponge|menger_sphere`.
+/// Defaults to `MengerSponge` — this is what actually determines the
+/// deployed web build's default scene, since `std::env::var` always returns
+/// `Err` on wasm32-unknown-unknown (no OS environment in a browser), so
+/// `MM_SCENE` only has any effect for local/native testing.
+///
+/// `Demo`/`ClassicOnly` have authored level data (`beware_of_bumps`: a
+/// start position tuned to rest on a surface, a kill plane, `ang1`
+/// animation support); the Menger scenes don't (C++ `StaticFractals.hpp`'s
+/// `MengerSponge`/`MengerSphere` were never actual levels, just standalone
+/// shape-generator functions), so their marble spawn point/radius/kill
+/// plane are reasonable-looking placeholders (`spawn_params` below), not
+/// tuned level data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SceneKind {
     Demo,
@@ -52,20 +59,61 @@ pub enum SceneKind {
     MengerSphere,
 }
 
+/// Marble spawn parameters for a scene: start position, radius, kill-plane
+/// height (only actually reachable in [`marble_csg::physics::GravityMode::Rolling`],
+/// since `Flying` — the default — has no kill plane at all, but every scene
+/// needs *some* value to hand `step_marble` regardless of mode).
+pub struct MarbleSpawn {
+    pub start: Vec3,
+    pub rad: f32,
+    pub kill_y: f32,
+}
+
 impl SceneKind {
     pub fn from_env() -> Self {
         match std::env::var("MM_SCENE").as_deref() {
+            Ok("demo") => Self::Demo,
             Ok("classic_only") => Self::ClassicOnly,
-            Ok("menger_sponge") => Self::MengerSponge,
             Ok("menger_sphere") => Self::MengerSphere,
-            _ => Self::Demo,
+            _ => Self::MengerSponge,
         }
     }
 
-    /// Whether this scene has a real marble to simulate/render (the tuned
-    /// demo level, in full or with the decorative clutter stripped out).
+    /// Every scene has a marble now (matching the original MMCE, where
+    /// every playable level does) — kept as a named method rather than
+    /// inlining `true` everywhere in case a genuinely marble-less preview
+    /// scene is ever added later.
     pub fn has_marble(self) -> bool {
-        matches!(self, Self::Demo | Self::ClassicOnly)
+        true
+    }
+
+    /// Where/how big the marble starts, and where the (`Rolling`-mode-only)
+    /// kill plane sits, for this scene.
+    pub fn spawn_params(self) -> MarbleSpawn {
+        match self {
+            Self::Demo | Self::ClassicOnly => MarbleSpawn {
+                start: beware_of_bumps::START,
+                rad: beware_of_bumps::MARBLE_RAD,
+                kill_y: beware_of_bumps::KILL_Y,
+            },
+            // The sponge/sphere occupy roughly a +-1-unit region around the
+            // origin (verified: de(origin) ~= 1.4 for menger_sponge at our
+            // MENGER_DEPTH/color, i.e. comfortably outside any solid
+            // material, not embedded) -- spawning at the origin also
+            // matches where the scene's camera already looks by default
+            // (`setup`'s Menger camera override targets `Vec3::ZERO`).
+            // `rad = 0.05` is a reasonable size relative to that scale
+            // (small enough to fly into the sponge's recursive tunnels),
+            // chosen by visual inspection, not derived from any level data
+            // (there isn't any). `kill_y = -50.0` is a generous
+            // "fell way out of the structure" bound for if `G` is toggled
+            // to `Rolling` mode while in one of these scenes.
+            Self::MengerSponge | Self::MengerSphere => MarbleSpawn {
+                start: Vec3::ZERO,
+                rad: 0.05,
+                kill_y: -50.0,
+            },
+        }
     }
 }
 
@@ -204,7 +252,7 @@ const MENGER_SPHERE_COLOR: Vec3 = Vec3::new(0.25, 0.65, 0.9);
 pub struct SceneState {
     pub kind: SceneKind,
     /// The scene tree, queried each physics tick by
-    /// `physics_sys::marble_physics_tick` (for [`SceneKind::Demo`] only).
+    /// `physics_sys::marble_physics_tick` against every scene's marble.
     pub object: Object,
     pub params: Params,
     pub handles: SceneHandles,
@@ -252,7 +300,8 @@ pub fn setup(
     // few world units, degenerate normals drop to zero at every depth
     // tried, confirming this is purely a "camera embedded in/hugging the
     // geometry" problem, not a marcher-precision-vs-recursion-depth one.
-    if !kind.has_marble() {
+    let is_menger = matches!(kind, SceneKind::MengerSponge | SceneKind::MengerSphere);
+    if is_menger {
         camera_orbit.yaw = 0.8;
         camera_orbit.pitch = 0.35;
         camera_orbit.distance = 6.0;
@@ -325,6 +374,14 @@ pub fn setup(
         handles,
         material,
         params_buffer,
+    });
+
+    let spawn = kind.spawn_params();
+    commands.insert_resource(MarbleState {
+        marble: Marble::spawn(spawn.start, spawn.rad),
+        cfg: PhysicsConfig::default(),
+        start_pos: spawn.start,
+        kill_y: spawn.kill_y,
     });
 }
 
@@ -403,18 +460,12 @@ pub fn update_material(
         .map(|w| (w.width() / w.height().max(1.0), w.physical_height() as f32))
         .unwrap_or((1.0, 1.0));
 
-    // Only the Demo scene has a real marble: follow it with the camera and
-    // render it; the static display fractals get a fixed origin-centered
-    // camera and a hidden marble (marble.w <= 0 -> the shader skips it).
-    let has_marble = scene_state.kind.has_marble();
+    // Every scene has a real marble now (`SceneKind::has_marble`): the
+    // camera always follows it.
     let marble = marble_state.marble;
-    let target = if has_marble { marble.pos } else { Vec3::ZERO };
+    let target = marble.pos;
     let (eye, right, up, forward) = orbit.eye_and_basis(target);
-    let marble_uniform = if has_marble {
-        marble.pos.extend(marble.rad)
-    } else {
-        Vec4::ZERO
-    };
+    let marble_uniform = marble.pos.extend(marble.rad);
 
     if let Some(mat) = materials.get_mut(&scene_state.material) {
         mat.scene = SceneUniforms {

@@ -5,7 +5,8 @@
 //! (see its module doc): [`GravityMode::Rolling`] (original MMCE physics —
 //! gravity, kill plane, horizontal movement) and [`GravityMode::Flying`]
 //! (this branch's zero-gravity free-flight experiment — full 3D
-//! camera-relative thrust, no kill plane). Defaults to `Rolling`.
+//! camera-relative thrust, no kill plane). Defaults to `Flying` (see
+//! `GravityMode`'s doc for why).
 //!
 //! WASD sign convention (`Rolling` mode; verified algebraically against
 //! `CameraOrbit`'s basis — rust/DESIGN.md §7): given `step_marble`'s
@@ -35,27 +36,23 @@ use bevy::input::touch::Touches;
 use bevy::prelude::*;
 
 use marble_csg::physics::{step_marble, GravityMode, Marble, PhysicsConfig};
-use marble_csg::scenes::beware_of_bumps;
 
 use crate::camera::CameraOrbit;
 use crate::render::SceneState;
 use crate::touch::read_two_finger_gesture;
 
-/// The marble's live physics state + tuning constants. Spawns at the demo
-/// scene's start position/radius (DESIGN.md §6/§7).
+/// The marble's live physics state + tuning constants, plus the current
+/// scene's spawn point and kill-plane height (used for `R`/kill-plane
+/// respawns — every scene has different values now that all scenes have a
+/// marble, see `SceneKind::spawn_params`, so these can no longer be a fixed
+/// constant read directly from `physics_sys.rs`). Constructed per-scene in
+/// `render::setup` (there's no scene-independent `Default` to speak of).
 #[derive(Resource)]
 pub struct MarbleState {
     pub marble: Marble,
     pub cfg: PhysicsConfig,
-}
-
-impl Default for MarbleState {
-    fn default() -> Self {
-        Self {
-            marble: Marble::spawn(beware_of_bumps::START, beware_of_bumps::MARBLE_RAD),
-            cfg: PhysicsConfig::default(),
-        }
-    }
+    pub start_pos: Vec3,
+    pub kill_y: f32,
 }
 
 /// One 60 Hz physics tick (`FixedUpdate`): reads WASD + a 2-finger pinch
@@ -83,7 +80,8 @@ pub fn marble_physics_tick(
     }
 
     if keys.just_pressed(KeyCode::KeyR) {
-        marble_state.marble.respawn(beware_of_bumps::START);
+        let start = marble_state.start_pos;
+        marble_state.marble.respawn(start);
         return;
     }
 
@@ -105,7 +103,9 @@ pub fn marble_physics_tick(
         dy += gesture.pinch_dy;
     }
 
-    let MarbleState { marble, cfg } = &mut *marble_state;
+    let kill_y = marble_state.kill_y;
+    let start = marble_state.start_pos;
+    let MarbleState { marble, cfg, .. } = &mut *marble_state;
     let _event = step_marble(
         marble,
         &scene.object,
@@ -114,7 +114,7 @@ pub fn marble_physics_tick(
         orbit.yaw,
         orbit.pitch,
         cfg,
-        beware_of_bumps::KILL_Y,
-        beware_of_bumps::START,
+        kill_y,
+        start,
     );
 }
