@@ -2,10 +2,24 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <!-- Without this, mobile browsers render at a virtual desktop-width
+       viewport (~980px) and scale it down, and still allow native
+       pinch-zoom -- both fight the app's own touch gesture handling
+       (touch.rs), which expects real device pixel coordinates and owns
+       pinch/swipe/rotate itself (DESIGN.md's mobile touch controls work). -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
   <title>Marble Marcher CSG (Bevy/WebGPU)</title>
   <style>
     html, body { margin: 0; height: 100%; background: #000; }
-    canvas { display: block; width: 100vw; height: 100vh; }
+    /* `touch-action: none` stops the browser from treating a swipe/pinch on
+       the canvas as native page-pan/zoom before our own touch handlers
+       (touch.rs's touch_camera_input / physics_sys.rs's pinch read) ever see
+       a clean gesture -- standard practice for a canvas-based touch app,
+       independent of (and layered on top of) the separate render-freeze
+       regression fixed in present.rs/mrrm.rs this same pass, which turned
+       out to be the actual cause of a same-session "swipe does nothing"
+       report. */
+    canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
   </style>
 </head>
 <body>

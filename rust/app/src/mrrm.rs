@@ -145,9 +145,12 @@ impl Material2d for CoarseMarcherMaterial {
 
 /// Marker for the MRRM coarse pass's own camera -- lowest `Camera.order` of
 /// the three (renders first, so the fine pass can read its finished output
-/// later in the same frame; see module doc).
+/// later in the same frame; see module doc). `pub(crate)`: it appears in
+/// `resize_coarse_render_target`'s public query type, which `main.rs` (a
+/// different module) needs to be able to name when registering that system
+/// -- same reasoning as `CoarseQuad`'s doc.
 #[derive(Component)]
-struct CoarseCamera;
+pub(crate) struct CoarseCamera;
 
 /// Marker for the MRRM coarse pass's fullscreen quad. `pub(crate)`: it
 /// appears in `sync_coarse_quad_scale`/`update_coarse_material`'s public
@@ -304,23 +307,43 @@ pub fn setup_mrrm_pipeline(
 /// texture's contents is needed: the coarse camera (lower `Camera.order`
 /// than the fine camera reading it) fully redraws every pixel of it every
 /// frame before the fine pass ever samples it, resize or not.
+///
+/// Builds a **new** `Image` and redirects the coarse camera's `Camera.target`
+/// and the fine pass's `FineMarcherMaterial.coarse` binding to it, exactly
+/// like `present::resize_marcher_render_target` does for the fine target --
+/// see that function's doc for why resizing the *same* `Image` asset in
+/// place (via `images.get_mut(..).resize(..)`) permanently freezes the
+/// camera rendering into it (a known upstream Bevy behavior, not specific to
+/// MRRM -- this hit the fine target first since adaptive resolution shipped
+/// before MRRM did, but the same hazard applies here too since this is also
+/// a `RenderTarget::Image` being resized while actively bound).
 pub fn resize_coarse_render_target(
     fine_render_target: Res<MarcherRenderTarget>,
     mut coarse_render_target: ResMut<CoarseRenderTarget>,
     mut images: ResMut<Assets<Image>>,
+    mut coarse_cameras: Query<&mut Camera, With<CoarseCamera>>,
+    fine_quads: Query<&MeshMaterial2d<crate::render::FineMarcherMaterial>, With<crate::render::MarcherQuad>>,
+    mut fine_materials: ResMut<Assets<crate::render::FineMarcherMaterial>>,
 ) {
     let desired = coarse_target_size(fine_render_target.size);
     if desired == coarse_render_target.size {
         return;
     }
-    if let Some(image) = images.get_mut(&coarse_render_target.image) {
-        image.resize(Extent3d {
-            width: desired.x,
-            height: desired.y,
-            depth_or_array_layers: 1,
-        });
-        coarse_render_target.size = desired;
+
+    let new_handle = images.add(make_coarse_render_target_image(desired));
+
+    for mut camera in &mut coarse_cameras {
+        camera.target = RenderTarget::from(new_handle.clone());
     }
+    for mesh_material in &fine_quads {
+        if let Some(mat) = fine_materials.get_mut(&mesh_material.0) {
+            mat.coarse = new_handle.clone();
+        }
+    }
+
+    images.remove(&coarse_render_target.image);
+    coarse_render_target.image = new_handle;
+    coarse_render_target.size = desired;
 }
 
 /// Keeps the coarse quad's world size equal to its own render target's

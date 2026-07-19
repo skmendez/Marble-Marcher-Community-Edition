@@ -207,19 +207,41 @@ pub fn setup_present_pipeline(
 /// `Update` system: recomputes the marcher's desired target pixel size from
 /// the window's current physical size and `AdaptiveResolution::scale`
 /// (`adaptive_res::target_pixel_size`), and only actually touches the
-/// `Image` asset -- a GPU resource; resizing it means the renderer
-/// recreates the underlying GPU texture -- when the *rounded* target size
+/// render target -- a GPU resource -- when the *rounded* target size
 /// genuinely differs from what's already there.
 /// `AdaptiveResolution::scale` itself is already throttled to a few times a
 /// second (`adaptive_res::adjust_resolution_scale`), so in practice this
 /// system's own per-frame cost is just a cheap size comparison on most
 /// frames, with a real resize only happening exactly when the scale
 /// controller actively adjusts.
+///
+/// Builds a **new** `Image` asset and redirects every handle that points at
+/// the render target (the marcher camera's own `Camera.target` and the
+/// present quad's `PresentMaterial.image`) to it, rather than calling
+/// `images.get_mut(&render_target.image).resize(...)` in place on the
+/// *same* asset the marcher camera is actively rendering into that frame --
+/// confirmed via a live, cache-disabled A/B test against this project's
+/// real-GPU/WebGPU deploy target (not just this sandbox) that in-place
+/// resize permanently freezes that camera's output from the very next
+/// frame onward (the present pass and UI keep updating normally, so the
+/// symptom reads as "the page is responsive but nothing you do ever moves
+/// anything," not a crash) -- this is a known upstream Bevy behavior, not a
+/// bug in this app's own logic: see
+/// <https://github.com/bevyengine/bevy/issues/16159> ("Changing backing
+/// image of a `RenderTarget::Image` causes rendering to that image to
+/// stop") and <https://github.com/bevyengine/bevy/issues/20445> ("Calling
+/// `get_mut` on an image being used as a render target causes it to not
+/// get drawn on that frame"). The old `Image` asset is explicitly removed
+/// (rather than left for the asset server's own GC) so a resize doesn't
+/// leak a full-resolution GPU texture every time the scale changes.
 pub fn resize_marcher_render_target(
     windows: Query<&Window, With<PrimaryWindow>>,
     adaptive: Res<AdaptiveResolution>,
     mut render_target: ResMut<MarcherRenderTarget>,
     mut images: ResMut<Assets<Image>>,
+    mut marcher_cameras: Query<&mut Camera, With<MarcherCamera>>,
+    present_quads: Query<&MeshMaterial2d<PresentMaterial>, With<PresentQuad>>,
+    mut present_materials: ResMut<Assets<PresentMaterial>>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -229,14 +251,21 @@ pub fn resize_marcher_render_target(
     if desired == render_target.size {
         return;
     }
-    if let Some(image) = images.get_mut(&render_target.image) {
-        image.resize(Extent3d {
-            width: desired.x,
-            height: desired.y,
-            depth_or_array_layers: 1,
-        });
-        render_target.size = desired;
+
+    let new_handle = images.add(make_render_target_image(desired));
+
+    for mut camera in &mut marcher_cameras {
+        camera.target = RenderTarget::from(new_handle.clone());
     }
+    for mesh_material in &present_quads {
+        if let Some(mat) = present_materials.get_mut(&mesh_material.0) {
+            mat.image = new_handle.clone();
+        }
+    }
+
+    images.remove(&render_target.image);
+    render_target.image = new_handle;
+    render_target.size = desired;
 }
 
 /// Keeps the present quad's world size equal to the window's (logical)
