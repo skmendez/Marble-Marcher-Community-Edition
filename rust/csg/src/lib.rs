@@ -22,6 +22,7 @@
 pub mod codegen;
 pub mod fold;
 pub mod object;
+pub mod physics;
 pub mod scenes;
 
 pub use fold::Fold;

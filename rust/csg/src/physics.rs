@@ -1,0 +1,464 @@
+//! M5: marble/collider physics against an [`Object`], pure logic (glam only,
+//! no bevy — see rust/DESIGN.md §7).
+//!
+//! Direct port of `Scene::UpdateMarble` / `Scene::MarbleCollision`
+//! (src/Scene.cpp). This branch's working tree carries three experimental
+//! gameplay edits in `Scene::UpdateMarble` (a `force = 0;` line that kills
+//! gravity, a disabled kill-plane check, and a camera-ray movement
+//! experiment replacing the original yaw-relative input force); per
+//! DESIGN.md §10.6 none of those are ported. This module implements the
+//! ORIGINAL upstream behavior: gravity on, kill plane on, and the original
+//! (in this branch, commented-out) yaw-relative movement line
+//! `v = (dx*cos - dy*sin, 0, -dy*cos - dx*sin)`. The `std::cerr` debug print
+//! in `MarbleCollision` is also not ported.
+
+use glam::{Vec2, Vec3};
+
+use crate::{Object, Params};
+
+/// A single point-collider sample: an offset from the owning body's origin
+/// plus a radius. The marble is the one-sample case (`offset = 0`). This is
+/// the hook for future CSG-vs-CSG collision (point-shell sampling of one
+/// body against the other's DE) without reworking the physics API — see
+/// DESIGN.md §7 and MILESTONES.md's "Later" section.
+#[derive(Clone, Copy, Debug)]
+pub struct SamplePoint {
+    pub offset: Vec3,
+    pub radius: f32,
+}
+
+/// Frame-rate-locked physics constants (per 60 Hz tick), C++ `Scene.cpp`
+/// file-scope `static const` values (ported verbatim — DESIGN.md §7).
+#[derive(Clone, Copy, Debug)]
+pub struct PhysicsConfig {
+    pub ground_force: f32,
+    pub air_force: f32,
+    pub ground_friction: f32,
+    pub air_friction: f32,
+    pub gravity: f32,
+    pub ground_ratio: f32,
+    pub bounce: f32,
+}
+
+impl Default for PhysicsConfig {
+    fn default() -> Self {
+        Self {
+            ground_force: 0.008,
+            air_force: 0.004,
+            ground_friction: 0.99,
+            air_friction: 0.995,
+            gravity: 0.005,
+            ground_ratio: 1.15,
+            bounce: 1.2,
+        }
+    }
+}
+
+/// The C++ `MarbleCollision` hard-codes this threshold (`marble_rad *
+/// 0.001f`) rather than exposing it as a tunable constant; kept as a literal
+/// here too.
+const CRUSH_RATIO: f32 = 0.001;
+
+/// The marble body: world-space position, velocity, and radius.
+#[derive(Clone, Copy, Debug)]
+pub struct Marble {
+    pub pos: Vec3,
+    pub vel: Vec3,
+    pub rad: f32,
+}
+
+impl Marble {
+    /// Spawns a marble at `start` with zero velocity (C++ `ResetLevel`'s
+    /// marble init: `marble_pos = start; marble_vel = 0`).
+    pub fn spawn(start: Vec3, rad: f32) -> Self {
+        Self {
+            pos: start,
+            vel: Vec3::ZERO,
+            rad,
+        }
+    }
+
+    /// Resets position to `start` and zeroes velocity in place (crush /
+    /// kill-plane respawn).
+    pub fn respawn(&mut self, start: Vec3) {
+        self.pos = start;
+        self.vel = Vec3::ZERO;
+    }
+}
+
+/// Result of a [`collide`] query: whether any sample was resting on/near a
+/// surface, whether any sample was crushed (fully embedded), and the
+/// corrected body position (push-outs from all non-crushed, overlapping
+/// samples summed back onto `body_pos` — DESIGN.md §7).
+#[derive(Clone, Copy, Debug)]
+pub struct CollisionOutcome {
+    pub on_ground: bool,
+    pub crushed: bool,
+    pub pos: Vec3,
+}
+
+/// Exact port of `Scene::MarbleCollision` (src/Scene.cpp:1072, minus the
+/// debug `std::cerr` print), generalized to a body made of `samples` point
+/// colliders (DESIGN.md §7's collider abstraction). Each sample is queried
+/// at `body_pos + sample.offset`; per-sample logic is identical to the C++:
+///
+/// ```text
+/// de = obj.de(vec4(pos, 1))
+/// if de >= rad { on_ground |= de < rad * ground_ratio; continue }
+/// if de < rad * 0.001 { crushed = true; break }   // C++ returns immediately
+/// np = obj.nearest_point(vec4(pos, 1))
+/// d = np - pos; dn = normalize(d); dv = dot(vel, dn)
+/// pos -= dn * rad - d
+/// vel -= dn * (dv * bounce)
+/// on_ground = true
+/// ```
+///
+/// `vel` is mutated in place (matches the C++ `marble_vel` in/out); the
+/// corrected position is returned rather than mutated in place, since a
+/// crushed outcome must NOT move the body (the caller decides how to
+/// respond — `step_marble` respawns).
+pub fn collide(
+    obj: &Object,
+    params: &Params,
+    body_pos: Vec3,
+    vel: &mut Vec3,
+    samples: &[SamplePoint],
+    cfg: &PhysicsConfig,
+) -> CollisionOutcome {
+    let mut on_ground = false;
+    let mut crushed = false;
+    let mut pos = body_pos;
+
+    for sample in samples {
+        let rad = sample.radius;
+        let sample_pos = pos + sample.offset;
+        let de = obj.de(sample_pos.extend(1.0), params);
+
+        if de >= rad {
+            on_ground |= de < rad * cfg.ground_ratio;
+            continue;
+        }
+
+        if de < rad * CRUSH_RATIO {
+            crushed = true;
+            break; // C++ returns immediately on crush; no further samples matter.
+        }
+
+        let np = obj.nearest_point(sample_pos.extend(1.0), params);
+        let d = np - sample_pos;
+        let dn = d.normalize();
+        let dv = vel.dot(dn);
+        pos -= dn * rad - d;
+        *vel -= dn * (dv * cfg.bounce);
+        on_ground = true;
+    }
+
+    CollisionOutcome {
+        on_ground,
+        crushed,
+        pos,
+    }
+}
+
+/// Outcome of a single [`step_marble`] tick, for callers that want to react
+/// to respawns (sound effects, UI, etc.).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepEvent {
+    None,
+    RespawnedCrushed,
+    RespawnedFell,
+}
+
+/// One 60 Hz physics tick — direct port of `Scene::UpdateMarble`'s
+/// non-free-camera branch with `num_phys_steps = 1` (DESIGN.md §7 notes the
+/// C++ substeps at 6; we use one substep per tick, matching the design's
+/// stated simplification), using the ORIGINAL (in this branch,
+/// commented-out) yaw-relative movement line — see the module doc.
+///
+/// `input` is `(dx, dy)` in C++'s convention: `dx` is the strafe axis, `dy`
+/// is the forward/back axis (see the app-side WASD mapping for the sign
+/// convention that makes `W` roll the marble away from the camera).
+/// `cam_yaw` is `cam_look_x` (radians). Order, matching the C++ statement
+/// order in `UpdateMarble`/`MarbleCollision`:
+///
+/// 1. `vel.y -= gravity`
+/// 2. collide (marble as one [`SamplePoint`]); crushed -> respawn to
+///    `start`, report [`StepEvent::RespawnedCrushed`]
+/// 3. input force: `f = rad * (on_ground ? ground_force : air_force)`,
+///    `v = (dx*cos(yaw) - dy*sin(yaw), 0, -dy*cos(yaw) - dx*sin(yaw))`,
+///    `vel += v * f`
+/// 4. friction: `vel *= on_ground ? ground_friction : air_friction`
+/// 5. `pos += vel`
+/// 6. kill-plane: `pos.y < kill_y` -> respawn to `start`, report
+///    [`StepEvent::RespawnedFell`]
+pub fn step_marble(
+    marble: &mut Marble,
+    obj: &Object,
+    params: &Params,
+    input: Vec2,
+    cam_yaw: f32,
+    cfg: &PhysicsConfig,
+    kill_y: f32,
+    start: Vec3,
+) -> StepEvent {
+    // C++ normalizes (dx, dy) to unit magnitude when the combined input
+    // exceeds 1 (e.g. two WASD keys held at once) so diagonal movement
+    // isn't faster than axis-aligned movement.
+    let mut dx = input.x;
+    let mut dy = input.y;
+    let mag2 = dx * dx + dy * dy;
+    if mag2 > 1.0 {
+        let mag = mag2.sqrt();
+        dx /= mag;
+        dy /= mag;
+    }
+
+    // 1. Gravity.
+    marble.vel.y -= cfg.gravity;
+
+    // 2. Collision.
+    let samples = [SamplePoint {
+        offset: Vec3::ZERO,
+        radius: marble.rad,
+    }];
+    let outcome = collide(obj, params, marble.pos, &mut marble.vel, &samples, cfg);
+    if outcome.crushed {
+        marble.respawn(start);
+        return StepEvent::RespawnedCrushed;
+    }
+    marble.pos = outcome.pos;
+    let on_ground = outcome.on_ground;
+
+    // 3. Input force (camera-yaw-relative).
+    let f = marble.rad * if on_ground { cfg.ground_force } else { cfg.air_force };
+    let cs = cam_yaw.cos();
+    let sn = cam_yaw.sin();
+    let v = Vec3::new(dx * cs - dy * sn, 0.0, -dy * cs - dx * sn);
+    marble.vel += v * f;
+
+    // 4. Friction.
+    marble.vel *= if on_ground { cfg.ground_friction } else { cfg.air_friction };
+
+    // 5. Integrate position.
+    marble.pos += marble.vel;
+
+    // 6. Kill plane.
+    if marble.pos.y < kill_y {
+        marble.respawn(start);
+        return StepEvent::RespawnedFell;
+    }
+
+    StepEvent::None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scenes::{beware_of_bumps, demo_scene, set_fractal_params};
+    use crate::ScalarValue;
+
+    fn setup_demo() -> (Object, Params) {
+        let mut params = Params::new();
+        let (object, handles) = demo_scene(&mut params);
+        set_fractal_params(
+            &mut params,
+            &handles,
+            beware_of_bumps::SCALE,
+            beware_of_bumps::ANG1,
+            beware_of_bumps::ANG2,
+            beware_of_bumps::SHIFT,
+            beware_of_bumps::COLOR,
+            beware_of_bumps::ITERS,
+        );
+        (object, params)
+    }
+
+    /// A marble dropped at the demo scene's start position falls (y
+    /// decreases) and, within a few thousand ticks, comes to rest on a
+    /// surface: on_ground (via `de` bracketed around `rad`), tiny velocity,
+    /// and `de(pos)` within `[rad*0.5, rad*ground_ratio*1.5]`.
+    #[test]
+    fn marble_falls_and_settles() {
+        let (object, params) = setup_demo();
+        let cfg = PhysicsConfig::default();
+        let rad = beware_of_bumps::MARBLE_RAD;
+        let start = beware_of_bumps::START;
+        let mut marble = Marble::spawn(start, rad);
+
+        let y0 = marble.pos.y;
+        const MAX_TICKS: u32 = 20_000;
+        let mut settled_at = None;
+        let mut min_y_seen = y0;
+
+        for tick in 0..MAX_TICKS {
+            let event = step_marble(
+                &mut marble,
+                &object,
+                &params,
+                Vec2::ZERO,
+                0.0,
+                &cfg,
+                beware_of_bumps::KILL_Y,
+                start,
+            );
+            assert_eq!(
+                event,
+                StepEvent::None,
+                "marble should not respawn while settling onto the start platform (tick {tick})"
+            );
+            min_y_seen = min_y_seen.min(marble.pos.y);
+
+            let de = object.de(marble.pos.extend(1.0), &params);
+            let speed = marble.vel.length();
+            if speed < 1e-4 * rad && de >= rad * 0.5 && de <= rad * cfg.ground_ratio * 1.5 {
+                settled_at = Some((tick, speed, de));
+                break;
+            }
+        }
+
+        assert!(
+            min_y_seen < y0,
+            "marble never fell (min y {min_y_seen} vs start y {y0})"
+        );
+
+        let (tick, speed, de) =
+            settled_at.expect("marble did not settle onto a surface within MAX_TICKS");
+        eprintln!(
+            "settled after {} ticks: |vel|={:.6e}, de/rad={:.4}",
+            tick + 1,
+            speed,
+            de / rad
+        );
+    }
+
+    /// `collide` reports `crushed` when the body is deeply embedded, and
+    /// `step_marble` respawns to `start` with zero velocity on crush.
+    #[test]
+    fn crush_respawns_to_start() {
+        // A trivial object the marble starts deeply embedded in (de very
+        // negative -> well below the `rad*0.001` crush threshold).
+        let params = Params::new();
+        let object = Object::Sphere {
+            radius: ScalarValue::Const(5.0),
+        };
+        let rad = 0.02;
+        let start = Vec3::new(1.0, 2.0, 3.0);
+        let mut marble = Marble::spawn(Vec3::ZERO, rad);
+        marble.vel = Vec3::new(0.1, 0.2, 0.3);
+
+        let event = step_marble(
+            &mut marble,
+            &object,
+            &params,
+            Vec2::ZERO,
+            0.0,
+            &PhysicsConfig::default(),
+            -1000.0,
+            start,
+        );
+
+        assert_eq!(event, StepEvent::RespawnedCrushed);
+        assert_eq!(marble.pos, start);
+        assert_eq!(marble.vel, Vec3::ZERO);
+    }
+
+    /// A marble falling through empty space (far from all geometry) hits
+    /// the kill plane and respawns to `start` with zero velocity.
+    #[test]
+    fn kill_plane_respawns_falling_marble() {
+        let (object, params) = setup_demo();
+        let rad = beware_of_bumps::MARBLE_RAD;
+        // Far outside both the classic fractal's cuboid (half-extent 6) and
+        // the creme-spheres bounding sphere (radius 6): DE stays large and
+        // positive the whole way down, so the marble free-falls to the kill
+        // plane without ever colliding.
+        let start = beware_of_bumps::START;
+        let drop_from = Vec3::new(50.0, 50.0, 50.0);
+        let mut marble = Marble::spawn(drop_from, rad);
+        let kill_y = beware_of_bumps::KILL_Y;
+
+        const MAX_TICKS: u32 = 20_000;
+        let mut event = StepEvent::None;
+        for _ in 0..MAX_TICKS {
+            event = step_marble(
+                &mut marble,
+                &object,
+                &params,
+                Vec2::ZERO,
+                0.0,
+                &PhysicsConfig::default(),
+                kill_y,
+                start,
+            );
+            if event != StepEvent::None {
+                break;
+            }
+        }
+
+        assert_eq!(event, StepEvent::RespawnedFell);
+        assert_eq!(marble.pos, start);
+        assert_eq!(marble.vel, Vec3::ZERO);
+    }
+
+    /// After any non-crushed `collide()` call, the push-out actually
+    /// separates the body from the surface: `de(corrected_pos) >= rad*0.9`.
+    #[test]
+    fn collide_pushes_out_to_surface() {
+        let params = Params::new();
+        let object = Object::Sphere {
+            radius: ScalarValue::Const(5.0),
+        };
+        let rad = 0.1;
+        // Slightly overlapping the sphere's surface from outside
+        // (de = 0.005, i.e. 0.05*rad -- above the crush threshold, below
+        // `rad`, so this exercises the nearest-point push-out branch).
+        let body_pos = Vec3::new(5.005, 0.0, 0.0);
+        let mut vel = Vec3::new(-0.5, 0.0, 0.0);
+        let cfg = PhysicsConfig::default();
+
+        let samples = [SamplePoint {
+            offset: Vec3::ZERO,
+            radius: rad,
+        }];
+        let outcome = collide(&object, &params, body_pos, &mut vel, &samples, &cfg);
+
+        assert!(!outcome.crushed);
+        assert!(outcome.on_ground);
+        let de = object.de(outcome.pos.extend(1.0), &params);
+        assert!(
+            de >= rad * 0.9,
+            "push-out should separate the body from the surface: de={de}, rad={rad}"
+        );
+    }
+
+    /// Sanity check on the collider abstraction itself: a multi-sample body
+    /// (e.g. a coarse point-shell) reports crush if any sample is embedded,
+    /// even when another sample is merely touching the surface.
+    #[test]
+    fn multi_sample_collide_reports_crush_from_any_sample() {
+        let params = Params::new();
+        let object = Object::Sphere {
+            radius: ScalarValue::Const(5.0),
+        };
+        let mut vel = Vec3::ZERO;
+        let samples = [
+            SamplePoint {
+                offset: Vec3::new(5.005, 0.0, 0.0),
+                radius: 0.1,
+            }, // fine: just outside, de=0.005 -- push-out branch
+            SamplePoint {
+                offset: Vec3::ZERO,
+                radius: 0.1,
+            }, // body_pos itself is the sphere's center: de=-5, crushed
+        ];
+        let outcome = collide(
+            &object,
+            &params,
+            Vec3::ZERO,
+            &mut vel,
+            &samples,
+            &PhysicsConfig::default(),
+        );
+        assert!(outcome.crushed);
+    }
+}
