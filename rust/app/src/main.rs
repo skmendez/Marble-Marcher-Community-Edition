@@ -12,6 +12,7 @@ mod fps_overlay;
 mod mrrm;
 mod physics_sys;
 mod render;
+mod shadow_pass;
 mod touch;
 
 use bevy::prelude::*;
@@ -27,6 +28,10 @@ use mrrm::{
 };
 use physics_sys::marble_physics_tick;
 use render::{setup, sync_quad_scale, update_material, FineMarcherMaterial};
+use shadow_pass::{
+    resize_shadow_render_target, setup_shadow_pipeline, sync_shadow_quad_scale,
+    update_shadow_material, ShadowMarcherMaterial,
+};
 use touch::touch_camera_input;
 
 /// `MM_WINDOW_SIZE=WxH` overrides the window's starting resolution — mainly
@@ -75,6 +80,7 @@ fn main() {
         }))
         .add_plugins(Material2dPlugin::<FineMarcherMaterial>::default())
         .add_plugins(Material2dPlugin::<CoarseMarcherMaterial>::default())
+        .add_plugins(Material2dPlugin::<ShadowMarcherMaterial>::default())
         .add_plugins(FpsOverlayPlugin)
         .add_plugins(DebugScreenshotPlugin)
         .insert_resource(Time::<Fixed>::from_hz(60.0))
@@ -83,18 +89,28 @@ fn main() {
         // scene tree + params buffer, to build the coarse shader/material)
         // and corrects `setup`'s placeholder `FineMarcherMaterial::coarse`
         // handle once the real coarse render target exists.
-        .add_systems(Startup, (setup, setup_mrrm_pipeline).chain())
+        // `setup_shadow_pipeline` (shadow_pass.rs) needs both `setup`'s
+        // `SceneState` and `setup_mrrm_pipeline`'s `CoarseRenderTarget`
+        // (this pass's own warm-start source), and corrects `setup`'s
+        // placeholder `FineMarcherMaterial::shadow` handle in turn.
+        .add_systems(
+            Startup,
+            (setup, setup_mrrm_pipeline, setup_shadow_pipeline).chain(),
+        )
         .add_systems(FixedUpdate, marble_physics_tick)
         .add_systems(
             Update,
             (
                 resize_coarse_render_target,
+                resize_shadow_render_target,
                 sync_quad_scale,
                 sync_coarse_quad_scale,
+                sync_shadow_quad_scale,
                 orbit_camera_input,
                 touch_camera_input,
                 update_material,
                 update_coarse_material,
+                update_shadow_material,
             )
                 .chain(),
         )

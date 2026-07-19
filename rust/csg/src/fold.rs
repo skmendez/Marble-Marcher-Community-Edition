@@ -221,6 +221,90 @@ impl Fold {
             Fold::OrbitInit(_) | Fold::OrbitMax(_) => {}
         }
     }
+
+    /// Given a world-space-`Some`-or-unbounded bounding sphere `child` for
+    /// whatever this fold's *output* feeds into, returns a bounding sphere
+    /// for this fold's *input* (i.e. propagates the bound backward through
+    /// the fold, since `fold()`/`de()` apply folds to the query point before
+    /// evaluating what's inside). `None` means unbounded -- correct (not a
+    /// missing case) for `Modulo`, which tiles infinitely on its axis.
+    ///
+    /// Every case here only needs to be a *sound* (possibly loose) outer
+    /// bound of the true preimage, not tight: `x` maps into `child`'s bound
+    /// implies `x` is in the returned bound, nothing stronger. That's all
+    /// `Object::bounding_sphere`'s callers need for a ray-clip pre-test --
+    /// see its doc for why a loose-but-correct bound is fine and an
+    /// under-approximation is the one failure mode that actually matters.
+    pub fn unfold_bounding_sphere(
+        &self,
+        child: Option<(Vec3, f32)>,
+        params: &Params,
+    ) -> Option<(Vec3, f32)> {
+        let (c, r) = child?;
+        match self {
+            // Abs/Menger are compositions of reflections/permutations through
+            // origin-containing planes, so `length(x)` is exactly preserved
+            // -- but as *set* maps (not single-point maps) they're many-to-one
+            // (every octant/ordering maps onto one canonical region), so the
+            // preimage of a sphere not centered at the origin is the union of
+            // its images across every octant/ordering, all at the same
+            // distance from the origin as `c` itself. Re-centering at the
+            // origin with radius `‖c‖ + r` is the exact enclosing sphere of
+            // that union (not merely a conservative pad).
+            Fold::Abs | Fold::Menger => Some((Vec3::ZERO, c.length() + r)),
+            Fold::Rotate { axis, mat } => {
+                let m = mat.get(params).transpose();
+                let (c1, c2) = rotate_components(*axis);
+                let mut center = c;
+                let v = m * Vec2::new(c[c1], c[c2]);
+                center[c1] = v.x;
+                center[c2] = v.y;
+                Some((center, r))
+            }
+            Fold::ScaleTranslate { scale, shift } => {
+                let s = scale.get(params);
+                Some(((c - shift.get(params)) / s, r / s.abs()))
+            }
+            Fold::Plane { normal, offset } => {
+                // A conditional reflection (isometric, but not necessarily
+                // through the origin) -- enclose `child`'s bound *and* its
+                // mirror image across the plane, since a preimage point could
+                // have come from either the reflected or unreflected branch.
+                // Loose (the true preimage only ever needs one branch per
+                // point) but always sound.
+                let norm = normal.get(params);
+                let off = offset.get(params);
+                let mirrored_c = c - 2.0 * (c.dot(norm) - off) * norm;
+                let center = (c + mirrored_c) * 0.5;
+                let spread = (c - center).length();
+                Some((center, r + spread))
+            }
+            // Tiles infinitely on this axis -- genuinely unbounded, not a
+            // gap in this function. `Object::Intersect` is what turns this
+            // back into a finite bound when a scene actually needs one (see
+            // its doc + `creme_spheres`).
+            Fold::Modulo { .. } => None,
+            Fold::Series(folds) => {
+                // Folds apply forward as `folds[0]` then `folds[1]` ...
+                // `folds[n-1]`; un-folding a bound walks back from the last
+                // fold applied to the first.
+                let mut bound = Some((c, r));
+                for f in folds.iter().rev() {
+                    bound = f.unfold_bounding_sphere(bound, params);
+                }
+                bound
+            }
+            Fold::Repeat { count, inner } => {
+                let mut bound = Some((c, r));
+                for _ in 0..count.get(params) {
+                    bound = inner.unfold_bounding_sphere(bound, params);
+                }
+                bound
+            }
+            // Color-pass-only no-ops (same as `fold`/`unfold`).
+            Fold::OrbitInit(_) | Fold::OrbitMax(_) => Some((c, r)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -347,6 +431,68 @@ mod tests {
             "roundtrip mismatch: {n:?} vs {:?}",
             orig.truncate()
         );
+    }
+
+    #[test]
+    fn abs_and_menger_unfold_bounding_sphere_recenters_at_origin() {
+        let params = Params::new();
+        // A child sphere off-center: the preimage under Abs/Menger spans
+        // every octant/ordering, so the exact enclosing bound is centered
+        // at the origin with radius ||c||+r.
+        let child = Some((Vec3::new(1.0, 2.0, 3.0), 0.5));
+        let expected_r = Vec3::new(1.0, 2.0, 3.0).length() + 0.5;
+        let (c, r) = Fold::Abs.unfold_bounding_sphere(child, &params).unwrap();
+        assert_eq!(c, Vec3::ZERO);
+        assert!((r - expected_r).abs() < 1e-5);
+        let (c, r) = Fold::Menger.unfold_bounding_sphere(child, &params).unwrap();
+        assert_eq!(c, Vec3::ZERO);
+        assert!((r - expected_r).abs() < 1e-5);
+    }
+
+    #[test]
+    fn scale_translate_unfold_bounding_sphere_is_exact_affine_inverse() {
+        let params = Params::new();
+        let fold = Fold::ScaleTranslate {
+            scale: ScalarValue::Const(2.0),
+            shift: Vec3Value::Const(Vec3::new(1.0, 0.0, -1.0)),
+        };
+        let child = Some((Vec3::new(3.0, 3.0, 3.0), 1.0));
+        let (c, r) = fold.unfold_bounding_sphere(child, &params).unwrap();
+        // Forward: p' = p*2 + shift. So p = (p' - shift)/2.
+        assert_eq!(c, Vec3::new(1.0, 1.5, 2.0));
+        assert!((r - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn modulo_unfold_bounding_sphere_is_unbounded() {
+        let params = Params::new();
+        let fold = Fold::Modulo {
+            axis: Axis::X,
+            modulus: ScalarValue::Const(1.0),
+        };
+        assert!(fold
+            .unfold_bounding_sphere(Some((Vec3::ZERO, 1.0)), &params)
+            .is_none());
+    }
+
+    #[test]
+    fn repeat_unfold_bounding_sphere_shrinks_by_scale_per_iteration() {
+        let params = Params::new();
+        // A pure-contraction repeat (no folding to complicate the picture):
+        // each iteration divides the radius by `scale`, applied `count`
+        // times, so this should compose exactly.
+        let inner = Fold::ScaleTranslate {
+            scale: ScalarValue::Const(2.0),
+            shift: Vec3Value::Const(Vec3::ZERO),
+        };
+        let repeat = Fold::Repeat {
+            count: IntValue::Const(3),
+            inner: Box::new(inner),
+        };
+        let child = Some((Vec3::ZERO, 8.0));
+        let (c, r) = repeat.unfold_bounding_sphere(child, &params).unwrap();
+        assert_eq!(c, Vec3::ZERO);
+        assert!((r - 1.0).abs() < 1e-5); // 8 / 2^3
     }
 
     #[test]

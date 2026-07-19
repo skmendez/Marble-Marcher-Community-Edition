@@ -7,14 +7,20 @@
 //! pixel skips almost all of the empty-space traversal its neighbors in the
 //! same coarse texel already paid for).
 //!
-//! Two passes per frame, ordered by `Camera.order` (lowest first):
+//! Three passes per frame now (a second-round-perf addition,
+//! `shadow_pass.rs`, sits between this one and the fine pass), ordered by
+//! `Camera.order` (lowest first):
 //!  1. **This module's coarse pass** (`CoarseCamera`/`CoarseQuad`): marches
 //!     `de_scene` from `t=0` into a small offscreen `Rgba16Float` render
 //!     target (the hit distance in R, `-1.0` sentinel on a miss, G/B/A
 //!     unused), using its *own* resolution's cone angle
 //!     (`update_coarse_material`'s `misc.z`) -- skips all shading (no
 //!     normals/color/shadow).
-//!  2. **The fine pass** (`render.rs`'s `MarcherCamera`/`MarcherQuad`,
+//!  2. **`shadow_pass.rs`'s half-resolution shadow/AO pass**: also
+//!     warm-starts from this pass's output, marches to a real hit, and
+//!     caches a shadow-visibility value the fine pass resamples instead of
+//!     marching a fresh shadow ray per full-res pixel.
+//!  3. **The fine pass** (`render.rs`'s `MarcherCamera`/`MarcherQuad`,
 //!     `FineMarcherMaterial`, renders straight to the window): reads this
 //!     pass's render target back as a starting-`t` guess (backed off by one
 //!     coarse-texel's angular footprint) and does the full march + shading
@@ -138,8 +144,9 @@ impl Material2d for CoarseMarcherMaterial {
 }
 
 /// Marker for the MRRM coarse pass's own camera -- lowest `Camera.order` of
-/// the two (renders first, so the fine pass can read its finished output
-/// later in the same frame; see module doc). `pub(crate)`: it appears in
+/// the three passes (renders first: both the shadow pass and the fine pass
+/// warm-start their own march from this pass's output, so it must finish
+/// before either reads it back; see module doc). `pub(crate)`: it appears in
 /// `resize_coarse_render_target`'s public query type, which `main.rs` (a
 /// different module) needs to be able to name when registering that system
 /// -- same reasoning as `CoarseQuad`'s doc.
@@ -255,9 +262,10 @@ pub fn setup_mrrm_pipeline(
         Camera {
             target: RenderTarget::from(image_handle.clone()),
             // Lowest order of the three passes -- must finish before the
-            // fine pass (`render.rs`, order 0 by default) reads this
-            // texture back (module doc).
-            order: -1,
+            // shadow pass (`shadow_pass.rs`, order -1) and fine pass
+            // (`render.rs`, order 0 by default) both read this texture back
+            // (module doc).
+            order: -2,
             // Required so this camera's intermediate "main texture" is
             // `Rgba16Float` (matching this pass's destination `Image`),
             // rather than the default 8-bit-UNORM `bevy_default()` --
@@ -366,10 +374,12 @@ pub fn sync_coarse_quad_scale(
 /// itself (many fine pixels per coarse texel) is already what the backed-off
 /// starting-`t` guess in `render.rs`'s `fragment` accounts for, so it
 /// doesn't need this aspect drift piled on top.
+#[allow(clippy::too_many_arguments)]
 pub fn update_coarse_material(
     time: Res<Time>,
     orbit: Res<CameraOrbit>,
     marble_state: Res<MarbleState>,
+    scene_state: Res<SceneState>,
     windows: Query<&Window, With<PrimaryWindow>>,
     coarse_render_target: Res<CoarseRenderTarget>,
     quads: Query<&MeshMaterial2d<CoarseMarcherMaterial>, With<CoarseQuad>>,
@@ -393,6 +403,7 @@ pub fn update_coarse_material(
                 cam_up: up.extend(0.0),
                 cam_forward: forward.extend(1.5),
                 misc: Vec4::new(aspect, t, coarse_height, 0.0),
+                bounding: scene_state.bounding_sphere,
                 ..SceneUniforms::default()
             };
         }

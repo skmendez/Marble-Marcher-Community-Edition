@@ -90,11 +90,70 @@ impl Object {
             }
         }
     }
+
+    /// A world-space `(center, radius)` bounding sphere for this object, or
+    /// `None` if it can't be bounded (an unbounded-tiling `Fold::Modulo`/
+    /// `Repeat` with no enclosing `Intersect` above it -- see `Union`/
+    /// `Intersect` below for how a finite bound still emerges when a scene
+    /// actually clips one of those to a finite region, e.g. `creme_spheres`).
+    /// Recurses the same shape as `de`, composing a bound instead of a
+    /// distance -- see `Fold::unfold_bounding_sphere`'s doc for why every
+    /// case here only has to be a *sound* (possibly loose) outer bound, never
+    /// an under-approximation: this feeds a ray-clip pre-test, where a bound
+    /// that's too small silently culls real geometry instead of erroring.
+    pub fn bounding_sphere(&self, params: &Params) -> Option<(Vec3, f32)> {
+        match self {
+            Object::Sphere { radius } => Some((Vec3::ZERO, radius.get(params))),
+            Object::Cuboid { half_extent } => Some((Vec3::ZERO, half_extent.get(params).length())),
+            Object::Fractal { fold, base } => {
+                fold.unfold_bounding_sphere(base.bounding_sphere(params), params)
+            }
+            Object::Union(left, right) => {
+                let l = left.bounding_sphere(params)?;
+                let r = right.bounding_sphere(params)?;
+                Some(enclosing_sphere(l, r))
+            }
+            // Intersection is a subset of both children, so either child's
+            // bound is already a valid (if not tightest) bound of it --
+            // take whichever is finite, or the smaller if both are.
+            Object::Intersect(left, right) => {
+                match (left.bounding_sphere(params), right.bounding_sphere(params)) {
+                    (Some(l), Some(r)) => Some(if l.1 <= r.1 { l } else { r }),
+                    (Some(l), None) => Some(l),
+                    (None, Some(r)) => Some(r),
+                    (None, None) => None,
+                }
+            }
+            // Subtracting can only shrink the set.
+            Object::Difference(left, _right) => left.bounding_sphere(params),
+        }
+    }
+}
+
+/// Smallest sphere enclosing two given spheres.
+fn enclosing_sphere(a: (Vec3, f32), b: (Vec3, f32)) -> (Vec3, f32) {
+    let (ca, ra) = a;
+    let (cb, rb) = b;
+    let d = ca.distance(cb);
+    if ra >= d + rb {
+        return a;
+    }
+    if rb >= d + ra {
+        return b;
+    }
+    let new_r = (d + ra + rb) * 0.5;
+    let center = if d > 1e-9 {
+        ca + (cb - ca) * ((new_r - ra) / d)
+    } else {
+        ca
+    };
+    (center, new_r)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Axis;
 
     fn sphere(r: f32) -> Object {
         Object::Sphere {
@@ -193,6 +252,160 @@ mod tests {
         assert!(l < r); // sanity: right side should be binding here
         let np_right = sphere(1.0).nearest_point(p, &params);
         assert_eq!(diff.nearest_point(p, &params), np_right);
+    }
+
+    #[test]
+    fn sphere_and_cuboid_bounding_sphere() {
+        let params = Params::new();
+        assert_eq!(
+            sphere(2.0).bounding_sphere(&params),
+            Some((Vec3::ZERO, 2.0))
+        );
+        let (c, r) = cuboid(Vec3::new(1.0, 2.0, 3.0))
+            .bounding_sphere(&params)
+            .unwrap();
+        assert_eq!(c, Vec3::ZERO);
+        assert!((r - Vec3::new(1.0, 2.0, 3.0).length()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn union_bounding_sphere_encloses_both_children() {
+        let params = Params::new();
+        let union = Object::Union(
+            Box::new(Object::Sphere {
+                radius: ScalarValue::Const(1.0),
+            }),
+            Box::new(Object::Fractal {
+                fold: Fold::ScaleTranslate {
+                    scale: ScalarValue::Const(1.0),
+                    shift: Vec3Value::Const(Vec3::new(5.0, 0.0, 0.0)),
+                },
+                base: Box::new(sphere(1.0)),
+            }),
+        );
+        let (c, r) = union.bounding_sphere(&params).unwrap();
+        // Both children (unit sphere at world origin; the second's local
+        // sphere at its own origin is reached by world point (-5,0,0), since
+        // the fold's forward map is `p' = p + (5,0,0)` and the local sphere
+        // sits at `p' = 0`) must lie entirely within the enclosing sphere.
+        assert!(c.distance(Vec3::ZERO) + 1.0 <= r + 1e-4);
+        assert!(c.distance(Vec3::new(-5.0, 0.0, 0.0)) + 1.0 <= r + 1e-4);
+    }
+
+    #[test]
+    fn union_with_unbounded_child_is_unbounded() {
+        let params = Params::new();
+        let unbounded = Object::Fractal {
+            fold: Fold::Modulo {
+                axis: Axis::X,
+                modulus: ScalarValue::Const(1.0),
+            },
+            base: Box::new(sphere(0.1)),
+        };
+        let union = Object::Union(Box::new(sphere(1.0)), Box::new(unbounded));
+        assert!(union.bounding_sphere(&params).is_none());
+    }
+
+    #[test]
+    fn bare_modulo_object_is_unbounded() {
+        let params = Params::new();
+        let obj = Object::Fractal {
+            fold: Fold::Modulo {
+                axis: Axis::X,
+                modulus: ScalarValue::Const(1.0),
+            },
+            base: Box::new(sphere(0.1)),
+        };
+        assert!(obj.bounding_sphere(&params).is_none());
+    }
+
+    #[test]
+    fn creme_spheres_intersect_resolves_infinite_repeat_to_the_outer_sphere() {
+        let params = Params::new();
+        let object = crate::scenes::creme_spheres();
+        // `creme_spheres` is `Intersect(Modulo-repeated spheres [unbounded],
+        // outer radius-6 sphere)` -- `Intersect` picks the finite side.
+        let (c, r) = object.bounding_sphere(&params).unwrap();
+        assert_eq!(c, Vec3::ZERO);
+        assert!((r - 6.0).abs() < 1e-5);
+    }
+
+    /// Soundness check against real, non-toy scene trees (not just synthetic
+    /// examples above): every point the tree itself reports as "inside"
+    /// (`de < 0`) must lie within the tree's own computed bounding sphere.
+    /// This is the property that actually matters for the ray-clip
+    /// pre-test -- an under-approximating bound silently culls real
+    /// geometry, so this is checked directly against `de`, not just against
+    /// the bound-composition formulas in isolation.
+    #[test]
+    fn bounding_sphere_is_sound_against_real_scenes() {
+        use crate::scenes::*;
+
+        // `steps`/`spacing` are per-scene: `menger_sponge` in particular is
+        // a thin-walled shell whose true interior is close to zero-measure
+        // (min DE found by a targeted probe was ~-3e-6), so a coarse grid
+        // can trivially find zero interior points without that meaning
+        // anything about soundness -- give it a finer, narrower scan than
+        // the other (thicker/larger) scenes.
+        fn assert_sound(name: &str, object: &Object, params: &Params, steps: i32, spacing: f32) {
+            let (center, radius) = object
+                .bounding_sphere(params)
+                .unwrap_or_else(|| panic!("{name}: expected a finite bound"));
+            let mut inside_count = 0;
+            for xi in -steps..=steps {
+                for yi in -steps..=steps {
+                    for zi in -steps..=steps {
+                        let p = Vec3::new(xi as f32, yi as f32, zi as f32) * spacing;
+                        if object.de(p.extend(1.0), params) < 0.0 {
+                            inside_count += 1;
+                            let d = p.distance(center);
+                            assert!(
+                                d <= radius + 1e-3,
+                                "{name}: inside point {p:?} at distance {d} from bound \
+                                 center {center:?}, outside computed radius {radius}"
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(inside_count > 0, "{name}: scan found no inside points at all -- test isn't exercising anything");
+        }
+
+        let mut p1 = Params::new();
+        let (classic_obj, h1) = classic(&mut p1);
+        set_fractal_params(
+            &mut p1,
+            &h1,
+            beware_of_bumps::SCALE,
+            beware_of_bumps::ANG1,
+            beware_of_bumps::ANG2,
+            beware_of_bumps::SHIFT,
+            beware_of_bumps::COLOR,
+            beware_of_bumps::ITERS,
+        );
+        assert_sound("classic", &classic_obj, &p1, 20, 0.7);
+
+        let mut p2 = Params::new();
+        let (demo, h2) = demo_scene(&mut p2);
+        set_fractal_params(
+            &mut p2,
+            &h2,
+            beware_of_bumps::SCALE,
+            beware_of_bumps::ANG1,
+            beware_of_bumps::ANG2,
+            beware_of_bumps::SHIFT,
+            beware_of_bumps::COLOR,
+            beware_of_bumps::ITERS,
+        );
+        assert_sound("demo_scene", &demo, &p2, 20, 0.7);
+
+        let p3 = Params::new();
+        assert_sound("creme_spheres", &creme_spheres(), &p3, 20, 0.3);
+
+        let mut p4 = Params::new();
+        let (sponge, h4) = menger_sponge(&mut p4);
+        set_menger_params(&mut p4, &h4, 12, Vec3::new(1.0, 0.5, 0.2));
+        assert_sound("menger_sponge", &sponge, &p4, 30, 0.1);
     }
 
     #[test]

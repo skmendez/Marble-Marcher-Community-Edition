@@ -30,6 +30,26 @@ pub struct CodeWriter {
     /// orbit save/restore in combinators only emit when this is `true`.
     pub color_pass: bool,
     next_id: u32,
+    /// Divides every `Fold::Repeat`'s loop bound at emission time (floored at
+    /// [`MIN_REPEAT_ITERATIONS`]) -- used to generate a cheaper, lower-detail
+    /// variant of the scene tree for the MRRM coarse and shadow/AO passes
+    /// (`generate_coarse_shader`/`generate_shadow_shader`), neither of which
+    /// needs the fine pass's full fractal surface fidelity (an approximate
+    /// empty-space skip distance / occlusion test, respectively). `1` (the
+    /// default, via [`CodeWriter::new`]) is a no-op -- [`generate_shader`]
+    /// always uses it.
+    ///
+    /// This has to work at the *WGSL emission* level, not by transforming the
+    /// `Object`/`Fold` tree beforehand: both of this codebase's real fractal
+    /// scenes (`classic`'s `iters`, `menger_sponge`'s `depth`) drive their
+    /// `Repeat` count from a runtime [`crate::IntValue::Param`], not a
+    /// [`crate::IntValue::Const`] baked in at tree-construction time -- a
+    /// tree-level transform could only ever reduce a `Const` count (a no-op
+    /// for every scene that actually matters here), whereas dividing the
+    /// *emitted expression* (`count.wgsl() / divisor`) works uniformly for
+    /// both, since it's just wrapped around whatever runtime value the
+    /// uniform buffer holds each frame.
+    iteration_divisor: i32,
 }
 
 impl Default for CodeWriter {
@@ -38,6 +58,15 @@ impl Default for CodeWriter {
     }
 }
 
+/// Floor for [`CodeWriter::iteration_divisor`]'s reduction -- these fractals'
+/// characteristic recursive structure (Menger cross-voids, nested corner
+/// folds) needs at least a couple of levels to read as "the same shape,
+/// approximately" rather than degenerating to a single flat primitive, which
+/// would make the coarse pass's hit-distance guess (or the shadow pass's
+/// occlusion test) diverge enough from the fine pass's real geometry to
+/// undermine MRRM's warm-start safety margin.
+const MIN_REPEAT_ITERATIONS: i32 = 2;
+
 impl CodeWriter {
     pub fn new() -> Self {
         Self {
@@ -45,6 +74,7 @@ impl CodeWriter {
             indent: 0,
             color_pass: false,
             next_id: 0,
+            iteration_divisor: 1,
         }
     }
 
@@ -125,10 +155,17 @@ impl CodeWriter {
             }
             Fold::Repeat { count, inner } => {
                 let it = self.fresh("it");
-                self.writeln(&format!(
-                    "for (var {it}: i32 = 0; {it} < {}; {it}++) {{",
+                let bound = if self.iteration_divisor <= 1 {
                     count.wgsl()
-                ));
+                } else {
+                    format!(
+                        "max({}, {} / {})",
+                        MIN_REPEAT_ITERATIONS,
+                        count.wgsl(),
+                        self.iteration_divisor
+                    )
+                };
+                self.writeln(&format!("for (var {it}: i32 = 0; {it} < {bound}; {it}++) {{"));
                 self.indent();
                 self.emit_fold(inner);
                 self.dedent();
@@ -211,7 +248,19 @@ enum Combine {
 }
 
 /// Bindings + `SceneUniforms` (verified against bevy_sprite 0.16.1, material
-/// bind group 2 — DESIGN.md §5).
+/// bind group 2 — DESIGN.md §5). `misc2`/`bounding` are the second-round-perf
+/// additions (ray-sphere clip + half-res shadow/AO): `misc2.x` is the shadow
+/// pass's own render-target height (only meaningful on the *fine* pass's own
+/// material, mirroring how `misc.z` is each pass's own resolution -- see
+/// `sample_shadow`'s doc), `misc2.y` is the fine pass's `MM_SHADOW_LOD`
+/// on/off flag (same uniform-flag-not-entity-toggle convention as `misc.w`'s
+/// MRRM flag, for the same A/B-comparability reason); `bounding.xyz` is the
+/// scene's world-space bounding-sphere center, `bounding.w` its radius, with
+/// `radius <= 0.0` meaning "no bound" (either the scene is genuinely
+/// unbounded -- `marble_csg::Object::bounding_sphere` returned `None` -- or
+/// this uniform was never populated), which `ray_sphere_clip` (`MARCH_CORE`)
+/// treats as "don't clip, march the full range" rather than "everything
+/// misses".
 const BINDINGS: &str = "\
 struct SceneUniforms {
     cam_pos: vec4<f32>,
@@ -223,6 +272,8 @@ struct SceneUniforms {
     sun_col: vec4<f32>,
     bg_col: vec4<f32>,
     misc: vec4<f32>,
+    misc2: vec4<f32>,
+    bounding: vec4<f32>,
 }
 
 @group(2) @binding(0) var<uniform> scene: SceneUniforms;
@@ -323,6 +374,16 @@ const COARSE_TEXTURE_BINDING: &str = "\
 @group(2) @binding(2) var coarse_tex: texture_2d<f32>;
 ";
 
+/// The fine pass's extra binding for the half-resolution shadow/AO pass's
+/// cached visibility (`shadow_pass.rs`) -- R = shadow visibility, A =
+/// traveled distance (`sample_shadow`'s doc). `textureLoad` (not
+/// `textureSample`): `sample_shadow` does its own depth-aware 4-tap blend
+/// by hand, so no hardware sampler is needed here either, same reasoning as
+/// `COARSE_TEXTURE_BINDING`.
+const SHADOW_TEXTURE_BINDING: &str = "\
+@group(2) @binding(3) var shadow_tex: texture_2d<f32>;
+";
+
 /// The over-relaxed march loop + its supporting constants, shared verbatim
 /// (DESIGN.md-style "no duplicated logic") between the coarse pass
 /// (`COARSE_MARCHER`) and the fine pass (`MARCHER`) -- both call
@@ -346,6 +407,31 @@ const MIN_HIT_DIST: f32 = 1e-5;
 
 fn map(p: vec3<f32>) -> f32 {
     return de_scene(vec4<f32>(p, 1.0));
+}
+
+// Ray-vs-bounding-sphere pre-test (`scene.bounding`, from
+// `marble_csg::Object::bounding_sphere`): every march pass calls this right
+// after ray setup so a ray pointed at open sky can skip `march_scene`
+// entirely instead of stepping all the way out to `max_d` through empty
+// space. Returns `(t_near, t_far)`, both clamped to `[0, MAX_DIST]` --
+// `radius <= 0.0` (no bound: an unbounded scene, or the uniform was never
+// populated) returns `(0.0, MAX_DIST)`, i.e. \"don't clip, march the full
+// range\" rather than \"everything misses\" -- and a clean miss returns
+// `t_near > t_far` (`(1.0, -1.0)`), which every caller checks for before
+// marching at all.
+fn ray_sphere_clip(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, radius: f32) -> vec2<f32> {
+    if (radius <= 0.0) {
+        return vec2<f32>(0.0, MAX_DIST);
+    }
+    let oc = ro - center;
+    let b = dot(oc, rd);
+    let c = dot(oc, oc) - radius * radius;
+    let h = b * b - c;
+    if (h < 0.0) {
+        return vec2<f32>(1.0, -1.0);
+    }
+    let sh = sqrt(h);
+    return vec2<f32>(max(-b - sh, 0.0), min(-b + sh, MAX_DIST));
 }
 
 // Result of `march_scene`: `t` is the best (lowest relative-error) candidate
@@ -382,7 +468,13 @@ struct MarchResult {
 // steps or triggers a backtrack, never a missed/incorrect hit -- see
 // `render.rs`'s `fragment` doc for why this makes MRRM safe even when the
 // coarse guess is wrong.
-fn march_scene(ro: vec3<f32>, rd: vec3<f32>, t0: f32, pixel_angle: f32) -> MarchResult {
+//
+// `max_d` is the far cutoff -- `MAX_DIST` when there's no bounding-sphere
+// clip to tighten it, or `ray_sphere_clip`'s `t_far` otherwise (always
+// `<= MAX_DIST`, see its doc); same never-unsafe-only-wasteful reasoning as
+// `t0` applies to a loose `max_d`, so a caller can always pass `MAX_DIST`
+// as a safe fallback.
+fn march_scene(ro: vec3<f32>, rd: vec3<f32>, t0: f32, pixel_angle: f32, max_d: f32) -> MarchResult {
     var t = t0;
     var prev_h = 0.0;
     var omega = OVERRELAX;
@@ -392,7 +484,7 @@ fn march_scene(ro: vec3<f32>, rd: vec3<f32>, t0: f32, pixel_angle: f32) -> March
     var hit_frac = false;
     for (var i = 0; i < MAX_STEPS; i++) {
         iters = i;
-        if (t > MAX_DIST) {
+        if (t > max_d) {
             break;
         }
         let h = map(ro + rd * t);
@@ -477,7 +569,12 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     let half_fov = atan(1.0 / scene.cam_forward.w);
     let pixel_angle = 2.0 * half_fov / max(scene.misc.z, 1.0);
 
-    let result = march_scene(ro, rd, 0.0, pixel_angle);
+    let clip = ray_sphere_clip(ro, rd, scene.bounding.xyz, scene.bounding.w);
+    if (clip.x > clip.y) {
+        return vec4<f32>(-1.0, 0.0, 0.0, 1.0);
+    }
+
+    let result = march_scene(ro, rd, clip.x, pixel_angle, clip.y);
     if (result.hit) {
         return vec4<f32>(result.t, 0.0, 0.0, 1.0);
     }
@@ -485,10 +582,78 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
 }
 ";
 
-/// Ray marcher + shading, appended after the scene functions in
-/// [`generate_shader`]. Kept deliberately simple (v1 — DESIGN.md §5); will
-/// grow toward MMCE's quality (shadows, fog, glow, GI) later.
-const MARCHER: &str = "\
+/// The half-resolution shadow/AO pre-pass's fragment shader
+/// (`shadow_pass.rs`/`generate_shadow_shader`): ray setup, a ray-sphere
+/// clip, then a march warm-started from MRRM's existing coarse buffer (same
+/// technique `MARCHER`'s `fragment` uses, at this pass's own, coarser
+/// resolution), then `calc_normal`/`shadow` on a genuine hit, packed as
+/// `vec4(shadow_visibility, 0.0, 0.0, traveled_distance)`. The `A` channel
+/// (traveled distance) is what `MARCHER`'s `sample_shadow` needs for its
+/// depth-aware resample -- a miss (or bounding-sphere clip miss) writes
+/// `MAX_DIST` there deliberately: `sample_shadow`'s weighting is
+/// `1/(sz^2+(td-td_i)^2)`, so a \"far away\" sentinel just gets naturally
+/// down-weighted against a real nearby hit rather than needing a branch on
+/// the fine-pass side. Doesn't need full fractal fidelity (only an
+/// approximate occlusion test), so its shader is generated with a reduced
+/// `Fold::Repeat` iteration count, same as `COARSE_MARCHER` (see
+/// `CodeWriter::iteration_divisor`).
+const SHADOW_MARCHER: &str = "\
+@fragment
+fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
+    let ndc = vec2<f32>(mesh.uv.x * 2.0 - 1.0, 1.0 - mesh.uv.y * 2.0);
+    let aspect = scene.misc.x;
+    let ro = scene.cam_pos.xyz;
+    let rd = normalize(
+        scene.cam_right.xyz * ndc.x * aspect
+        + scene.cam_up.xyz * ndc.y
+        + scene.cam_forward.xyz * scene.cam_forward.w
+    );
+
+    // This pass's *own* resolution's cone angle (`scene.misc.z` is this
+    // pass's own render-target height, written by `shadow_pass.rs` -- same
+    // per-pass-own-resolution convention as `COARSE_MARCHER`).
+    let half_fov = atan(1.0 / scene.cam_forward.w);
+    let pixel_angle = 2.0 * half_fov / max(scene.misc.z, 1.0);
+
+    let clip = ray_sphere_clip(ro, rd, scene.bounding.xyz, scene.bounding.w);
+    if (clip.x > clip.y) {
+        return vec4<f32>(1.0, 0.0, 0.0, MAX_DIST);
+    }
+
+    var t0 = clip.x;
+    let coarse_dims = vec2<i32>(textureDimensions(coarse_tex));
+    let texel = clamp(
+        vec2<i32>(mesh.uv * vec2<f32>(coarse_dims)),
+        vec2<i32>(0),
+        coarse_dims - vec2<i32>(1),
+    );
+    let coarse_t = textureLoad(coarse_tex, texel, 0).r;
+    if (coarse_t > 0.0) {
+        let coarse_pixel_angle = 2.0 * half_fov / max(f32(coarse_dims.y), 1.0);
+        t0 = max(t0, coarse_t - coarse_t * coarse_pixel_angle);
+    }
+
+    let march = march_scene(ro, rd, t0, pixel_angle, clip.y);
+    if (!march.hit) {
+        return vec4<f32>(1.0, 0.0, 0.0, MAX_DIST);
+    }
+
+    let p = ro + rd * march.t;
+    let eps = 1e-4 * max(march.t, 0.05);
+    let n = calc_normal(p, eps);
+    let sh = shadow(p + n * 2.0 * eps, scene.sun.xyz, pixel_angle);
+    return vec4<f32>(sh, 0.0, 0.0, march.t);
+}
+";
+
+/// `calc_normal`/`shadow` -- shared verbatim (same "no duplicated logic"
+/// reasoning as `MARCH_CORE`) between the fine pass (`MARCHER`) and the new
+/// half-resolution shadow/AO pass (`SHADOW_MARCHER`): both need a surface
+/// normal and an occlusion query against the sun, just at different
+/// resolutions. Not needed by the coarse (`COARSE_MARCHER`) pass, which
+/// skips all shading -- but harmless dead code there is worse than a third
+/// copy, so this lives in its own block included only where used.
+const SHADING_CORE: &str = "\
 const SHADOW_STEPS: i32 = 24;
 // Angular size (tangent of the half-angle) of the sun disc, controlling
 // shadow penumbra softness in the improved soft-shadow technique below --
@@ -508,21 +673,6 @@ fn calc_normal(p: vec3<f32>, eps: f32) -> vec3<f32> {
     ));
 }
 
-fn sphere_hit(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, r: f32) -> f32 {
-    let oc = ro - center;
-    let b = dot(oc, rd);
-    let c = dot(oc, oc) - r * r;
-    let h = b * b - c;
-    if (h < 0.0) {
-        return -1.0;
-    }
-    let t = -b - sqrt(h);
-    if (t < 0.0) {
-        return -1.0;
-    }
-    return t;
-}
-
 // Improved soft shadows via the closest-distance-to-the-cone technique
 // (Inigo Quilez's \"improved sphere tracing soft shadows\"; ported from
 // MMCE's shadow_march, utility/ray_marching.glsl), replacing the earlier
@@ -530,7 +680,7 @@ fn sphere_hit(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, r: f32) -> f32 {
 // ray makes to any occluder along its path (via the y/d bookkeeping below,
 // not just each sample's own ratio), giving smoother, less banded
 // penumbras and converging in fewer steps for a given quality. `pixel_angle`
-// (see `fragment`'s doc) both terminates the march once further stepping
+// (see callers' doc) both terminates the march once further stepping
 // can't change anything visible and is used as the base occlusion test
 // (matching MMCE's `pos.w < max(fovray*dir.w, MIN_DIST)`).
 fn shadow(ro: vec3<f32>, rd: vec3<f32>, pixel_angle: f32) -> f32 {
@@ -566,6 +716,65 @@ fn shadow(ro: vec3<f32>, rd: vec3<f32>, pixel_angle: f32) -> f32 {
     // returning the raw linear visibility).
     let lv2 = light_visibility * 2.0 - 1.0;
     return 0.5 + (lv2 * sqrt(max(1.0 - lv2 * lv2, 0.0)) + asin(clamp(lv2, -1.0, 1.0))) / 3.14159265;
+}
+";
+
+/// Ray marcher + shading, appended after the scene functions in
+/// [`generate_shader`]. Kept deliberately simple (v1 — DESIGN.md §5); will
+/// grow toward MMCE's quality (fog, glow, GI) later.
+const MARCHER: &str = "\
+fn sphere_hit(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, r: f32) -> f32 {
+    let oc = ro - center;
+    let b = dot(oc, rd);
+    let c = dot(oc, oc) - r * r;
+    let h = b * b - c;
+    if (h < 0.0) {
+        return -1.0;
+    }
+    let t = -b - sqrt(h);
+    if (t < 0.0) {
+        return -1.0;
+    }
+    return t;
+}
+
+// Depth-aware 4-tap resample of the half-resolution shadow/AO pass's cached
+// visibility (`shadow_pass.rs`/`SHADOW_MARCHER`), ported from MMCE's
+// `bilinear_surface` (`utility/interpolation.glsl`) -- weights each tap by
+// `1 / (sz^2 + (td - td_i)^2)` instead of plain bilinear (`(1-dx)(1-dy)`
+// etc. alone), so a tap whose stored traveled-distance `td_i` is wildly
+// different from this pixel's own `td` (i.e. it's actually a different,
+// unrelated surface behind/in front of a silhouette edge) gets smoothly
+// down-weighted rather than blended in and haloing the edge. `sz` is the
+// expected depth variation across one shadow-pass texel at this depth
+// (`3.0 * td * shadow_pixel_angle`, mirroring MRRM's own
+// `coarse_pixel_angle` back-off) -- MMCE's gamma-correction step in the
+// original is dropped here: that's for resampling a color texture, this is
+// a linear scalar visibility. `uv` is this pixel's screen UV (`mesh.uv`).
+fn sample_shadow(uv: vec2<f32>, td: f32) -> f32 {
+    let dims = vec2<f32>(textureDimensions(shadow_tex));
+    let shadow_pixel_angle = 2.0 * atan(1.0 / scene.cam_forward.w) / max(scene.misc2.x, 1.0);
+    let sz = max(3.0 * td * shadow_pixel_angle, MIN_HIT_DIST);
+    let sz2 = sz * sz;
+
+    let coord = uv * dims;
+    let ci = vec2<i32>(floor(coord));
+    let d = coord - floor(coord);
+    let dims_i = vec2<i32>(dims) - vec2<i32>(1);
+    let c00 = clamp(ci, vec2<i32>(0), dims_i);
+    let c10 = clamp(ci + vec2<i32>(1, 0), vec2<i32>(0), dims_i);
+    let c01 = clamp(ci + vec2<i32>(0, 1), vec2<i32>(0), dims_i);
+    let c11 = clamp(ci + vec2<i32>(1, 1), vec2<i32>(0), dims_i);
+    let a1 = textureLoad(shadow_tex, c00, 0);
+    let a2 = textureLoad(shadow_tex, c10, 0);
+    let a3 = textureLoad(shadow_tex, c01, 0);
+    let a4 = textureLoad(shadow_tex, c11, 0);
+
+    let w1 = (1.0 - d.x) * (1.0 - d.y) / (sz2 + (td - a1.w) * (td - a1.w));
+    let w2 = d.x * (1.0 - d.y) / (sz2 + (td - a2.w) * (td - a2.w));
+    let w3 = (1.0 - d.x) * d.y / (sz2 + (td - a3.w) * (td - a3.w));
+    let w4 = d.x * d.y / (sz2 + (td - a4.w) * (td - a4.w));
+    return (a1.r * w1 + a2.r * w2 + a3.r * w3 + a4.r * w4) / (w1 + w2 + w3 + w4);
 }
 
 // Vertical gradient of bg_col plus a sun disc/glow.
@@ -616,45 +825,60 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         marble_t = sphere_hit(ro, rd, scene.marble.xyz, scene.marble.w);
     }
 
-    // MRRM (multi-resolution ray marching): start this march from the
-    // coarse pre-pass's cached hit distance for this pixel instead of the
-    // camera (`t=0`), skipping almost all of the empty-space traversal
-    // neighboring pixels in the same coarse texel already redid
-    // independently. `scene.misc.w` is the MRRM on/off toggle (`MM_MRRM`,
-    // see `render.rs::update_material`) -- kept as a uniform flag rather
-    // than an entity/system toggle so the *shape* of every frame is
-    // identical whether MRRM is on or off (same cameras, same passes run),
-    // which is what makes the A/B comparison this feature was verified with
-    // trustworthy: only this one value differs between the two runs.
-    var t0 = 0.0;
-    if (scene.misc.w > 0.5) {
-        let coarse_dims = vec2<i32>(textureDimensions(coarse_tex));
-        let texel = clamp(
-            vec2<i32>(mesh.uv * vec2<f32>(coarse_dims)),
-            vec2<i32>(0),
-            coarse_dims - vec2<i32>(1),
-        );
-        let coarse_t = textureLoad(coarse_tex, texel, 0).r;
-        if (coarse_t > 0.0) {
-            // Back off by roughly one coarse-pixel's angular footprint at
-            // that depth, computed from the coarse pass's *own* resolution
-            // (`coarse_dims`, not this pass's `pixel_angle`) -- a real
-            // surface just outside the coarse sample's exact ray direction
-            // (which the coarse pass, marching along a slightly different
-            // ray through the same texel, wouldn't have seen) must still
-            // land inside the fine march's search space, not be skipped
-            // past by starting exactly on top of (or beyond) the coarse
-            // guess. The over-relaxed march's backtrack-on-overstep handles
-            // the rest -- see `march_scene`'s doc.
-            let coarse_pixel_angle = 2.0 * half_fov / max(f32(coarse_dims.y), 1.0);
-            t0 = max(0.0, coarse_t - coarse_t * coarse_pixel_angle);
-        }
-    }
+    // Ray-vs-bounding-sphere pre-test (`marble_csg::Object::bounding_sphere`,
+    // `render.rs`'s `bounding` uniform): a ray pointed at open sky can skip
+    // the fractal march entirely instead of stepping all the way out to
+    // `MAX_DIST` through empty space -- a clean miss here just leaves
+    // `hit_frac` false, exactly like an exhausted march, so the marble test
+    // above (whose sphere isn't necessarily inside this bound -- e.g.
+    // `GravityMode::Flying` lets it fly anywhere) still works unchanged.
+    let clip = ray_sphere_clip(ro, rd, scene.bounding.xyz, scene.bounding.w);
 
-    let march = march_scene(ro, rd, t0, pixel_angle);
-    let t = march.t;
-    let hit_frac = march.hit;
-    let iters = march.iters;
+    var t = 0.0;
+    var hit_frac = false;
+    var iters = 0;
+    if (clip.x <= clip.y) {
+        // MRRM (multi-resolution ray marching): start this march from the
+        // coarse pre-pass's cached hit distance for this pixel instead of
+        // the camera (`t=0`), skipping almost all of the empty-space
+        // traversal neighboring pixels in the same coarse texel already
+        // redid independently. `scene.misc.w` is the MRRM on/off toggle
+        // (`MM_MRRM`, see `render.rs::update_material`) -- kept as a uniform
+        // flag rather than an entity/system toggle so the *shape* of every
+        // frame is identical whether MRRM is on or off (same cameras, same
+        // passes run), which is what makes the A/B comparison this feature
+        // was verified with trustworthy: only this one value differs
+        // between the two runs.
+        var t0 = clip.x;
+        if (scene.misc.w > 0.5) {
+            let coarse_dims = vec2<i32>(textureDimensions(coarse_tex));
+            let texel = clamp(
+                vec2<i32>(mesh.uv * vec2<f32>(coarse_dims)),
+                vec2<i32>(0),
+                coarse_dims - vec2<i32>(1),
+            );
+            let coarse_t = textureLoad(coarse_tex, texel, 0).r;
+            if (coarse_t > 0.0) {
+                // Back off by roughly one coarse-pixel's angular footprint at
+                // that depth, computed from the coarse pass's *own* resolution
+                // (`coarse_dims`, not this pass's `pixel_angle`) -- a real
+                // surface just outside the coarse sample's exact ray direction
+                // (which the coarse pass, marching along a slightly different
+                // ray through the same texel, wouldn't have seen) must still
+                // land inside the fine march's search space, not be skipped
+                // past by starting exactly on top of (or beyond) the coarse
+                // guess. The over-relaxed march's backtrack-on-overstep handles
+                // the rest -- see `march_scene`'s doc.
+                let coarse_pixel_angle = 2.0 * half_fov / max(f32(coarse_dims.y), 1.0);
+                t0 = max(t0, coarse_t - coarse_t * coarse_pixel_angle);
+            }
+        }
+
+        let march = march_scene(ro, rd, t0, pixel_angle, clip.y);
+        t = march.t;
+        hit_frac = march.hit;
+        iters = march.iters;
+    }
 
     let marble_hit = marble_t > 0.0 && (!hit_frac || marble_t < t);
 
@@ -707,7 +931,17 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         // negative and NaN in `tonemap`'s `pow`.
         let base = clamp(col.rgb / (1.0 + abs(col.rgb)), vec3<f32>(0.0), vec3<f32>(1.0));
         let diffuse = max(dot(n, scene.sun.xyz), 0.0);
-        let sh = shadow(p + n * 2.0 * eps, scene.sun.xyz, pixel_angle);
+        // `scene.misc2.y` is the `MM_SHADOW_LOD` on/off flag (same
+        // uniform-flag convention as MRRM's `misc.w`, for the same
+        // A/B-comparability reason): resample the half-resolution
+        // shadow/AO pass's cached visibility instead of marching a fresh
+        // shadow ray for every full-res pixel.
+        var sh = 0.0;
+        if (scene.misc2.y > 0.5) {
+            sh = sample_shadow(mesh.uv, t);
+        } else {
+            sh = shadow(p + n * 2.0 * eps, scene.sun.xyz, pixel_angle);
+        }
         let ambient = 0.3 + 0.4 * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0);
         let ao = 1.0 - f32(iters) / f32(MAX_STEPS);
         var color = base * (ambient + diffuse * sh) * ao;
@@ -730,7 +964,17 @@ pub fn generate_library() -> String {
 
 /// `de_scene` + `col_scene` for `obj` (DESIGN.md §5).
 pub fn generate_scene_functions(obj: &Object) -> String {
+    generate_scene_functions_with_divisor(obj, 1)
+}
+
+/// Same as [`generate_scene_functions`], but every `Fold::Repeat` in `obj`
+/// gets its loop bound divided by `divisor` at emission time (see
+/// [`CodeWriter::iteration_divisor`]'s doc) -- used by
+/// `generate_coarse_shader`/`generate_shadow_shader` to build a cheaper,
+/// lower-detail variant for passes that don't need full fractal fidelity.
+fn generate_scene_functions_with_divisor(obj: &Object, divisor: i32) -> String {
     let mut w = CodeWriter::new();
+    w.iteration_divisor = divisor;
 
     w.color_pass = false;
     w.writeln("fn de_scene(p_in: vec4<f32>) -> f32 {");
@@ -758,10 +1002,12 @@ pub fn generate_scene_functions(obj: &Object) -> String {
 }
 
 /// Full fragment shader for the app's *fine* (full-resolution) marcher pass:
-/// import line, bindings, the MRRM coarse-texture binding, library, scene
-/// functions, shared march core, fine-only shading, and the `fragment`
-/// entry (DESIGN.md §5). Reads back `mrrm.rs`'s coarse pre-pass render
-/// target as a starting-distance guess (see `MARCHER`'s `fragment` doc).
+/// import line, bindings, the MRRM coarse-texture + shadow-texture bindings,
+/// library, scene functions, shared march core, shared shading core,
+/// fine-only shading, and the `fragment` entry (DESIGN.md §5). Reads back
+/// `mrrm.rs`'s coarse pre-pass render target as a starting-distance guess
+/// and `shadow_pass.rs`'s half-resolution shadow/AO pass as a resampled
+/// visibility value (see `MARCHER`'s `fragment` doc).
 pub fn generate_shader(obj: &Object) -> String {
     let mut s = String::new();
     s.push_str("#import bevy_sprite::mesh2d_vertex_output::VertexOutput\n\n");
@@ -769,35 +1015,84 @@ pub fn generate_shader(obj: &Object) -> String {
     s.push('\n');
     s.push_str(COARSE_TEXTURE_BINDING);
     s.push('\n');
+    s.push_str(SHADOW_TEXTURE_BINDING);
+    s.push('\n');
     s.push_str(&generate_scene_functions(obj));
     s.push_str("\n\n");
     s.push_str(MARCH_CORE);
+    s.push('\n');
+    s.push_str(SHADING_CORE);
     s.push('\n');
     s.push_str(MARCHER);
     s
 }
 
+/// Every `Fold::Repeat` in the coarse and shadow passes' generated trees
+/// runs at `1/COARSE_ITERATION_DIVISOR` the fine pass's iteration count
+/// (floored at [`MIN_REPEAT_ITERATIONS`]) -- see
+/// [`CodeWriter::iteration_divisor`]'s doc for why neither pass needs full
+/// fractal fidelity. `2` is a starting point verified visually (not a
+/// derived constant): halving still leaves enough recursive detail for
+/// MRRM's warm-start guess and the shadow pass's occlusion test to track the
+/// fine pass's real surface closely, without paying for iterations whose
+/// effect is already sub-pixel at these passes' own coarser resolution.
+const COARSE_ITERATION_DIVISOR: i32 = 2;
+
 /// Full fragment shader for the app's MRRM *coarse* pre-pass (`mrrm.rs`):
 /// import line + bindings (no coarse-texture binding -- this pass doesn't
-/// read one) + library + scene functions + shared march core + the coarse
-/// `fragment` entry (see `COARSE_MARCHER`'s doc for why this is a wholly
-/// separate module from [`generate_shader`]'s, not a second entry point in
-/// the same one). Deliberately regenerates `de_scene`/`col_scene` from the
-/// same `obj` tree rather than sharing a compiled module with the fine
-/// shader -- cheap (shader generation/compilation is a one-time
-/// startup/scene-change cost, not per-frame), and it's what lets this pass's
-/// bind-group layout have no `coarse_tex` binding at all instead of the fine
-/// pass's.
+/// read one) + library + a reduced-iteration copy of the scene functions
+/// (`COARSE_ITERATION_DIVISOR`) + shared march core + the coarse `fragment`
+/// entry (see `COARSE_MARCHER`'s doc for why this is a wholly separate
+/// module from [`generate_shader`]'s, not a second entry point in the same
+/// one). Deliberately regenerates `de_scene`/`col_scene` from the same `obj`
+/// tree rather than sharing a compiled module with the fine shader -- cheap
+/// (shader generation/compilation is a one-time startup/scene-change cost,
+/// not per-frame), and it's what lets this pass's bind-group layout have no
+/// `coarse_tex` binding at all instead of the fine pass's.
 pub fn generate_coarse_shader(obj: &Object) -> String {
     let mut s = String::new();
     s.push_str("#import bevy_sprite::mesh2d_vertex_output::VertexOutput\n\n");
     s.push_str(&generate_library());
     s.push('\n');
-    s.push_str(&generate_scene_functions(obj));
+    s.push_str(&generate_scene_functions_with_divisor(
+        obj,
+        COARSE_ITERATION_DIVISOR,
+    ));
     s.push_str("\n\n");
     s.push_str(MARCH_CORE);
     s.push('\n');
     s.push_str(COARSE_MARCHER);
+    s
+}
+
+/// Full fragment shader for the app's half-resolution shadow/AO pre-pass
+/// (`shadow_pass.rs`): import line + bindings + the MRRM coarse-texture
+/// binding (this pass warm-starts its own march from it, same as the fine
+/// pass) + library + a reduced-iteration copy of the scene functions (same
+/// `COARSE_ITERATION_DIVISOR` as the coarse pass -- this pass only needs an
+/// approximate occlusion test, not full fractal fidelity either) + shared
+/// march core + shared shading core + the `fragment` entry (see
+/// `SHADOW_MARCHER`'s doc). Wholly separate module from both
+/// `generate_shader` and `generate_coarse_shader`, same "fixed
+/// `\"fragment\"` entry-point name per `Material2d`" reasoning as
+/// `COARSE_MARCHER`'s doc.
+pub fn generate_shadow_shader(obj: &Object) -> String {
+    let mut s = String::new();
+    s.push_str("#import bevy_sprite::mesh2d_vertex_output::VertexOutput\n\n");
+    s.push_str(&generate_library());
+    s.push('\n');
+    s.push_str(COARSE_TEXTURE_BINDING);
+    s.push('\n');
+    s.push_str(&generate_scene_functions_with_divisor(
+        obj,
+        COARSE_ITERATION_DIVISOR,
+    ));
+    s.push_str("\n\n");
+    s.push_str(MARCH_CORE);
+    s.push('\n');
+    s.push_str(SHADING_CORE);
+    s.push('\n');
+    s.push_str(SHADOW_MARCHER);
     s
 }
 
@@ -836,6 +1131,18 @@ struct VertexOutput {
         assert!(
             shader.contains(import_line),
             "expected coarse shader to start with the bevy_sprite import line"
+        );
+        shader.replacen(import_line, VERTEX_OUTPUT_STRUCT, 1)
+    }
+
+    /// Same substitution as [`full_source`], for the half-resolution
+    /// shadow/AO pass shader (`generate_shadow_shader`).
+    fn full_shadow_source(obj: &Object) -> String {
+        let shader = generate_shadow_shader(obj);
+        let import_line = "#import bevy_sprite::mesh2d_vertex_output::VertexOutput\n";
+        assert!(
+            shader.contains(import_line),
+            "expected shadow shader to start with the bevy_sprite import line"
         );
         shader.replacen(import_line, VERTEX_OUTPUT_STRUCT, 1)
     }
@@ -958,6 +1265,46 @@ struct VertexOutput {
             base: Box::new(sphere(1.0)),
         };
         validate_wgsl(&full_coarse_source(&obj));
+    }
+
+    // Same three shapes again, through the half-resolution shadow/AO pass's
+    // generator (`generate_shadow_shader`) -- see `SHADOW_MARCHER`'s doc for
+    // why this is a wholly separate module from both the fine and coarse
+    // ones, warranting its own independent naga validation.
+    #[test]
+    fn demo_scene_shadow_shader_validates() {
+        let mut params = Params::new();
+        let (obj, _handles) = scenes::demo_scene(&mut params);
+        validate_wgsl(&full_shadow_source(&obj));
+    }
+
+    #[test]
+    fn nested_union_shadow_shader_validates() {
+        let obj = Object::Union(
+            Box::new(Object::Union(
+                Box::new(sphere(1.0)),
+                Box::new(cuboid(glam::Vec3::splat(1.0))),
+            )),
+            Box::new(sphere(2.0)),
+        );
+        validate_wgsl(&full_shadow_source(&obj));
+    }
+
+    #[test]
+    fn nested_repeat_shadow_shader_validates() {
+        let inner = Fold::Repeat {
+            count: IntValue::Const(3),
+            inner: Box::new(Fold::Abs),
+        };
+        let outer = Fold::Repeat {
+            count: IntValue::Const(2),
+            inner: Box::new(inner),
+        };
+        let obj = Object::Fractal {
+            fold: outer,
+            base: Box::new(sphere(1.0)),
+        };
+        validate_wgsl(&full_shadow_source(&obj));
     }
 
     #[test]

@@ -165,7 +165,7 @@ mod scene_uniforms_impl {
     use bevy::render::render_resource::ShaderType;
 
     /// Field-for-field match of the WGSL `SceneUniforms` struct emitted by
-    /// `marble_csg::codegen` (DESIGN.md §5) — nine `vec4<f32>`s, same order.
+    /// `marble_csg::codegen` (DESIGN.md §5) — eleven `vec4<f32>`s, same order.
     #[derive(Clone, Copy, Debug, ShaderType)]
     pub struct SceneUniforms {
         /// xyz eye position.
@@ -189,13 +189,26 @@ mod scene_uniforms_impl {
         /// hit threshold -- see `codegen.rs`'s `MARCH_CORE`; deliberately
         /// read from a uniform each frame rather than a shader constant so
         /// adaptive-render-resolution doesn't need this touched -- and
-        /// "this pass's own": the fine and coarse materials each write
-        /// their *own* render target's height here, not the other's, since
+        /// "this pass's own": each of the three passes' materials write
+        /// their *own* render target's height here, not another's, since
         /// each pass's cone-angle threshold must match its own resolution),
         /// w MRRM on/off flag (fine pass only -- `mrrm::mrrm_enabled`, see
-        /// `update_material`'s doc; unused/always 0 on the coarse pass's
-        /// own material, which doesn't read it).
+        /// `update_material`'s doc; unused/always 0 on the coarse/shadow
+        /// passes' own materials, which don't read it).
         pub misc: Vec4,
+        /// x the shadow/AO pass's own render-target height (fine pass's
+        /// material only -- feeds `sample_shadow`'s depth-tolerance `sz`
+        /// computation, mirroring how `misc.z` threads the coarse pass's own
+        /// resolution into the fine pass's MRRM back-off), y `MM_SHADOW_LOD`
+        /// on/off flag (same uniform-flag convention as `misc.w`'s MRRM
+        /// flag -- see `shadow_pass::shadow_lod_enabled`), z/w unused.
+        pub misc2: Vec4,
+        /// xyz world-space bounding-sphere center, w radius (`<= 0.0` means
+        /// "no bound" -- either the scene is genuinely unbounded or this was
+        /// never populated -- see `ray_sphere_clip`'s doc, `MARCH_CORE`).
+        /// Same value on every pass's material (computed once from the
+        /// scene tree at setup time, `SceneState::bounding_sphere`).
+        pub bounding: Vec4,
     }
 
     impl Default for SceneUniforms {
@@ -210,6 +223,10 @@ mod scene_uniforms_impl {
                 sun_col: Vec4::ONE,
                 bg_col: Vec4::ONE,
                 misc: Vec4::new(1.0, 0.0, 0.0, 0.0),
+                misc2: Vec4::ZERO,
+                // radius 0.0 -- "no bound" until `SceneState::bounding_sphere`
+                // is actually written in.
+                bounding: Vec4::ZERO,
             }
         }
     }
@@ -230,10 +247,12 @@ pub struct MarcherQuad;
 
 /// The fine (full-resolution) marcher's material. Two bindings unchanged
 /// from pre-MRRM (`scene`/`params`), plus the MRRM coarse pre-pass's cached
-/// hit-distance render target (`mrrm.rs`) as a third -- no paired `#[sampler]`
-/// binding: the generated shader only ever reads this texture with
-/// `textureLoad` (exact texel, matching the coarse pass's own texel grid),
-/// never `textureSample`, so no sampler is needed at all. See
+/// hit-distance render target (`mrrm.rs`) and the half-resolution shadow/AO
+/// pass's cached visibility (`shadow_pass.rs`) as a third and fourth -- no
+/// paired `#[sampler]` bindings: the generated shader only ever reads these
+/// textures with `textureLoad` (exact texel; `sample_shadow` does its own
+/// hand-rolled depth-aware 4-tap blend for the shadow one), never
+/// `textureSample`, so no sampler is needed at all. See
 /// `marble_csg::codegen::COARSE_TEXTURE_BINDING`'s doc for a known,
 /// environment-specific (llvmpipe-only) crash this exact data flow triggers
 /// in this project's native test sandbox -- not a bug in this binding/shader.
@@ -245,6 +264,8 @@ pub struct FineMarcherMaterial {
     pub params: Handle<ShaderStorageBuffer>,
     #[texture(2)]
     pub coarse: Handle<Image>,
+    #[texture(3)]
+    pub shadow: Handle<Image>,
 }
 
 impl Material2d for FineMarcherMaterial {
@@ -304,6 +325,29 @@ pub struct SceneState {
     pub handles: SceneHandles,
     pub material: Handle<FineMarcherMaterial>,
     pub params_buffer: Handle<ShaderStorageBuffer>,
+    /// The scene's world-space bounding sphere (`object.bounding_sphere`),
+    /// packed as `xyz = center, w = radius` (`w <= 0.0` means "no bound" --
+    /// `bounding_sphere` returned `None`), computed once here at setup
+    /// rather than every frame: it only depends on `params`, which this
+    /// scene's own tree either never changes after setup or (Demo's
+    /// opt-in `MM_ANIMATE_FRACTAL`) only nudges `ang1` -- a `Fold::Rotate`
+    /// angle, which `Fold::unfold_bounding_sphere` handles as an exact
+    /// isometry regardless of angle, so the bound stays valid without
+    /// needing to be recomputed as that animates. Every pass's material
+    /// writes this same value into its own `SceneUniforms::bounding` each
+    /// frame (`update_material`/`mrrm::update_coarse_material`/
+    /// `shadow_pass::update_shadow_material`).
+    pub bounding_sphere: Vec4,
+}
+
+/// `object.bounding_sphere(params)` packed for `SceneUniforms::bounding`/
+/// `ray_sphere_clip` (`marble_csg::codegen`): `xyz = center, w = radius`,
+/// or an all-zero (`radius <= 0.0`, "no bound") vector on `None`.
+fn pack_bounding_sphere(object: &Object, params: &Params) -> Vec4 {
+    match object.bounding_sphere(params) {
+        Some((center, radius)) => center.extend(radius),
+        None => Vec4::ZERO,
+    }
 }
 
 /// Startup system: builds the selected scene (`MM_SCENE`, [`SceneKind::from_env`]),
@@ -404,15 +448,18 @@ pub fn setup(
     );
 
     let params_buffer = storage_buffers.add(ShaderStorageBuffer::from(params.slots().to_vec()));
-    // `coarse: Handle::default()` is a placeholder -- `mrrm::setup_mrrm_pipeline`
-    // (a Startup system chained to run after this one) corrects it to the
-    // real coarse hit-distance render target once that `Image` exists.
-    // Every Startup system finishes before the first frame is ever
-    // rendered, so this placeholder is never actually read by the GPU.
+    let bounding_sphere = pack_bounding_sphere(&object, &params);
+    // `coarse`/`shadow: Handle::default()` are placeholders -- `mrrm::setup_mrrm_pipeline`
+    // and `shadow_pass::setup_shadow_pipeline` (Startup systems chained to
+    // run after this one) correct them to the real render targets once
+    // those `Image`s exist. Every Startup system finishes before the first
+    // frame is ever rendered, so these placeholders are never actually read
+    // by the GPU.
     let material = materials.add(FineMarcherMaterial {
         scene: SceneUniforms::default(),
         params: params_buffer.clone(),
         coarse: Handle::default(),
+        shadow: Handle::default(),
     });
 
     // Renders straight to the primary window (no adaptive-resolution
@@ -438,6 +485,7 @@ pub fn setup(
         handles,
         material,
         params_buffer,
+        bounding_sphere,
     });
 
     let spawn = kind.spawn_params();
@@ -485,11 +533,13 @@ fn animate_fractal() -> bool {
 /// §7/§8); re-syncs fractal params only if `animate_fractal()` is enabled
 /// (otherwise the static params `setup()` wrote stay untouched, matching
 /// what the marble's physics collides against).
+#[allow(clippy::too_many_arguments)]
 pub fn update_material(
     time: Res<Time>,
     orbit: Res<CameraOrbit>,
     marble_state: Res<MarbleState>,
     windows: Query<&Window, With<PrimaryWindow>>,
+    shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
     mut scene_state: ResMut<SceneState>,
     mut materials: ResMut<Assets<FineMarcherMaterial>>,
     mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
@@ -548,6 +598,16 @@ pub fn update_material(
             // comparison at a fixed camera state only ever differs in this
             // one value (see `mrrm::mrrm_enabled`'s doc).
             misc: Vec4::new(aspect, t, resolution_height, if crate::mrrm::mrrm_enabled() { 1.0 } else { 0.0 }),
+            // x: the shadow pass's own render-target height (`sample_shadow`'s
+            // `sz` computation), y: `MM_SHADOW_LOD` on/off (same
+            // A/B-comparability reasoning as MRRM's `misc.w` above).
+            misc2: Vec4::new(
+                shadow_render_target.size.y as f32,
+                if crate::shadow_pass::shadow_lod_enabled() { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ),
+            bounding: scene_state.bounding_sphere,
         };
     }
 }
