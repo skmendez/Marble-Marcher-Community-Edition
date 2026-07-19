@@ -1,5 +1,5 @@
-//! M5: fixed-timestep marble physics + WASD input, wired to the demo scene's
-//! `SceneState` (rust/DESIGN.md §7/§8).
+//! M5: fixed-timestep marble physics + WASD/touch input, wired to the demo
+//! scene's `SceneState` (rust/DESIGN.md §7/§8).
 //!
 //! `G` toggles between the two physics models `marble_csg::physics` supports
 //! (see its module doc): [`GravityMode::Rolling`] (original MMCE physics —
@@ -19,7 +19,19 @@
 //! pitch — D rolls the marble in the camera's screen-right direction. In
 //! `Flying` mode the same `dx`/`dy` inputs instead drive full 3D thrust
 //! along wherever the camera is actually pointed (see `step_marble`'s doc).
+//!
+//! Touch: a 2-finger pinch feeds an additional `dy` (on top of WASD's) via
+//! `touch::read_two_finger_gesture` — pinching in pulls the marble toward
+//! the camera (S-equivalent), pinching out pushes it away (W-equivalent).
+//! Read directly here (not via an `Update`-schedule intermediary) for the
+//! same reason WASD is: `Touches`, like `ButtonInput<KeyCode>`, is input
+//! state readable from any schedule, not something that needs per-frame
+//! accumulation across schedules. The gesture's *rotate* half is handled
+//! separately in `touch::touch_camera_input` (`Update` schedule, alongside
+//! the mouse-driven `orbit_camera_input`), since it drives `CameraOrbit`,
+//! not the marble.
 
+use bevy::input::touch::Touches;
 use bevy::prelude::*;
 
 use marble_csg::physics::{step_marble, GravityMode, Marble, PhysicsConfig};
@@ -27,6 +39,7 @@ use marble_csg::scenes::beware_of_bumps;
 
 use crate::camera::CameraOrbit;
 use crate::render::SceneState;
+use crate::touch::read_two_finger_gesture;
 
 /// The marble's live physics state + tuning constants. Spawns at the demo
 /// scene's start position/radius (DESIGN.md §6/§7).
@@ -45,13 +58,15 @@ impl Default for MarbleState {
     }
 }
 
-/// One 60 Hz physics tick (`FixedUpdate`): reads WASD + the orbit camera's
-/// yaw/pitch, steps the marble against the live CSG scene tree, lets `R`
-/// force an immediate manual respawn, and `G` toggle [`GravityMode`]. A no-op
-/// for scenes without a real marble (`SceneKind::has_marble` — the static
-/// display fractals, not the tuned demo level).
+/// One 60 Hz physics tick (`FixedUpdate`): reads WASD + a 2-finger pinch
+/// (additive — see module doc) + the orbit camera's yaw/pitch, steps the
+/// marble against the live CSG scene tree, lets `R` force an immediate
+/// manual respawn, and `G` toggle [`GravityMode`]. A no-op for scenes
+/// without a real marble (`SceneKind::has_marble` — the static display
+/// fractals, not the tuned demo level).
 pub fn marble_physics_tick(
     keys: Res<ButtonInput<KeyCode>>,
+    touches: Res<Touches>,
     orbit: Res<CameraOrbit>,
     scene: Res<SceneState>,
     mut marble_state: ResMut<MarbleState>,
@@ -85,6 +100,9 @@ pub fn marble_physics_tick(
     }
     if keys.pressed(KeyCode::KeyD) {
         dx += 1.0;
+    }
+    if let Some(gesture) = read_two_finger_gesture(&touches) {
+        dy += gesture.pinch_dy;
     }
 
     let MarbleState { marble, cfg } = &mut *marble_state;

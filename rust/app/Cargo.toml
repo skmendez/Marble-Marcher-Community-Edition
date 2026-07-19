@@ -21,6 +21,18 @@ bevy = { version = "0.16", default-features = false, features = [
     "multi_threaded",
     "x11",
     "png",
+    # On-screen FPS overlay (debug/perf-testing signal, DESIGN.md/M-next):
+    # bevy_diagnostic::FrameTimeDiagnosticsPlugin is already pulled in
+    # unconditionally by bevy_internal (it's a plain, non-optional
+    # dependency of bevy_internal, not feature-gated — see
+    # bevy_internal-0.16.1/Cargo.toml), so no feature is needed for that
+    # part. Text rendering, however, *is* feature-gated: bevy_ui/bevy_text
+    # are optional deps of bevy_internal, so both must be enabled here.
+    # `default_font` pulls in bevy_text's bundled FiraMono-derived embedded
+    # font so we don't need to vendor + load a font asset of our own.
+    "bevy_ui",
+    "bevy_text",
+    "default_font",
 ] }
 
 [features]

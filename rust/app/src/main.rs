@@ -8,8 +8,10 @@
 
 mod camera;
 mod debug_screenshot;
+mod fps_overlay;
 mod physics_sys;
 mod render;
+mod touch;
 
 use bevy::prelude::*;
 use bevy::sprite::Material2dPlugin;
@@ -17,8 +19,10 @@ use bevy::window::WindowResolution;
 
 use camera::{orbit_camera_input, CameraOrbit};
 use debug_screenshot::DebugScreenshotPlugin;
+use fps_overlay::FpsOverlayPlugin;
 use physics_sys::{marble_physics_tick, MarbleState};
 use render::{setup, sync_quad_scale, update_material, MarcherMaterial};
+use touch::touch_camera_input;
 
 /// `MM_WINDOW_SIZE=WxH` overrides the window's starting resolution — mainly
 /// useful for testing on a software (CPU) Vulkan/GL fallback, where this
@@ -65,6 +69,7 @@ fn main() {
             ..default()
         }))
         .add_plugins(Material2dPlugin::<MarcherMaterial>::default())
+        .add_plugins(FpsOverlayPlugin)
         .add_plugins(DebugScreenshotPlugin)
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<CameraOrbit>()
@@ -73,7 +78,13 @@ fn main() {
         .add_systems(FixedUpdate, marble_physics_tick)
         .add_systems(
             Update,
-            (sync_quad_scale, orbit_camera_input, update_material).chain(),
+            (
+                sync_quad_scale,
+                orbit_camera_input,
+                touch_camera_input,
+                update_material,
+            )
+                .chain(),
         )
         .run();
 }
