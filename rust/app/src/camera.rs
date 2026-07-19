@@ -27,8 +27,20 @@ pub struct CameraOrbit {
 impl Default for CameraOrbit {
     fn default() -> Self {
         Self {
-            yaw: 0.8,
-            pitch: 0.35,
+            // Aimed roughly along the outward surface normal at the demo
+            // scene's actual resting spot (computed once, offline, from
+            // Object::nearest_point at the settled marble position — see
+            // rust/csg/examples/ in git history) rather than an arbitrary
+            // angle: with the marble sitting flush against the fractal
+            // surface (radius-thin clearance), most viewing directions look
+            // straight into solid geometry or get blocked by the nearby
+            // decorative "creme spheres" clutter, and this is the direction
+            // that was actually verified (via a close-up screenshot) to see
+            // it. Not a general solution — a real fix would auto-orient the
+            // camera to the marble's contact normal at spawn/settle time,
+            // which isn't implemented yet.
+            yaw: -1.448,
+            pitch: 0.899,
             // DESIGN.md §7: orbit_dist * marble_rad / 0.035 (Beware Of Bumps'
             // level values), i.e. the original MMCE camera-distance scaling.
             distance: beware_of_bumps::ORBIT_DIST * beware_of_bumps::MARBLE_RAD / 0.035,

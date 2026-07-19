@@ -2,19 +2,40 @@
 //! no bevy — see rust/DESIGN.md §7).
 //!
 //! Direct port of `Scene::UpdateMarble` / `Scene::MarbleCollision`
-//! (src/Scene.cpp). This branch's working tree carries three experimental
-//! gameplay edits in `Scene::UpdateMarble` (a `force = 0;` line that kills
-//! gravity, a disabled kill-plane check, and a camera-ray movement
-//! experiment replacing the original yaw-relative input force); per
-//! DESIGN.md §10.6 none of those are ported. This module implements the
-//! ORIGINAL upstream behavior: gravity on, kill plane on, and the original
-//! (in this branch, commented-out) yaw-relative movement line
-//! `v = (dx*cos - dy*sin, 0, -dy*cos - dx*sin)`. The `std::cerr` debug print
-//! in `MarbleCollision` is also not ported.
+//! (src/Scene.cpp), supporting **both** physics models present in this
+//! repo's C++ history as [`GravityMode`]:
+//!
+//! - [`GravityMode::Rolling`]: the original upstream behavior — gravity on,
+//!   kill plane on, camera-**yaw**-relative rolling
+//!   (`v = (dx*cos - dy*sin, 0, -dy*cos - dx*sin)`, horizontal only).
+//! - [`GravityMode::Flying`]: this branch's in-progress experimental
+//!   mechanic ("new camera/movement mechanics" commit) — no gravity
+//!   (`force = 0`), no kill plane, true 3D camera-**yaw-and-pitch**-relative
+//!   thrust (so `W`/`S` fly along wherever the camera is actually looking,
+//!   including up/down, not just horizontally). Collision/bounce off
+//!   geometry still applies in both modes — only gravity and the movement
+//!   formula differ; see [`step_marble`]'s doc for the exact per-mode math,
+//!   derived from `Scene::MakeCameraRotation`/`FOCAL_DIST` (src/Scene.h/.cpp).
+//!
+//! The `std::cerr` debug print in `MarbleCollision` is not ported in either
+//! mode.
 
 use glam::{Vec2, Vec3};
 
 use crate::{Object, Params};
+
+/// Which physics model [`step_marble`] uses. See the module doc for what
+/// each mode is a port of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GravityMode {
+    /// Original MMCE marble-rolling physics: gravity, kill plane, horizontal
+    /// camera-yaw-relative movement.
+    #[default]
+    Rolling,
+    /// This branch's experimental zero-gravity free-flight mechanic: no
+    /// gravity, no kill plane, full 3D camera-relative thrust.
+    Flying,
+}
 
 /// A single point-collider sample: an offset from the owning body's origin
 /// plus a radius. The marble is the one-sample case (`offset = 0`). This is
@@ -28,7 +49,8 @@ pub struct SamplePoint {
 }
 
 /// Frame-rate-locked physics constants (per 60 Hz tick), C++ `Scene.cpp`
-/// file-scope `static const` values (ported verbatim — DESIGN.md §7).
+/// file-scope `static const` values (ported verbatim — DESIGN.md §7), plus
+/// which [`GravityMode`] to simulate.
 #[derive(Clone, Copy, Debug)]
 pub struct PhysicsConfig {
     pub ground_force: f32,
@@ -38,6 +60,7 @@ pub struct PhysicsConfig {
     pub gravity: f32,
     pub ground_ratio: f32,
     pub bounce: f32,
+    pub mode: GravityMode,
 }
 
 impl Default for PhysicsConfig {
@@ -50,9 +73,15 @@ impl Default for PhysicsConfig {
             gravity: 0.005,
             ground_ratio: 1.15,
             bounce: 1.2,
+            mode: GravityMode::default(),
         }
     }
 }
+
+/// `sqrt(3)`, C++ `Scene.h`'s `#define FOCAL_DIST 1.73205080757` — the
+/// camera-space distance used to build the [`GravityMode::Flying`] thrust
+/// direction (see `step_marble`).
+const FOCAL_DIST: f32 = 1.732_050_8;
 
 /// The C++ `MarbleCollision` hard-codes this threshold (`marble_rad *
 /// 0.001f`) rather than exposing it as a tunable constant; kept as a literal
@@ -177,19 +206,20 @@ pub enum StepEvent {
 }
 
 /// One 60 Hz physics tick — direct port of `Scene::UpdateMarble`'s
-/// non-free-camera branch with `num_phys_steps = 1` (DESIGN.md §7 notes the
-/// C++ substeps at 6; we use one substep per tick, matching the design's
-/// stated simplification), using the ORIGINAL (in this branch,
-/// commented-out) yaw-relative movement line — see the module doc.
+/// non-free-camera branch, branching on `cfg.mode` (see the module doc for
+/// what each [`GravityMode`] is a port of and why gravity/kill-plane/the
+/// movement formula are the only things that differ between them —
+/// substepping, collision, and friction are identical in both modes).
 ///
-/// ⚠ Corrected from an earlier draft of this port (and of DESIGN.md §7),
-/// which ran gravity/integration/collision once per tick with the full
-/// velocity. That tunnels: `marble_pos += marble_vel` in one big jump skips
-/// over thin fractal struts, and — worse — a single collision correction
-/// per tick leaves the *tangential* component of velocity untouched (only
-/// the normal component is resolved), so a marble resting on a sloped strut
-/// drifts sideways for many ticks (friction alone decays it far too slowly)
-/// until it slides off and free-falls. The real C++ avoids both problems by
+/// ⚠ The substep structure below is load-bearing, in both modes — an
+/// earlier draft of this port (and of DESIGN.md §7) ran
+/// gravity/integration/collision once per tick with the full velocity, and
+/// that tunnels: `marble_pos += marble_vel` in one big jump skips over thin
+/// fractal struts, and — worse — a single collision correction per tick
+/// leaves the *tangential* component of velocity untouched (only the normal
+/// component is resolved), so a marble resting on a sloped strut drifts
+/// sideways for many ticks (friction alone decays it far too slowly) until
+/// it slides off and free-falls. The real C++ avoids both problems by
 /// substepping: gravity and position integration are split across
 /// [`NUM_PHYS_STEPS`] substeps, with a full collision resolution after
 /// *each* substep (`Scene::UpdateMarble`, src/Scene.cpp — `num_phys_steps`).
@@ -198,26 +228,45 @@ pub enum StepEvent {
 ///
 /// `input` is `(dx, dy)` in C++'s convention: `dx` is the strafe axis, `dy`
 /// is the forward/back axis (see the app-side WASD mapping for the sign
-/// convention that makes `W` roll the marble away from the camera).
-/// `cam_yaw` is `cam_look_x` (radians). Order, matching the C++ statement
-/// order in `UpdateMarble`/`MarbleCollision`:
+/// convention). `cam_yaw`/`cam_pitch` are `cam_look_x`/`cam_look_y`
+/// (radians); `cam_pitch` is only used in [`GravityMode::Flying`] (the
+/// original rolling movement is horizontal-only and ignores pitch, matching
+/// the pristine C++). Order, matching the C++ statement order in
+/// `UpdateMarble`/`MarbleCollision`:
 ///
-/// 1. [`NUM_PHYS_STEPS`] substeps, each: `vel.y -= rad * gravity /
-///    NUM_PHYS_STEPS`, then `pos += vel / NUM_PHYS_STEPS`, then collide
-///    (marble as one [`SamplePoint`]) at the new `pos` — `on_ground`
-///    accumulates via OR across substeps, and a crush respawns to `start`
-///    immediately, reporting [`StepEvent::RespawnedCrushed`] (the C++
-///    instead sets `pos.y = -9999` and lets the *end-of-tick* kill-plane
-///    check below catch it on the same tick; we short-circuit to the same
-///    observable outcome — reset to `start`, zero velocity, by the end of
-///    this call — without running the remaining substeps against a
-///    sentinel position).
-/// 2. input force: `f = rad * (on_ground ? ground_force : air_force)`,
-///    `v = (dx*cos(yaw) - dy*sin(yaw), 0, -dy*cos(yaw) - dx*sin(yaw))`,
-///    `vel += v * f`
-/// 3. friction: `vel *= on_ground ? ground_friction : air_friction`
-/// 4. kill-plane: `pos.y < kill_y` -> respawn to `start`, report
-///    [`StepEvent::RespawnedFell`]
+/// 1. [`NUM_PHYS_STEPS`] substeps, each: gravity (`Rolling`: `vel.y -= rad *
+///    gravity / NUM_PHYS_STEPS`; `Flying`: none — C++'s `force = 0;`
+///    override), then `pos += vel / NUM_PHYS_STEPS`, then collide (marble as
+///    one [`SamplePoint`]) at the new `pos` — `on_ground` accumulates via OR
+///    across substeps, and a crush respawns to `start` immediately,
+///    reporting [`StepEvent::RespawnedCrushed`] in **both** modes (the C++
+///    instead sets `pos.y = -9999` and, in `Rolling` mode, lets the
+///    *end-of-tick* kill-plane check below catch it on the same tick — with
+///    the kill-plane check disabled entirely in `Flying` mode, a
+///    C++-faithful crush there would leave the marble permanently stuck at
+///    `y = -9999`; we short-circuit to an immediate respawn in both modes
+///    instead, which matches `Rolling`'s observable outcome exactly and
+///    gives `Flying` a sane one instead of an unreachable void).
+/// 2. input force, once per full tick: `f = rad * (on_ground ?
+///    ground_force : air_force)`, then per mode:
+///    - `Rolling`: `v = (dx*cos(yaw) - dy*sin(yaw), 0, -dy*cos(yaw) -
+///      dx*sin(yaw))` (horizontal only).
+///    - `Flying`: full 3D camera-relative thrust, derived from
+///      `Scene::MakeCameraRotation`'s `cam_mat = Ry(yaw) * Rx(pitch)`
+///      (marble_mat = identity for non-planet levels) applied to the C++'s
+///      `ray = cam_mat*(0,0,-FOCAL_DIST,0)` (look direction) and
+///      `ray2 = cam_mat*(dx,0,0,0)` (strafe direction), giving
+///      `v = dy*ray + ray2 = (-dy*F*cos(pitch)*sin(yaw) + dx*cos(yaw),
+///      dy*F*sin(pitch), -dy*F*cos(pitch)*cos(yaw) - dx*sin(yaw))` where
+///      `F = FOCAL_DIST` — i.e. `W`/`S` fly along wherever the camera is
+///      actually pointed (including up/down), `A`/`D` strafe horizontally.
+///
+///    Either way: `vel += v * f`.
+/// 3. friction, once per full tick: `vel *= on_ground ? ground_friction :
+///    air_friction`.
+/// 4. kill-plane (`Rolling` only — disabled in `Flying`, matching the C++'s
+///    commented-out check): `pos.y < kill_y` -> respawn to `start`, report
+///    [`StepEvent::RespawnedFell`].
 #[allow(clippy::too_many_arguments)]
 pub fn step_marble(
     marble: &mut Marble,
@@ -225,6 +274,7 @@ pub fn step_marble(
     params: &Params,
     input: Vec2,
     cam_yaw: f32,
+    cam_pitch: f32,
     cfg: &PhysicsConfig,
     kill_y: f32,
     start: Vec3,
@@ -245,7 +295,9 @@ pub fn step_marble(
     let mut on_ground = false;
 
     for _ in 0..NUM_PHYS_STEPS {
-        marble.vel.y -= marble.rad * cfg.gravity / steps;
+        if cfg.mode == GravityMode::Rolling {
+            marble.vel.y -= marble.rad * cfg.gravity / steps;
+        }
         marble.pos += marble.vel / steps;
 
         let samples = [SamplePoint {
@@ -261,18 +313,31 @@ pub fn step_marble(
         on_ground |= outcome.on_ground;
     }
 
-    // Input force (camera-yaw-relative), once per full tick.
+    // Input force, once per full tick.
     let f = marble.rad * if on_ground { cfg.ground_force } else { cfg.air_force };
-    let cs = cam_yaw.cos();
-    let sn = cam_yaw.sin();
-    let v = Vec3::new(dx * cs - dy * sn, 0.0, -dy * cs - dx * sn);
+    let v = match cfg.mode {
+        GravityMode::Rolling => {
+            let cs = cam_yaw.cos();
+            let sn = cam_yaw.sin();
+            Vec3::new(dx * cs - dy * sn, 0.0, -dy * cs - dx * sn)
+        }
+        GravityMode::Flying => {
+            let (sin_y, cos_y) = cam_yaw.sin_cos();
+            let (sin_p, cos_p) = cam_pitch.sin_cos();
+            Vec3::new(
+                -dy * FOCAL_DIST * cos_p * sin_y + dx * cos_y,
+                dy * FOCAL_DIST * sin_p,
+                -dy * FOCAL_DIST * cos_p * cos_y - dx * sin_y,
+            )
+        }
+    };
     marble.vel += v * f;
 
     // Friction, once per full tick.
     marble.vel *= if on_ground { cfg.ground_friction } else { cfg.air_friction };
 
-    // Kill plane.
-    if marble.pos.y < kill_y {
+    // Kill plane (Rolling only).
+    if cfg.mode == GravityMode::Rolling && marble.pos.y < kill_y {
         marble.respawn(start);
         return StepEvent::RespawnedFell;
     }
@@ -330,6 +395,7 @@ mod tests {
                 &object,
                 &params,
                 Vec2::ZERO,
+                0.0,
                 0.0,
                 &cfg,
                 beware_of_bumps::KILL_Y,
@@ -395,6 +461,7 @@ mod tests {
                 &params,
                 Vec2::ZERO,
                 0.0,
+                0.0,
                 &cfg,
                 beware_of_bumps::KILL_Y,
                 start,
@@ -439,6 +506,7 @@ mod tests {
             &params,
             Vec2::ZERO,
             0.0,
+            0.0,
             &PhysicsConfig::default(),
             -1000.0,
             start,
@@ -472,6 +540,7 @@ mod tests {
                 &object,
                 &params,
                 Vec2::ZERO,
+                0.0,
                 0.0,
                 &PhysicsConfig::default(),
                 kill_y,
@@ -547,5 +616,82 @@ mod tests {
             &PhysicsConfig::default(),
         );
         assert!(outcome.crushed);
+    }
+
+    /// [`GravityMode::Flying`]: no gravity — a marble floating in empty
+    /// space with zero input stays exactly where it is (no free-fall).
+    #[test]
+    fn flying_mode_has_no_gravity() {
+        let params = Params::new();
+        // Far from all geometry, matching kill_plane_respawns_falling_marble's
+        // "empty space" setup, but this time we're checking it does NOT fall.
+        let object = Object::Sphere {
+            radius: ScalarValue::Const(0.01),
+        };
+        let rad = 0.02;
+        let start = Vec3::new(50.0, 50.0, 50.0);
+        let mut marble = Marble::spawn(start, rad);
+        let cfg = PhysicsConfig {
+            mode: GravityMode::Flying,
+            ..PhysicsConfig::default()
+        };
+
+        for _ in 0..600 {
+            let event = step_marble(
+                &mut marble,
+                &object,
+                &params,
+                Vec2::ZERO,
+                0.0,
+                0.0,
+                &cfg,
+                beware_of_bumps::KILL_Y,
+                start,
+            );
+            assert_eq!(event, StepEvent::None);
+        }
+        assert_eq!(marble.pos, start, "flying mode must not apply gravity");
+    }
+
+    /// [`GravityMode::Flying`]: no kill plane — a marble given downward
+    /// thrust flies straight through where `kill_y` would trigger a respawn
+    /// in `Rolling` mode, and never respawns.
+    #[test]
+    fn flying_mode_has_no_kill_plane() {
+        let params = Params::new();
+        let object = Object::Sphere {
+            radius: ScalarValue::Const(0.01),
+        };
+        let rad = 0.02;
+        let start = Vec3::new(50.0, 50.0, 50.0);
+        let mut marble = Marble::spawn(start, rad);
+        let cfg = PhysicsConfig {
+            mode: GravityMode::Flying,
+            ..PhysicsConfig::default()
+        };
+        let kill_y = start.y - 1.0; // would trigger almost immediately in Rolling mode
+
+        // dy > 0 with pitch = -PI/2 (looking straight down) flies downward
+        // per step_marble's Flying-mode formula (v.y = dy * FOCAL_DIST * sin(pitch)).
+        for _ in 0..600 {
+            let event = step_marble(
+                &mut marble,
+                &object,
+                &params,
+                Vec2::new(0.0, 1.0),
+                0.0,
+                -std::f32::consts::FRAC_PI_2,
+                &cfg,
+                kill_y,
+                start,
+            );
+            assert_eq!(event, StepEvent::None, "Flying mode must never respawn from a kill plane");
+        }
+        assert!(
+            marble.pos.y < kill_y,
+            "expected the marble to have flown below kill_y ({}), got y={}",
+            kill_y,
+            marble.pos.y
+        );
     }
 }

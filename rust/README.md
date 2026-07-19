@@ -18,9 +18,18 @@ Workspace layout:
 cargo run -p marble-marcher-bevy
 ```
 
-WASD moves the marble (camera-yaw-relative, matching the original Marble
-Marcher's feel); `R` forces a manual respawn. Left-drag orbits the camera,
-scroll wheel zooms.
+WASD moves the marble; `R` forces a manual respawn; `G` toggles between the
+two physics models `marble_csg::physics` supports (see its module doc for
+exactly what each one is a faithful port of):
+
+- **Rolling** (default) — original MMCE physics: gravity, kill plane,
+  horizontal camera-yaw-relative rolling.
+- **Flying** — this branch's in-progress zero-gravity experiment ("new
+  camera/movement mechanics"): no gravity, no kill plane, full 3D
+  camera-relative thrust (WASD flies wherever the camera is actually
+  pointed, including up/down).
+
+Left-drag orbits the camera, scroll wheel zooms.
 
 `MM_WINDOW_SIZE=WxH` overrides the starting window resolution — useful on a
 software (CPU) Vulkan/GL fallback (e.g. llvmpipe, when no hardware GPU ICD

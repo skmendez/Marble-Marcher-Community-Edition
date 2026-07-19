@@ -397,7 +397,21 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         let mn = normalize(mp - scene.marble.xyz);
         let refl = reflect(rd, mn);
         let fresnel = pow(1.0 - max(dot(-rd, mn), 0.0), 5.0);
-        let marble_col = mix(scene.bg_col.rgb * 0.5, sky(refl), 0.04 + 0.96 * fresnel);
+        // A distinct, saturated base color (not just a sky-reflecting mirror)
+        // so the marble reads clearly against the scene even at the small
+        // apparent size a realistic marble_rad gives it. Earlier version
+        // *mixed* in a bright pale sky color even at low fresnel, which
+        // desaturated the base color toward a washed-out pink (verified by
+        // rendering a close-up: shape/position/tangency were all correct,
+        // only the color read wrong) -- an additive, fresnel-gated rim
+        // highlight keeps the base color dominant everywhere except a thin
+        // bright rim at grazing angles.
+        let base_col = vec3<f32>(0.95, 0.08, 0.05);
+        let ambient = 0.3;
+        let diffuse = max(dot(mn, scene.sun.xyz), 0.0);
+        let shaded = base_col * (ambient + (1.0 - ambient) * diffuse);
+        let rim = pow(fresnel, 2.0) * 0.4 * sky(refl);
+        let marble_col = shaded + rim;
         return vec4<f32>(tonemap(marble_col), 1.0);
     }
 
@@ -406,7 +420,26 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         let eps = 1e-4 * max(t, 0.05);
         let n = calc_normal(p, eps);
         let col = col_scene(vec4<f32>(p, 1.0));
-        let base = clamp(col.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+        // Orbit-trap values are `max(orbit, p.xyz * color)` accumulated over
+        // however many fold iterations ran (DESIGN.md §5's OrbitMax) -- `p`
+        // is the *folded* coordinate, which routinely reaches magnitudes
+        // well past +-1 (up to the fractal's box half-extent, ~6 for the
+        // classic scene). A hard `clamp(col.rgb, 0, 1)` here saturates most
+        // pixels to white/near-white *before* any lighting is applied, which
+        // reads as a uniformly pale/washed-out surface no matter how
+        // ambient/diffuse/tonemap constants downstream are tuned (clamping
+        // is lossy -- detail above 1.0 is gone, not just displayed brightly).
+        // Compress with a Reinhard-style curve (matches `tonemap()` below)
+        // before clamping instead: this maps the *typical* orbit range
+        // smoothly into (-1, 1) so the coloring keeps its shape (still
+        // varies meaningfully across the surface -- it's the same orbit
+        // value, just range-compressed) rather than being hard-clipped to a
+        // flat white ceiling. The clamp after is still needed to guard
+        // against negative components (a channel can go negative when the
+        // folded p component is negative and no later iteration's max
+        // overrides it) -- a negative `base` would go on to make `color`
+        // negative and NaN in `tonemap`'s `pow`.
+        let base = clamp(col.rgb / (1.0 + abs(col.rgb)), vec3<f32>(0.0), vec3<f32>(1.0));
         let diffuse = max(dot(n, scene.sun.xyz), 0.0);
         let sh = shadow(p + n * 2.0 * eps, scene.sun.xyz);
         let ambient = 0.3 + 0.4 * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0);
