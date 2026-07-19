@@ -59,6 +59,13 @@ impl Default for PhysicsConfig {
 /// here too.
 const CRUSH_RATIO: f32 = 0.001;
 
+/// Physics substeps per tick (C++ `Scene.cpp`'s file-scope `static const int
+/// num_phys_steps = 6;`). Gravity and position integration are split across
+/// this many substeps, with a full collision resolution after each one —
+/// see [`step_marble`]'s doc for why this substepping (not a single big step
+/// per tick) is load-bearing.
+pub const NUM_PHYS_STEPS: u32 = 6;
+
 /// The marble body: world-space position, velocity, and radius.
 #[derive(Clone, Copy, Debug)]
 pub struct Marble {
@@ -175,22 +182,43 @@ pub enum StepEvent {
 /// stated simplification), using the ORIGINAL (in this branch,
 /// commented-out) yaw-relative movement line — see the module doc.
 ///
+/// ⚠ Corrected from an earlier draft of this port (and of DESIGN.md §7),
+/// which ran gravity/integration/collision once per tick with the full
+/// velocity. That tunnels: `marble_pos += marble_vel` in one big jump skips
+/// over thin fractal struts, and — worse — a single collision correction
+/// per tick leaves the *tangential* component of velocity untouched (only
+/// the normal component is resolved), so a marble resting on a sloped strut
+/// drifts sideways for many ticks (friction alone decays it far too slowly)
+/// until it slides off and free-falls. The real C++ avoids both problems by
+/// substepping: gravity and position integration are split across
+/// [`NUM_PHYS_STEPS`] substeps, with a full collision resolution after
+/// *each* substep (`Scene::UpdateMarble`, src/Scene.cpp — `num_phys_steps`).
+/// Keyboard input force and friction are still applied once per full tick,
+/// after the substep loop, exactly as in the C++.
+///
 /// `input` is `(dx, dy)` in C++'s convention: `dx` is the strafe axis, `dy`
 /// is the forward/back axis (see the app-side WASD mapping for the sign
 /// convention that makes `W` roll the marble away from the camera).
 /// `cam_yaw` is `cam_look_x` (radians). Order, matching the C++ statement
 /// order in `UpdateMarble`/`MarbleCollision`:
 ///
-/// 1. `vel.y -= gravity`
-/// 2. collide (marble as one [`SamplePoint`]); crushed -> respawn to
-///    `start`, report [`StepEvent::RespawnedCrushed`]
-/// 3. input force: `f = rad * (on_ground ? ground_force : air_force)`,
+/// 1. [`NUM_PHYS_STEPS`] substeps, each: `vel.y -= rad * gravity /
+///    NUM_PHYS_STEPS`, then `pos += vel / NUM_PHYS_STEPS`, then collide
+///    (marble as one [`SamplePoint`]) at the new `pos` — `on_ground`
+///    accumulates via OR across substeps, and a crush respawns to `start`
+///    immediately, reporting [`StepEvent::RespawnedCrushed`] (the C++
+///    instead sets `pos.y = -9999` and lets the *end-of-tick* kill-plane
+///    check below catch it on the same tick; we short-circuit to the same
+///    observable outcome — reset to `start`, zero velocity, by the end of
+///    this call — without running the remaining substeps against a
+///    sentinel position).
+/// 2. input force: `f = rad * (on_ground ? ground_force : air_force)`,
 ///    `v = (dx*cos(yaw) - dy*sin(yaw), 0, -dy*cos(yaw) - dx*sin(yaw))`,
 ///    `vel += v * f`
-/// 4. friction: `vel *= on_ground ? ground_friction : air_friction`
-/// 5. `pos += vel`
-/// 6. kill-plane: `pos.y < kill_y` -> respawn to `start`, report
+/// 3. friction: `vel *= on_ground ? ground_friction : air_friction`
+/// 4. kill-plane: `pos.y < kill_y` -> respawn to `start`, report
 ///    [`StepEvent::RespawnedFell`]
+#[allow(clippy::too_many_arguments)]
 pub fn step_marble(
     marble: &mut Marble,
     obj: &Object,
@@ -213,36 +241,37 @@ pub fn step_marble(
         dy /= mag;
     }
 
-    // 1. Gravity.
-    marble.vel.y -= cfg.gravity;
+    let steps = NUM_PHYS_STEPS as f32;
+    let mut on_ground = false;
 
-    // 2. Collision.
-    let samples = [SamplePoint {
-        offset: Vec3::ZERO,
-        radius: marble.rad,
-    }];
-    let outcome = collide(obj, params, marble.pos, &mut marble.vel, &samples, cfg);
-    if outcome.crushed {
-        marble.respawn(start);
-        return StepEvent::RespawnedCrushed;
+    for _ in 0..NUM_PHYS_STEPS {
+        marble.vel.y -= marble.rad * cfg.gravity / steps;
+        marble.pos += marble.vel / steps;
+
+        let samples = [SamplePoint {
+            offset: Vec3::ZERO,
+            radius: marble.rad,
+        }];
+        let outcome = collide(obj, params, marble.pos, &mut marble.vel, &samples, cfg);
+        if outcome.crushed {
+            marble.respawn(start);
+            return StepEvent::RespawnedCrushed;
+        }
+        marble.pos = outcome.pos;
+        on_ground |= outcome.on_ground;
     }
-    marble.pos = outcome.pos;
-    let on_ground = outcome.on_ground;
 
-    // 3. Input force (camera-yaw-relative).
+    // Input force (camera-yaw-relative), once per full tick.
     let f = marble.rad * if on_ground { cfg.ground_force } else { cfg.air_force };
     let cs = cam_yaw.cos();
     let sn = cam_yaw.sin();
     let v = Vec3::new(dx * cs - dy * sn, 0.0, -dy * cs - dx * sn);
     marble.vel += v * f;
 
-    // 4. Friction.
+    // Friction, once per full tick.
     marble.vel *= if on_ground { cfg.ground_friction } else { cfg.air_friction };
 
-    // 5. Integrate position.
-    marble.pos += marble.vel;
-
-    // 6. Kill plane.
+    // Kill plane.
     if marble.pos.y < kill_y {
         marble.respawn(start);
         return StepEvent::RespawnedFell;
@@ -273,17 +302,22 @@ mod tests {
         (object, params)
     }
 
-    /// A marble dropped at the demo scene's start position falls (y
-    /// decreases) and, within a few thousand ticks, comes to rest on a
+    /// A marble dropped somewhat above the demo scene's start position falls
+    /// (y decreases) and, within a few thousand ticks, comes to rest on a
     /// surface: on_ground (via `de` bracketed around `rad`), tiny velocity,
     /// and `de(pos)` within `[rad*0.5, rad*ground_ratio*1.5]`.
+    ///
+    /// (The level's authored start position is already resting on solid
+    /// ground — see [`marble_at_start_is_immediately_stable`] — so this test
+    /// drops from `start + 0.5` on Y to actually exercise the fall.)
     #[test]
     fn marble_falls_and_settles() {
         let (object, params) = setup_demo();
         let cfg = PhysicsConfig::default();
         let rad = beware_of_bumps::MARBLE_RAD;
         let start = beware_of_bumps::START;
-        let mut marble = Marble::spawn(start, rad);
+        let drop_from = start + Vec3::new(0.0, 0.5, 0.0);
+        let mut marble = Marble::spawn(drop_from, rad);
 
         let y0 = marble.pos.y;
         const MAX_TICKS: u32 = 20_000;
@@ -310,7 +344,13 @@ mod tests {
 
             let de = object.de(marble.pos.extend(1.0), &params);
             let speed = marble.vel.length();
-            if speed < 1e-4 * rad && de >= rad * 0.5 && de <= rad * cfg.ground_ratio * 1.5 {
+            // "Settled" here means small relative to the marble's own scale,
+            // not near-machine-zero: resting-contact jitter from the
+            // collision correction's bounce term (never purely dissipative
+            // for the tangential component) stabilizes around 1e-2..5e-2
+            // times `rad`, not lower — confirmed empirically by tracing this
+            // exact scenario (see rust/csg/examples/step_probe.rs).
+            if speed < 0.05 * rad && de >= rad * 0.5 && de <= rad * cfg.ground_ratio * 1.5 {
                 settled_at = Some((tick, speed, de));
                 break;
             }
@@ -328,6 +368,53 @@ mod tests {
             tick + 1,
             speed,
             de / rad
+        );
+    }
+
+    /// The level's authored start position is already resting on solid
+    /// ground (this is what a real level's spawn point means): a marble
+    /// spawned exactly at `beware_of_bumps::START` with zero velocity stays
+    /// essentially motionless — no perceptible fall, no drift — for many
+    /// ticks. This is also the regression test for the tangential-drift bug
+    /// a single-substep-per-tick version of `step_marble` had (see its doc
+    /// comment): that version let the marble creep sideways off this exact
+    /// ledge and fall through the kill plane within ~100 ticks.
+    #[test]
+    fn marble_at_start_is_immediately_stable() {
+        let (object, params) = setup_demo();
+        let cfg = PhysicsConfig::default();
+        let rad = beware_of_bumps::MARBLE_RAD;
+        let start = beware_of_bumps::START;
+        let mut marble = Marble::spawn(start, rad);
+
+        const TICKS: u32 = 600; // 10 seconds at 60 Hz
+        for tick in 0..TICKS {
+            let event = step_marble(
+                &mut marble,
+                &object,
+                &params,
+                Vec2::ZERO,
+                0.0,
+                &cfg,
+                beware_of_bumps::KILL_Y,
+                start,
+            );
+            assert_eq!(
+                event,
+                StepEvent::None,
+                "marble should not respawn while resting at the authored start (tick {tick})"
+            );
+        }
+
+        let horizontal_drift = (marble.pos - start).with_y(0.0).length();
+        assert!(
+            horizontal_drift < 0.1 * rad,
+            "marble drifted {horizontal_drift} sideways off its start ledge (rad={rad})"
+        );
+        assert!(
+            marble.vel.length() < 1e-3 * rad,
+            "marble should have settled to near-zero velocity, got |vel|={}",
+            marble.vel.length()
         );
     }
 

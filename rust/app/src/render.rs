@@ -29,6 +29,7 @@ use marble_csg::scenes::{beware_of_bumps, demo_scene, set_fractal_params, Classi
 use marble_csg::{Object, Params};
 
 use crate::camera::CameraOrbit;
+use crate::physics_sys::MarbleState;
 
 /// Fixed weak handle for the generated ray-marcher shader. A startup system
 /// inserts the WGSL source into `Assets<Shader>` under this id; regenerating
@@ -105,14 +106,13 @@ impl Material2d for MarcherMaterial {
 }
 
 /// The CSG scene + its live parameter table, kept around so per-frame systems
-/// can animate params (and, from M5 on, run CPU physics queries against
-/// `object`) without rebuilding the tree or regenerating the shader.
+/// can animate params and (M5) run the marble's CPU distance/nearest-point
+/// collision queries against `object` without rebuilding the tree or
+/// regenerating the shader.
 #[derive(Resource)]
 pub struct SceneState {
-    /// The demo scene tree. Not read anywhere yet (CPU distance/nearest-point
-    /// queries land in M5); kept here now so the physics milestone doesn't
-    /// need to replumb scene ownership.
-    #[allow(dead_code)]
+    /// The demo scene tree, queried each physics tick by
+    /// `physics_sys::marble_physics_tick`.
     pub object: Object,
     pub params: Params,
     pub handles: ClassicHandles,
@@ -185,13 +185,15 @@ pub fn sync_quad_scale(
     }
 }
 
-/// Per-frame system: writes the orbit camera basis, timing, and animated
-/// fractal params into the material (DESIGN.md §8). Animating `ang1` here
-/// (rather than at startup only) is the proof that parameter changes are
-/// buffer writes with no shader recompile.
+/// Per-frame system: writes the orbit camera basis (now following the
+/// marble), timing, the marble uniform, and animated fractal params into the
+/// material (DESIGN.md §7/§8). Animating `ang1` here (rather than at startup
+/// only) is the proof that parameter changes are buffer writes with no
+/// shader recompile.
 pub fn update_material(
     time: Res<Time>,
     orbit: Res<CameraOrbit>,
+    marble_state: Res<MarbleState>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut scene_state: ResMut<SceneState>,
     mut materials: ResMut<Assets<MarcherMaterial>>,
@@ -228,7 +230,8 @@ pub fn update_material(
         .map(|w| w.width() / w.height().max(1.0))
         .unwrap_or(1.0);
 
-    let (eye, right, up, forward) = orbit.eye_and_basis();
+    let marble = marble_state.marble;
+    let (eye, right, up, forward) = orbit.eye_and_basis(marble.pos);
 
     if let Some(mat) = materials.get_mut(&*material) {
         mat.scene = SceneUniforms {
@@ -236,7 +239,7 @@ pub fn update_material(
             cam_right: right.extend(0.0),
             cam_up: up.extend(0.0),
             cam_forward: forward.extend(1.5),
-            marble: Vec4::ZERO,
+            marble: marble.pos.extend(marble.rad),
             sun: beware_of_bumps::sun_dir().extend(0.0),
             sun_col: beware_of_bumps::SUN_COL.extend(0.0),
             bg_col: beware_of_bumps::BG.extend(0.0),

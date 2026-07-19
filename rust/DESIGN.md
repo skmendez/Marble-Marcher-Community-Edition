@@ -318,10 +318,32 @@ air_friction=0.995, gravity=0.005, ground_ratio=1.15, marble_bounce=1.2`.
 Run physics in a fixed 60 Hz loop (`Time<Fixed>`), forces scaled by
 `marble_rad` as in C++: `f = marble_rad * (on_ground ? ground_force : air_force)`.
 
-Per tick: `vel.y -= gravity/steps` (C++ uses num_phys_steps sub-steps; use
-steps=1 to start) → collision → input force (camera-yaw-relative:
-`v = (dx·cos−dy·sin, 0, −dy·cos−dx·sin)`) → friction → `pos += vel` →
-kill-plane respawn (`pos.y < kill_y` → reset to start, zero vel).
+Per tick, `NUM_PHYS_STEPS = 6` substeps (C++ `num_phys_steps`, Scene.cpp:30
+— **load-bearing, do not collapse to 1 substep**: a single big
+gravity+integrate+collide step per tick tunnels through thin fractal struts
+and, worse, leaves a resting marble's *tangential* velocity uncorrected for
+a whole tick — friction alone decays it far too slowly, so the marble slides
+off any sloped strut before settling. Substepping resolves collision after
+every small position increment, which is what actually lets the marble
+settle):
+```
+for _ in 0..NUM_PHYS_STEPS {
+    vel.y -= rad * gravity / NUM_PHYS_STEPS
+    pos += vel / NUM_PHYS_STEPS
+    collide(pos) → on_ground |=, crushed → respawn now (see note below)
+}
+input force (camera-yaw-relative, ONCE per tick):
+    v = (dx·cos−dy·sin, 0, −dy·cos−dx·sin); vel += v * f
+friction (ONCE per tick): vel *= on_ground ? ground_friction : air_friction
+kill-plane (ONCE per tick): pos.y < kill_y → reset to start, zero vel
+```
+Note on crush timing: the C++ `MarbleCollision` sets `pos.y = -9999` and
+returns `false`; the *substep loop keeps running* with that sentinel
+position, and the crash is only actually caught by the end-of-tick
+kill-plane check. Our port short-circuits — respawn immediately on
+`crushed` rather than running remaining substeps against a sentinel — which
+preserves the observable outcome (reset to `start`, zero velocity, by the
+end of the tick) more simply.
 
 `MarbleCollision` exact port (Scene.cpp:1075, minus debug prints):
 

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Marble Marcher CSG (Bevy/WebGPU)</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+  </style>
+</head>
+<body>
+  <script type="module">
+    import init from "./marble-marcher.js";
+    init().catch((e) => {
+      document.title = "INIT FAILED";
+      console.error(e);
+    });
+  </script>
+</body>
+</html>

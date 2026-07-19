@@ -1,18 +1,22 @@
-//! Free-orbit camera around the scene origin (DESIGN.md §8). Not the M5 game
-//! camera (which orbits the marble) — this is purely for looking at the demo
-//! scene while there's no marble to follow yet.
+//! Game camera: orbits a target (the marble, once M5 spawns one) via
+//! yaw/pitch/distance (DESIGN.md §7/§8).
 
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::prelude::*;
 
+use marble_csg::scenes::beware_of_bumps;
+
 const PITCH_LIMIT: f32 = 1.5;
-const MIN_DISTANCE: f32 = 0.5;
+const MIN_DISTANCE: f32 = 0.2;
 const MAX_DISTANCE: f32 = 20.0;
 const YAW_SENSITIVITY: f32 = 0.006;
 const PITCH_SENSITIVITY: f32 = 0.006;
 const ZOOM_SENSITIVITY: f32 = 0.5;
 
-/// Yaw/pitch/distance around a fixed target at the scene origin.
+/// Yaw/pitch/distance around an externally supplied target (see
+/// [`CameraOrbit::eye_and_basis`]) — the target itself (the marble's
+/// position) lives in `MarbleState`, not here, so this resource stays pure
+/// input state.
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct CameraOrbit {
     pub yaw: f32,
@@ -25,18 +29,19 @@ impl Default for CameraOrbit {
         Self {
             yaw: 0.8,
             pitch: 0.35,
-            distance: 8.0,
+            // DESIGN.md §7: orbit_dist * marble_rad / 0.035 (Beware Of Bumps'
+            // level values), i.e. the original MMCE camera-distance scaling.
+            distance: beware_of_bumps::ORBIT_DIST * beware_of_bumps::MARBLE_RAD / 0.035,
         }
     }
 }
 
 impl CameraOrbit {
     /// Eye position and right-handed camera basis (right, up, forward)
-    /// looking at the origin (DESIGN.md §8): up = +Y,
+    /// looking at `target` (DESIGN.md §8): up = +Y,
     /// forward = normalize(target - eye), right = normalize(cross(forward, up)),
     /// up' = cross(right, forward).
-    pub fn eye_and_basis(&self) -> (Vec3, Vec3, Vec3, Vec3) {
-        let target = Vec3::ZERO;
+    pub fn eye_and_basis(&self, target: Vec3) -> (Vec3, Vec3, Vec3, Vec3) {
         let offset = self.distance
             * Vec3::new(
                 self.pitch.cos() * self.yaw.sin(),
