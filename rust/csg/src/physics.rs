@@ -87,6 +87,20 @@ impl Default for PhysicsConfig {
 /// direction (see `step_marble`).
 const FOCAL_DIST: f32 = 1.732_050_8;
 
+/// Projects `v` onto the XZ (horizontal) plane and renormalizes, for
+/// [`GravityMode::Rolling`]'s horizontal-only movement (`step_marble`) --
+/// falls back to `default_direction` (always some horizontal unit vector)
+/// in the degenerate case of `v` pointing exactly straight up or down,
+/// where the projection is zero and has no well-defined direction.
+fn horizontal(v: Vec3, default_direction: Vec3) -> Vec3 {
+    let flat = Vec3::new(v.x, 0.0, v.z);
+    if flat.length_squared() > 1e-12 {
+        flat.normalize()
+    } else {
+        default_direction
+    }
+}
+
 /// The C++ `MarbleCollision` hard-codes this threshold (`marble_rad *
 /// 0.001f`) rather than exposing it as a tunable constant; kept as a literal
 /// here too.
@@ -232,11 +246,30 @@ pub enum StepEvent {
 ///
 /// `input` is `(dx, dy)` in C++'s convention: `dx` is the strafe axis, `dy`
 /// is the forward/back axis (see the app-side WASD mapping for the sign
-/// convention). `cam_yaw`/`cam_pitch` are `cam_look_x`/`cam_look_y`
-/// (radians); `cam_pitch` is only used in [`GravityMode::Flying`] (the
-/// original rolling movement is horizontal-only and ignores pitch, matching
-/// the pristine C++). Order, matching the C++ statement order in
-/// `UpdateMarble`/`MarbleCollision`:
+/// convention). `cam_forward`/`cam_right` are the camera's actual current
+/// unit basis vectors (e.g. `CameraOrbit::forward()`/`orientation * Vec3::X`
+/// on the app side) — **not** yaw/pitch angles re-derived via trig, which an
+/// earlier version of this function took instead. That version had a real
+/// bug: its `Flying`-mode formula's vertical component came out with the
+/// opposite sign from `cam_forward`'s actual vertical component (confirmed
+/// by direct derivation, not just suspicion — the horizontal terms matched
+/// `cam_forward` exactly, only the vertical term's sign differed), so
+/// thrust was only ever exactly toward/away from the camera when pitch was
+/// zero, and visibly *not* toward/away from the camera at any other tilt —
+/// reported as "the movement force isn't directly towards or away from the
+/// camera." Taking the real basis vectors directly instead of re-deriving
+/// an approximation of them from angles eliminates that whole class of
+/// bug (there's no second, independently-written trig formula that has to
+/// happen to agree in sign convention with the first).
+///
+/// The full 3D `cam_forward` is conceptually only used in
+/// [`GravityMode::Flying`] (the original rolling movement is horizontal-only
+/// and ignores the camera's vertical tilt, matching the pristine C++) —
+/// `Rolling` derives its horizontal-only direction by projecting
+/// `cam_forward`/`cam_right` onto the XZ plane and renormalizing
+/// (falling back to `Vec3::NEG_Z`/`Vec3::X` in the degenerate case of
+/// looking exactly straight up or down, where that projection is zero).
+/// Order, matching the C++ statement order in `UpdateMarble`/`MarbleCollision`:
 ///
 /// 1. [`NUM_PHYS_STEPS`] substeps, each: gravity (`Rolling`: `vel.y -= rad *
 ///    gravity / NUM_PHYS_STEPS`; `Flying`: none — C++'s `force = 0;`
@@ -253,17 +286,12 @@ pub enum StepEvent {
 ///    gives `Flying` a sane one instead of an unreachable void).
 /// 2. input force, once per full tick: `f = rad * (on_ground ?
 ///    ground_force : air_force)`, then per mode:
-///    - `Rolling`: `v = (dx*cos(yaw) - dy*sin(yaw), 0, -dy*cos(yaw) -
-///      dx*sin(yaw))` (horizontal only).
-///    - `Flying`: full 3D camera-relative thrust, derived from
-///      `Scene::MakeCameraRotation`'s `cam_mat = Ry(yaw) * Rx(pitch)`
-///      (marble_mat = identity for non-planet levels) applied to the C++'s
-///      `ray = cam_mat*(0,0,-FOCAL_DIST,0)` (look direction) and
-///      `ray2 = cam_mat*(dx,0,0,0)` (strafe direction), giving
-///      `v = dy*ray + ray2 = (-dy*F*cos(pitch)*sin(yaw) + dx*cos(yaw),
-///      dy*F*sin(pitch), -dy*F*cos(pitch)*cos(yaw) - dx*sin(yaw))` where
-///      `F = FOCAL_DIST` — i.e. `W`/`S` fly along wherever the camera is
-///      actually pointed (including up/down), `A`/`D` strafe horizontally.
+///    - `Rolling`: `v = dy*horizontal(cam_forward) + dx*horizontal(cam_right)`
+///      (horizontal only, see above).
+///    - `Flying`: full 3D camera-relative thrust: `v = dy*FOCAL_DIST*cam_forward
+///      + dx*cam_right` — i.e. `W`/`S` fly along wherever the camera is
+///      actually pointed (including up/down), `A`/`D` strafe along its
+///        actual current right vector.
 ///
 ///    Either way: `vel += v * f`.
 /// 3. friction, once per full tick: `vel *= on_ground ? ground_friction :
@@ -277,8 +305,8 @@ pub fn step_marble(
     obj: &Object,
     params: &Params,
     input: Vec2,
-    cam_yaw: f32,
-    cam_pitch: f32,
+    cam_forward: Vec3,
+    cam_right: Vec3,
     cfg: &PhysicsConfig,
     kill_y: f32,
     start: Vec3,
@@ -321,19 +349,9 @@ pub fn step_marble(
     let f = marble.rad * if on_ground { cfg.ground_force } else { cfg.air_force };
     let v = match cfg.mode {
         GravityMode::Rolling => {
-            let cs = cam_yaw.cos();
-            let sn = cam_yaw.sin();
-            Vec3::new(dx * cs - dy * sn, 0.0, -dy * cs - dx * sn)
+            dy * horizontal(cam_forward, Vec3::NEG_Z) + dx * horizontal(cam_right, Vec3::X)
         }
-        GravityMode::Flying => {
-            let (sin_y, cos_y) = cam_yaw.sin_cos();
-            let (sin_p, cos_p) = cam_pitch.sin_cos();
-            Vec3::new(
-                -dy * FOCAL_DIST * cos_p * sin_y + dx * cos_y,
-                dy * FOCAL_DIST * sin_p,
-                -dy * FOCAL_DIST * cos_p * cos_y - dx * sin_y,
-            )
-        }
+        GravityMode::Flying => dy * FOCAL_DIST * cam_forward + dx * cam_right,
     };
     marble.vel += v * f;
 
@@ -404,8 +422,8 @@ mod tests {
                 &object,
                 &params,
                 Vec2::ZERO,
-                0.0,
-                0.0,
+                Vec3::NEG_Z,
+                Vec3::X,
                 &cfg,
                 beware_of_bumps::KILL_Y,
                 start,
@@ -474,8 +492,8 @@ mod tests {
                 &object,
                 &params,
                 Vec2::ZERO,
-                0.0,
-                0.0,
+                Vec3::NEG_Z,
+                Vec3::X,
                 &cfg,
                 beware_of_bumps::KILL_Y,
                 start,
@@ -519,8 +537,8 @@ mod tests {
             &object,
             &params,
             Vec2::ZERO,
-            0.0,
-            0.0,
+            Vec3::NEG_Z,
+            Vec3::X,
             &PhysicsConfig::default(),
             -1000.0,
             start,
@@ -561,8 +579,8 @@ mod tests {
                 &object,
                 &params,
                 Vec2::ZERO,
-                0.0,
-                0.0,
+                Vec3::NEG_Z,
+                Vec3::X,
                 &cfg,
                 kill_y,
                 start,
@@ -668,8 +686,8 @@ mod tests {
                 &object,
                 &params,
                 Vec2::ZERO,
-                0.0,
-                0.0,
+                Vec3::NEG_Z,
+                Vec3::X,
                 &cfg,
                 beware_of_bumps::KILL_Y,
                 start,
@@ -697,16 +715,16 @@ mod tests {
         };
         let kill_y = start.y - 1.0; // would trigger almost immediately in Rolling mode
 
-        // dy > 0 with pitch = -PI/2 (looking straight down) flies downward
-        // per step_marble's Flying-mode formula (v.y = dy * FOCAL_DIST * sin(pitch)).
+        // dy > 0 with cam_forward pointing straight down flies downward per
+        // step_marble's Flying-mode formula (v = dy * FOCAL_DIST * cam_forward).
         for _ in 0..600 {
             let event = step_marble(
                 &mut marble,
                 &object,
                 &params,
                 Vec2::new(0.0, 1.0),
-                0.0,
-                -std::f32::consts::FRAC_PI_2,
+                Vec3::NEG_Y, // straight down, regardless of yaw/pitch conventions
+                Vec3::X,
                 &cfg,
                 kill_y,
                 start,

@@ -28,6 +28,14 @@ const ZOOM_SENSITIVITY: f32 = 0.5;
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct CameraOrbit {
     pub orientation: Quat,
+    /// Screen-tilt roll around the current forward axis, applied only as a
+    /// final step in `eye_and_basis` -- kept fully separate from
+    /// `orientation` (which stays pure yaw+pitch) so that accumulated roll
+    /// can never skew the axis `drag`'s pitch rotates around. See `roll`'s
+    /// doc for why this separation matters ("Google Earth sphere": swipe
+    /// always pans, twist always rolls, and neither ever leaks into the
+    /// other).
+    pub roll: f32,
     pub distance: f32,
 }
 
@@ -64,6 +72,7 @@ impl Default for CameraOrbit {
             // camera to the marble's contact normal at spawn/settle time,
             // which isn't implemented yet.
             orientation: Self::orientation_from_yaw_pitch(-1.448, 0.899),
+            roll: 0.0,
             // Much closer than DESIGN.md §7's original
             // `orbit_dist * marble_rad / 0.035` MMCE-scaling formula
             // (~1.77): that reads as "the marble is a barely-visible speck"
@@ -87,18 +96,24 @@ impl Default for CameraOrbit {
 impl CameraOrbit {
     /// Eye position and orthonormal camera basis (right, up, forward)
     /// looking at `target`, `distance` back along `-forward` (DESIGN.md §8).
+    /// `roll` is applied here, as a final rotation of `right`/`up` about
+    /// `forward` -- `orientation` itself stays pure yaw+pitch, so `forward`
+    /// is never affected by roll.
     pub fn eye_and_basis(&self, target: Vec3) -> (Vec3, Vec3, Vec3, Vec3) {
         let forward = self.forward();
-        let right = self.orientation * Vec3::X;
-        let up = self.orientation * Vec3::Y;
+        let right0 = self.orientation * Vec3::X;
+        let up0 = self.orientation * Vec3::Y;
+        let (sin_r, cos_r) = self.roll.sin_cos();
+        let right = right0 * cos_r + up0 * sin_r;
+        let up = up0 * cos_r - right0 * sin_r;
         let eye = target - forward * self.distance;
         (eye, right, up, forward)
     }
 
     /// The direction the camera is currently looking, independent of any
-    /// target (`physics_sys.rs` uses this alone, decomposed back into a
-    /// yaw/pitch pair, to feed `marble_csg::step_marble`'s camera-relative
-    /// thrust — see that call site's doc for why that's safe).
+    /// target (`physics_sys.rs` passes this directly, alongside the
+    /// un-rolled `orientation * Vec3::X` right vector, into
+    /// `marble_csg::step_marble`'s camera-relative thrust).
     pub fn forward(&self) -> Vec3 {
         self.orientation * Vec3::NEG_Z
     }
@@ -127,11 +142,17 @@ impl CameraOrbit {
         self.orientation = (yaw * self.orientation * pitch).normalize();
     }
 
-    /// Applies a two-finger-rotate roll increment around the camera's own
-    /// current forward axis (post-multiply, i.e. in the camera's local
-    /// frame — a pure screen-space roll, `forward` unaffected).
+    /// Applies a two-finger-rotate roll increment. Kept as a wholly
+    /// separate scalar from `orientation` (rather than composed into it via
+    /// `Quat::from_rotation_z` post-multiply, as an earlier version of this
+    /// did) so that accumulated roll can never tilt the axis `drag`'s pitch
+    /// rotates around -- the "Google Earth sphere" model the camera is
+    /// meant to follow: swiping always spins the sphere (pure yaw/pitch
+    /// orbit via `drag`), twisting always rotates the sphere in place
+    /// (pure screen roll, this function), and neither gesture's effect
+    /// leaks into the other no matter how much of either has accumulated.
     pub(crate) fn roll(&mut self, delta_radians: f32) {
-        self.orientation = (self.orientation * Quat::from_rotation_z(delta_radians)).normalize();
+        self.roll += delta_radians;
     }
 }
 
@@ -189,6 +210,7 @@ mod tests {
         for (yaw, pitch) in [(0.0, 0.0), (0.8, 0.35), (-1.448, 0.899)] {
             let orbit = CameraOrbit {
                 orientation: CameraOrbit::orientation_from_yaw_pitch(yaw, pitch),
+                roll: 0.0,
                 distance: 1.0,
             };
             let (_, right, up, forward) = orbit.eye_and_basis(Vec3::ZERO);
@@ -201,7 +223,7 @@ mod tests {
 
     #[test]
     fn eye_is_distance_back_along_forward_from_target() {
-        let orbit = CameraOrbit { orientation: CameraOrbit::orientation_from_yaw_pitch(0.4, 0.2), distance: 3.0 };
+        let orbit = CameraOrbit { orientation: CameraOrbit::orientation_from_yaw_pitch(0.4, 0.2), roll: 0.0, distance: 3.0 };
         let target = Vec3::new(1.0, 2.0, 3.0);
         let (eye, _, _, forward) = orbit.eye_and_basis(target);
         assert!((eye - target).length() - 3.0 < 1e-4);
@@ -220,7 +242,7 @@ mod tests {
         // system was physically incapable of ever reaching this state at
         // all; this one lands exactly where continuous rotation predicts,
         // with a still-orthonormal, non-degenerate basis.
-        let mut orbit = CameraOrbit { orientation: Quat::IDENTITY, distance: 1.0 };
+        let mut orbit = CameraOrbit { orientation: Quat::IDENTITY, roll: 0.0, distance: 1.0 };
         let steps = 100;
         let total_pitch = std::f32::consts::PI;
         let per_step_delta_y = -(total_pitch / PITCH_SENSITIVITY) / steps as f32;
@@ -248,7 +270,7 @@ mod tests {
 
     #[test]
     fn roll_does_not_change_forward() {
-        let mut orbit = CameraOrbit { orientation: CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35), distance: 1.0 };
+        let mut orbit = CameraOrbit { orientation: CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35), roll: 0.0, distance: 1.0 };
         let forward_before = orbit.forward();
         orbit.roll(1.2);
         let forward_after = orbit.forward();
@@ -260,11 +282,41 @@ mod tests {
 
     #[test]
     fn roll_does_change_right_and_up() {
-        let mut orbit = CameraOrbit { orientation: CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35), distance: 1.0 };
+        let mut orbit = CameraOrbit { orientation: CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35), roll: 0.0, distance: 1.0 };
         let (_, right_before, up_before, _) = orbit.eye_and_basis(Vec3::ZERO);
         orbit.roll(1.2);
         let (_, right_after, up_after, _) = orbit.eye_and_basis(Vec3::ZERO);
         assert!(right_before.distance(right_after) > 0.1, "roll should visibly change `right`");
         assert!(up_before.distance(up_after) > 0.1, "roll should visibly change `up`");
+    }
+
+    #[test]
+    fn drag_after_roll_still_orbits_around_world_y_and_level_pitch() {
+        // The actual bug this test guards against: an earlier version
+        // composed `roll` directly into `orientation`, so once any roll had
+        // accumulated, `drag`'s pitch (which rotates around whatever
+        // `orientation`'s local X axis currently is) rotated around a
+        // *tilted* axis instead of a level one -- a horizontal swipe would
+        // visibly behave like a partial twist instead of a clean pan.
+        // Confirm a horizontal-only drag applied after a large roll
+        // produces exactly the same `orientation`/`forward` change as the
+        // same drag applied with no roll at all (roll must never leak into
+        // `drag`'s effect on `orientation`).
+        let base = CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35);
+
+        let mut rolled = CameraOrbit { orientation: base, roll: 0.0, distance: 1.0 };
+        rolled.roll(2.7);
+        rolled.drag(Vec2::new(37.0, 0.0));
+
+        let mut unrolled = CameraOrbit { orientation: base, roll: 0.0, distance: 1.0 };
+        unrolled.drag(Vec2::new(37.0, 0.0));
+
+        assert!(
+            rolled.orientation.angle_between(unrolled.orientation) < 1e-4,
+            "roll leaked into drag's orientation update: {:?} vs {:?}",
+            rolled.orientation,
+            unrolled.orientation
+        );
+        assert!(rolled.forward().distance(unrolled.forward()) < 1e-4);
     }
 }
