@@ -351,7 +351,11 @@ to `SceneUniforms`.
 
 - `MarcherMaterial`: `#[derive(Asset, TypePath, AsBindGroup, Clone)]` with
   `#[uniform(0)] scene: SceneUniforms` (a `ShaderType` struct of 9 Vec4s,
-  §5) and `#[storage(1, read_only)] params: Vec<Vec4>`.
+  §5) and `#[storage(1, read_only)] params: Handle<ShaderStorageBuffer>`.
+  (bevy_render 0.16's AsBindGroup derive has no inline-`Vec<Vec4>` storage
+  path — the storage arm requires a `Handle<ShaderStorageBuffer>` asset; the
+  per-frame system writes `Params::slots()` into that asset via `set_data`,
+  which is still a pure buffer write with no recompile.)
 - `impl Material2d for MarcherMaterial { fn fragment_shader() -> ShaderRef
   { MARCHER_SHADER_HANDLE.into() } }` where
   `const MARCHER_SHADER_HANDLE: Handle<Shader> = weak_handle!("<uuid4>");`
