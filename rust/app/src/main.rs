@@ -6,10 +6,12 @@
 //! same `Object`/`Params` the shader renders, driven by WASD (camera-yaw
 //! relative) with `R` to force a respawn; the orbit camera follows it.
 
+mod adaptive_res;
 mod camera;
 mod debug_screenshot;
 mod fps_overlay;
 mod physics_sys;
+mod present;
 mod render;
 mod touch;
 
@@ -17,10 +19,14 @@ use bevy::prelude::*;
 use bevy::sprite::Material2dPlugin;
 use bevy::window::WindowResolution;
 
+use adaptive_res::{adjust_resolution_scale, AdaptiveResolution};
 use camera::{orbit_camera_input, CameraOrbit};
 use debug_screenshot::DebugScreenshotPlugin;
 use fps_overlay::FpsOverlayPlugin;
 use physics_sys::marble_physics_tick;
+use present::{
+    resize_marcher_render_target, setup_present_pipeline, sync_present_quad_scale, PresentMaterial,
+};
 use render::{setup, sync_quad_scale, update_material, MarcherMaterial};
 use touch::touch_camera_input;
 
@@ -69,16 +75,30 @@ fn main() {
             ..default()
         }))
         .add_plugins(Material2dPlugin::<MarcherMaterial>::default())
+        .add_plugins(Material2dPlugin::<PresentMaterial>::default())
         .add_plugins(FpsOverlayPlugin)
         .add_plugins(DebugScreenshotPlugin)
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<CameraOrbit>()
-        .add_systems(Startup, setup)
+        .init_resource::<AdaptiveResolution>()
+        // `setup_present_pipeline` looks up the `MarcherCamera` entity
+        // `setup` spawns (to redirect its render target to the offscreen
+        // image), so it must run strictly after it -- see present.rs.
+        .add_systems(Startup, (setup, setup_present_pipeline).chain())
         .add_systems(FixedUpdate, marble_physics_tick)
         .add_systems(
             Update,
             (
+                // Adaptive-resolution controller (adaptive_res.rs) first
+                // decides the scale, then the render target is actually
+                // resized to match (present.rs) -- both throttled
+                // internally, so this runs every frame cheaply -- and only
+                // then do the quad-scale-sync/uniform-writing systems run,
+                // so they always see this frame's final render-target size.
+                adjust_resolution_scale,
+                resize_marcher_render_target,
                 sync_quad_scale,
+                sync_present_quad_scale,
                 orbit_camera_input,
                 touch_camera_input,
                 update_material,

@@ -33,6 +33,16 @@ bevy = { version = "0.16", default-features = false, features = [
     "bevy_ui",
     "bevy_text",
     "default_font",
+    # Adaptive internal render resolution (render.rs/present.rs/adaptive_res.rs)
+    # renders the marcher into an offscreen `Image` render target it creates
+    # itself at runtime, which needs `bevy::image::{Image, ImageSampler, ...}`
+    # to be reachable as a direct path from this crate -- `bevy_render`
+    # depends on the `bevy_image` crate unconditionally already (Image is
+    # fundamental to rendering), but this crate can't `use` a transitive
+    # dependency's types by name without also depending on it directly,
+    # which is what this feature (`bevy_internal/bevy_image` -> `pub use
+    # bevy_image as image`) actually provides.
+    "bevy_image",
 ] }
 
 [features]

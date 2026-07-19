@@ -84,8 +84,12 @@ impl Plugin for FpsOverlayPlugin {
 /// Rolling window of recent per-frame wall-clock times (seconds), used to
 /// compute a windowed-average fps/frame-time pair -- see the module doc for
 /// why this is more stable than Bevy's default EMA-of-instantaneous-fps.
+///
+/// `pub(crate)` (not private): `adaptive_res::adjust_resolution_scale` reads
+/// `averaged()` directly so the adaptive-resolution controller uses this
+/// exact same already-debugged frame-time signal instead of duplicating it.
 #[derive(Resource, Default)]
-struct FrameTimeWindow {
+pub(crate) struct FrameTimeWindow {
     samples: VecDeque<f64>,
     window_sum: f64,
 }
@@ -103,7 +107,7 @@ impl FrameTimeWindow {
 
     /// `(fps, frame_time_ms)` averaged over the current window, or `None`
     /// if no non-zero-duration samples have been recorded yet.
-    fn averaged(&self) -> Option<(f64, f64)> {
+    pub(crate) fn averaged(&self) -> Option<(f64, f64)> {
         if self.samples.is_empty() || self.window_sum <= 0.0 {
             return None;
         }
