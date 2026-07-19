@@ -13,3 +13,18 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# Deploy target is a browser download-and-locally-JIT-compile of a wasm32
+# binary (GitHub Pages, mobile Safari/Chrome included) — binary size and
+# load time matter far more here than raw execution speed: the actual
+# per-frame ray marching runs in the WGSL fragment shader on the GPU, not
+# in this Rust/wasm code, so wasm execution speed is a minor factor.
+# This profile also applies to the native desktop build (same workspace
+# profile) and hasn't shown any behavioral regressions there.
+[profile.release]
+opt-level = "z"    # optimize for size over speed; app is GPU/shader-bound
+lto = true         # fat LTO: better size (and speed) than thin, slower CI build
+codegen-units = 1  # required for LTO to fully inline/dedupe across crates
+panic = "abort"    # drop unwinding tables; nothing in this codebase catches
+                   # panics (no catch_unwind/std::panic use anywhere in rust/)
+strip = true       # drop symbols/debuginfo; not needed for a shipped build

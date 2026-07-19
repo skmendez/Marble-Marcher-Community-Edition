@@ -68,6 +68,41 @@ jobs:
             --out-dir dist --out-name marble-marcher \
             rust/target/wasm32-unknown-unknown/release/marble-marcher-bevy.wasm
 
+      # Pin an exact binaryen release rather than `apt-get install binaryen`:
+      # Ubuntu noble's apt candidate (108-1 as of this writing) would likely
+      # work too, but pinning the same build we validated locally (size
+      # numbers + an actual in-browser CDP screenshot check) avoids silent
+      # drift if a future apt upgrade changes wasm-opt's output.
+      - name: Install wasm-opt (binaryen, pinned release)
+        run: |
+          curl -sL -o /tmp/binaryen.tar.gz \
+            https://github.com/WebAssembly/binaryen/releases/download/version_120/binaryen-version_120-x86_64-linux.tar.gz
+          tar -xzf /tmp/binaryen.tar.gz -C /tmp
+          echo "/tmp/binaryen-version_120/bin" >> "$GITHUB_PATH"
+
+      - name: Verify wasm-opt is installed
+        run: wasm-opt --version
+
+      # -Oz over -O3: this app is GPU/shader-bound (ray marching runs in the
+      # WGSL fragment shader, not in wasm), so binary size/load time matter
+      # far more than wasm execution speed. Measured locally: -Oz produced
+      # an 8% smaller module than -O3 while running an order of magnitude
+      # faster. The --enable-* flags mirror the wasm32-unknown-unknown
+      # target's default feature set (confirmed by bisecting wasm-opt's
+      # validator errors against the wasm-bindgen output) — rustc no longer
+      # embeds a target-features custom section wasm-opt could otherwise
+      # autodetect from, so they must be passed explicitly.
+      - name: Optimize wasm with wasm-opt (-Oz, size-focused)
+        run: |
+          wasm-opt -Oz \
+            --enable-bulk-memory \
+            --enable-nontrapping-float-to-int \
+            --enable-sign-ext \
+            --enable-mutable-globals \
+            dist/marble-marcher_bg.wasm -o dist/marble-marcher_bg.wasm.opt
+          mv dist/marble-marcher_bg.wasm.opt dist/marble-marcher_bg.wasm
+          ls -la dist/marble-marcher_bg.wasm
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
