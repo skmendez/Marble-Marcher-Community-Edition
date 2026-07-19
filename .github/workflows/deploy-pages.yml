@@ -1,0 +1,85 @@
+name: Deploy Pages
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "rust/**"
+      - ".github/workflows/deploy-pages.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deployment at a time; a newer push supersedes an in-flight one.
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (+ wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build (wasm32, WebGPU, release)
+        working-directory: rust
+        run: cargo build -p marble-marcher-bevy --target wasm32-unknown-unknown --features web --release
+
+      # wasm-bindgen-cli's version must match the `wasm-bindgen` crate version
+      # locked in Cargo.lock (mismatches fail at bindgen time), so read it
+      # from the lockfile instead of hardcoding a version here.
+      - name: Determine required wasm-bindgen-cli version
+        id: wbg
+        working-directory: rust
+        run: |
+          version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | grep '^version' | head -1 | sed -E 's/.*"(.*)".*/\1/')
+          echo "Locked wasm-bindgen version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache wasm-bindgen-cli
+        id: cache-wbg-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-cli-${{ steps.wbg.outputs.version }}-${{ runner.os }}
+
+      - name: Install wasm-bindgen-cli
+        if: steps.cache-wbg-cli.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version ${{ steps.wbg.outputs.version }}
+
+      - name: Generate JS bindings and assemble site
+        run: |
+          mkdir -p dist
+          cp rust/web/index.html dist/
+          wasm-bindgen --no-typescript --target web \
+            --out-dir dist --out-name marble-marcher \
+            rust/target/wasm32-unknown-unknown/release/marble-marcher-bevy.wasm
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
