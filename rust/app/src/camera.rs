@@ -164,7 +164,37 @@ impl CameraOrbit {
     /// (`cos(0)=1, sin(0)=0`), so unrolled behavior is unchanged.
     pub(crate) fn drag(&mut self, delta: Vec2) {
         let unrolled = self.unrolled_delta(delta);
-        let yaw = Quat::from_rotation_y(-unrolled.x * YAW_SENSITIVITY);
+        let forward = self.forward();
+        // Yaw (about world Y) moves `forward` at a rate scaled by
+        // `sqrt(forward.x^2 + forward.z^2)` -- the length of `forward`'s
+        // horizontal projection, equivalently sin(angle between `forward`
+        // and world Y) -- exactly 1 at level pitch, shrinking toward 0 near
+        // the poles (an unavoidable geometric fact: yaw about world Y does
+        // literally nothing to `forward` when `forward` is itself parallel
+        // to that axis, i.e. looking straight up/down). Pitch has no such
+        // scaling: `right0` (`orientation * Vec3::X`) is always exactly
+        // perpendicular to `forward`, a structural property of this
+        // camera's `Ry(yaw)*Rx(pitch)`-decomposable orientation (any
+        // sequence of `drag` calls collapses to that form, since same-axis
+        // quaternion rotations compose additively regardless of
+        // interleaving), so pitch's effect on `forward` never attenuates.
+        // `unrolled_delta`'s roll compensation implicitly assumes yaw and
+        // pitch have *equal* gain on `forward` -- true only exactly at
+        // pitch=0 -- so at any other pitch, a roll-mixed swipe (any roll
+        // that isn't a multiple of 90 degrees, where `unrolled` reduces to
+        // a pure single-axis input either way) under-drives yaw relative
+        // to pitch, and the resulting pan direction leaks off-axis. Worse
+        // the steeper the pitch. Dividing yaw's input by this gain restores
+        // the correct proportion -- confirmed against a live device
+        // repro (see `drag_matches_real_device_repro_at_45_degree_roll`).
+        // Floored well above zero: exactly at the pole this ratio is
+        // genuinely undefined (yaw has no well-defined effect to restore
+        // proportion *to*), so the floor trades "yaw briefly gets coarse
+        // right at the pole" for "no NaN/inf poisoning `orientation`".
+        let yaw_gain = (forward.x * forward.x + forward.z * forward.z)
+            .sqrt()
+            .max(1e-3);
+        let yaw = Quat::from_rotation_y(-unrolled.x * YAW_SENSITIVITY / yaw_gain);
         let pitch = Quat::from_rotation_x(unrolled.y * PITCH_SENSITIVITY);
         // Renormalize every step: repeated quaternion multiplication can
         // accumulate tiny floating-point drift away from unit length over
@@ -438,6 +468,50 @@ mod tests {
             moved.distance(up) < 1e-2 || moved.distance(-up) < 1e-2,
             "vertical drag at roll={roll} should move forward along the current `up` \
              ({up:?}) (either sign), got direction {moved:?}"
+        );
+    }
+
+    #[test]
+    fn drag_matches_real_device_repro_at_45_degree_roll() {
+        // Regression test grounded in an actual live repro, not a synthetic
+        // case: the previous round's roll-compensation fix
+        // (`unrolled_delta`) was verified only at `pitch = 0`, where yaw
+        // and pitch happen to have equal effect on `forward` -- but a real
+        // on-device screenshot (`roll: 46.2deg`, `forward: (-0.290, -0.800,
+        // -0.526)`, swiping bottom-to-top gave `delta: (-0.1, -1.6)`) showed
+        // that a nearly-pure-vertical swipe at that roll/pitch combination
+        // produced a `forward`-motion direction with a real ~30% leak onto
+        // the `right`/`left` axis (dot product ~-0.30) -- exactly the
+        // "swipe up tilts left" symptom reported. This test reconstructs
+        // that state (yaw/pitch solved from the reported `forward` via the
+        // same closed-form `old_forward` inverts) and asserts the
+        // now-gain-corrected `drag` keeps the cross-axis leak small.
+        let pitch = 0.8_f32.asin(); // sin(pitch) = -forward.y = 0.800
+        let yaw = (0.290_f32 / pitch.cos()).asin(); // cos(pitch)*sin(yaw) = -forward.x = 0.290
+        let roll = 46.2_f32.to_radians();
+        let mut orbit = CameraOrbit { orientation: CameraOrbit::orientation_from_yaw_pitch(yaw, pitch), roll, distance: 1.0 };
+        let forward_before = orbit.forward();
+        assert!(
+            forward_before.distance(Vec3::new(-0.290, -0.800, -0.526)) < 0.02,
+            "reconstructed state should reproduce the screenshot's forward, got {forward_before:?}"
+        );
+
+        let (_, right, up, _) = orbit.eye_and_basis(Vec3::ZERO);
+        orbit.drag(Vec2::new(-0.1, -1.6));
+        let moved = (orbit.forward() - forward_before).normalize();
+
+        let cross_axis_leak = moved.dot(right.normalize()).abs();
+        assert!(
+            cross_axis_leak < 0.1,
+            "a near-pure-vertical swipe at roll=46.2deg leaked {cross_axis_leak:.3} onto \
+             `right` (pre-fix this was ~0.30, matching the reported 'swipe up tilts left' bug) \
+             -- moved={moved:?} right={right:?}"
+        );
+        let up_alignment = moved.dot(up.normalize()).abs();
+        assert!(
+            up_alignment > 0.95,
+            "expected the swipe to be predominantly aligned with `up`/`-up`, got \
+             dot={up_alignment:.3} moved={moved:?} up={up:?}"
         );
     }
 }
