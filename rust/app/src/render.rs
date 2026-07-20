@@ -45,11 +45,13 @@ use crate::camera::CameraOrbit;
 use crate::physics_sys::MarbleState;
 
 /// Which scene to build, selected via
-/// `MM_SCENE=demo|classic_only|menger_sponge|menger_sphere|menger_oscillating_sphere`.
-/// Defaults to `MengerSponge` — this is what actually determines the
-/// deployed web build's default scene, since `std::env::var` always returns
-/// `Err` on wasm32-unknown-unknown (no OS environment in a browser), so
-/// `MM_SCENE` only has any effect for local/native testing.
+/// `MM_SCENE=demo|classic_only|menger_sponge|menger_sphere|menger_oscillating_sphere`
+/// on native, or `?scene=<same value>` in the URL on the deployed web build
+/// (`std::env::var` always returns `Err` on wasm32-unknown-unknown -- there's
+/// no OS environment in a browser -- so `MM_SCENE` alone only ever had any
+/// effect for local/native testing; `web_config::query_param` is the
+/// browser-reachable equivalent, same value vocabulary, so the two can't
+/// drift apart). Defaults to `MengerSponge` either way if unset/unrecognized.
 ///
 /// `Demo`/`ClassicOnly` have authored level data (`beware_of_bumps`: a
 /// start position tuned to rest on a surface, a kill plane, `ang1`
@@ -88,12 +90,19 @@ pub struct MarbleSpawn {
 }
 
 impl SceneKind {
-    pub fn from_env() -> Self {
-        match std::env::var("MM_SCENE").as_deref() {
-            Ok("demo") => Self::Demo,
-            Ok("classic_only") => Self::ClassicOnly,
-            Ok("menger_sphere") => Self::MengerSphere,
-            Ok("menger_oscillating_sphere") => Self::MengerOscillatingSphere,
+    /// Reads `MM_SCENE` (native) or `?scene=` (web) -- see this type's doc.
+    /// `query_param` is always `None` on native (`web_config`'s doc), so the
+    /// `.or_else` falls straight through to `std::env::var` there exactly as
+    /// before; on wasm `std::env::var` is always `Err`, so the query param is
+    /// the only branch that can ever match.
+    pub fn from_config() -> Self {
+        let value = crate::web_config::query_param("scene")
+            .or_else(|| std::env::var("MM_SCENE").ok());
+        match value.as_deref() {
+            Some("demo") => Self::Demo,
+            Some("classic_only") => Self::ClassicOnly,
+            Some("menger_sphere") => Self::MengerSphere,
+            Some("menger_oscillating_sphere") => Self::MengerOscillatingSphere,
             _ => Self::MengerSponge,
         }
     }
@@ -377,7 +386,7 @@ fn pack_bounding_sphere(object: &Object, params: &Params) -> Vec4 {
     }
 }
 
-/// Startup system: builds the selected scene (`MM_SCENE`, [`SceneKind::from_env`]),
+/// Startup system: builds the selected scene ([`SceneKind::from_config`]),
 /// generates its WGSL, and spawns the fullscreen quad that renders it
 /// (DESIGN.md §8).
 pub fn setup(
@@ -388,7 +397,7 @@ pub fn setup(
     mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
     mut camera_orbit: ResMut<CameraOrbit>,
 ) {
-    let kind = SceneKind::from_env();
+    let kind = SceneKind::from_config();
     let mut params = Params::new();
 
     // CameraOrbit::default() is tuned for the Demo scene specifically (aimed

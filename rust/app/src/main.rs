@@ -15,6 +15,7 @@ mod physics_sys;
 mod render;
 mod shadow_pass;
 mod touch;
+mod web_config;
 
 use bevy::prelude::*;
 use bevy::sprite::Material2dPlugin;

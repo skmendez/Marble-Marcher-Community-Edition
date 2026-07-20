@@ -56,3 +56,13 @@ default = []
 # Build for the browser with the WebGPU backend:
 #   cargo build --target wasm32-unknown-unknown --features web
 web = ["bevy/webgpu"]
+
+# Query-string config reads (`web_config.rs`): `std::env::var` always returns
+# `Err` on wasm32-unknown-unknown (no OS environment in a browser), so
+# `?key=value` in the page URL is this build's only equivalent of a native
+# `MM_*` env var. `web-sys` is already resolved transitively via
+# `bevy_winit`'s own wasm target deps (`winit` itself uses it) -- pinning the
+# same major/minor here (0.3) lets Cargo unify onto the already-locked
+# version instead of resolving a second, incompatible copy.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Window", "Location", "UrlSearchParams"] }
