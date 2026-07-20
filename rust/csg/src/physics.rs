@@ -119,6 +119,15 @@ pub struct Marble {
     pub pos: Vec3,
     pub vel: Vec3,
     pub rad: f32,
+    /// The raw camera-relative thrust vector `step_marble` computed on its
+    /// most recent call (`v` in that function's doc — before the per-tick
+    /// force-scale `f` multiply), or `Vec3::ZERO` if that tick's input was
+    /// `Vec2::ZERO`. Exposed purely for visualization (`debug_gizmos.rs`):
+    /// callers that want to verify thrust direction can read this directly
+    /// instead of re-deriving an approximation of it from yaw/pitch, which
+    /// is exactly the class of bug (`step_marble`'s doc) this field exists
+    /// to let a caller check against *without* repeating.
+    pub last_thrust: Vec3,
 }
 
 impl Marble {
@@ -129,6 +138,7 @@ impl Marble {
             pos: start,
             vel: Vec3::ZERO,
             rad,
+            last_thrust: Vec3::ZERO,
         }
     }
 
@@ -137,6 +147,7 @@ impl Marble {
     pub fn respawn(&mut self, start: Vec3) {
         self.pos = start;
         self.vel = Vec3::ZERO;
+        self.last_thrust = Vec3::ZERO;
     }
 }
 
@@ -353,6 +364,7 @@ pub fn step_marble(
         }
         GravityMode::Flying => dy * FOCAL_DIST * cam_forward + dx * cam_right,
     };
+    marble.last_thrust = v;
     marble.vel += v * f;
 
     // Friction, once per full tick.

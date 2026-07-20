@@ -7,6 +7,7 @@
 //! relative) with `R` to force a respawn; the orbit camera follows it.
 
 mod camera;
+mod debug_gizmos;
 mod debug_screenshot;
 mod fps_overlay;
 mod mrrm;
@@ -20,6 +21,7 @@ use bevy::sprite::Material2dPlugin;
 use bevy::window::WindowResolution;
 
 use camera::{orbit_camera_input, CameraOrbit};
+use debug_gizmos::draw_thrust_debug;
 use debug_screenshot::DebugScreenshotPlugin;
 use fps_overlay::FpsOverlayPlugin;
 use mrrm::{
@@ -111,6 +113,7 @@ fn main() {
                 update_material,
                 update_coarse_material,
                 update_shadow_material,
+                draw_thrust_debug,
             )
                 .chain(),
         )

@@ -43,6 +43,12 @@ bevy = { version = "0.16", default-features = false, features = [
     # (`bevy_internal/bevy_image` -> `pub use bevy_image as image`)
     # actually provides.
     "bevy_image",
+    # Live thrust-direction debug overlay (debug_gizmos.rs) -- draws 2D
+    # screen-space arrows via `Gizmos::arrow_2d`. `DefaultPlugins` registers
+    # `bevy_gizmos::GizmoPlugin` automatically once this feature is on (see
+    # `bevy_internal`'s `default_plugins.rs`), so no separate plugin
+    # registration is needed in `main.rs` beyond enabling the feature here.
+    "bevy_gizmos",
 ] }
 
 [features]

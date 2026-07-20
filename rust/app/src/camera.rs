@@ -6,6 +6,13 @@ use bevy::prelude::*;
 
 pub(crate) const YAW_SENSITIVITY: f32 = 0.006;
 pub(crate) const PITCH_SENSITIVITY: f32 = 0.006;
+/// Focal length (`1/tan(halfFOV)`) baked into `cam_forward.w` everywhere a
+/// `SceneUniforms` is written (`render.rs`/`mrrm.rs`/`shadow_pass.rs`, each
+/// currently as their own `forward.extend(1.5)` literal, pre-existing
+/// duplication not touched here) — exposed here too so `debug_gizmos.rs`'s
+/// screen-space projection uses the exact same value rather than a fifth,
+/// independently-chosen copy.
+pub(crate) const FOCAL_LENGTH: f32 = 1.5;
 const MIN_DISTANCE: f32 = 0.12;
 const MAX_DISTANCE: f32 = 20.0;
 const ZOOM_SENSITIVITY: f32 = 0.5;
