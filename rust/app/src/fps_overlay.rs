@@ -172,14 +172,28 @@ fn spawn_fps_overlay(mut commands: Commands) {
 
 fn update_orbit_debug_text(
     orbit: Res<crate::camera::CameraOrbit>,
+    touch_debug: Res<crate::touch::TouchDebugInfo>,
     mut text: Query<&mut Text, With<OrbitDebugText>>,
 ) {
     let Ok(mut text) = text.single_mut() else {
         return;
     };
     let f = orbit.forward();
+    // `touches` line always shows the live count (0/1/2+), and the raw
+    // swipe delta + its roll-compensated `unrolled` counterpart whenever a
+    // single-finger swipe actually happened this frame -- lets a real
+    // on-device repro (twist to some roll, then swipe) be diagnosed from a
+    // screenshot of exactly what raw input `drag` received, rather than a
+    // description of it. See `touch::TouchDebugInfo`'s doc.
+    let touch_line = match (touch_debug.swipe_delta, touch_debug.unrolled) {
+        (Some(d), Some(u)) => format!(
+            "touches: {} delta: ({:.1}, {:.1}) unrolled: ({:.1}, {:.1})",
+            touch_debug.active_count, d.x, d.y, u.x, u.y
+        ),
+        _ => format!("touches: {}", touch_debug.active_count),
+    };
     text.0 = format!(
-        "roll: {:.1}deg forward: ({:.3}, {:.3}, {:.3})",
+        "roll: {:.1}deg forward: ({:.3}, {:.3}, {:.3})\n{touch_line}",
         orbit.roll.to_degrees(),
         f.x,
         f.y,

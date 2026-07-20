@@ -34,7 +34,7 @@ use shadow_pass::{
     resize_shadow_render_target, setup_shadow_pipeline, sync_shadow_quad_scale,
     update_shadow_material, ShadowMarcherMaterial,
 };
-use touch::touch_camera_input;
+use touch::{touch_camera_input, TouchDebugInfo};
 
 /// `MM_WINDOW_SIZE=WxH` overrides the window's starting resolution — mainly
 /// useful for testing on a software (CPU) Vulkan/GL fallback, where this
@@ -87,6 +87,7 @@ fn main() {
         .add_plugins(DebugScreenshotPlugin)
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<CameraOrbit>()
+        .init_resource::<TouchDebugInfo>()
         // `setup_mrrm_pipeline` (mrrm.rs) needs `setup`'s `SceneState` (the
         // scene tree + params buffer, to build the coarse shader/material)
         // and corrects `setup`'s placeholder `FineMarcherMaterial::coarse`

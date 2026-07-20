@@ -163,11 +163,7 @@ impl CameraOrbit {
     /// At `roll == 0` this reduces to the original `delta` exactly
     /// (`cos(0)=1, sin(0)=0`), so unrolled behavior is unchanged.
     pub(crate) fn drag(&mut self, delta: Vec2) {
-        let (sin_r, cos_r) = self.roll.sin_cos();
-        let unrolled = Vec2::new(
-            delta.x * cos_r - delta.y * sin_r,
-            delta.x * sin_r + delta.y * cos_r,
-        );
+        let unrolled = self.unrolled_delta(delta);
         let yaw = Quat::from_rotation_y(-unrolled.x * YAW_SENSITIVITY);
         let pitch = Quat::from_rotation_x(unrolled.y * PITCH_SENSITIVITY);
         // Renormalize every step: repeated quaternion multiplication can
@@ -175,6 +171,20 @@ impl CameraOrbit {
         // a long play session, which would otherwise slowly skew
         // `eye_and_basis`'s basis vectors away from orthonormal.
         self.orientation = (yaw * self.orientation * pitch).normalize();
+    }
+
+    /// The roll-compensation step `drag` applies to a raw physical-screen
+    /// delta before splitting it into yaw/pitch (see `drag`'s doc) --
+    /// pulled out on its own so `touch.rs`'s live debug readout can display
+    /// the exact intermediate value `drag` actually uses, without
+    /// reimplementing the formula a second time (which could silently
+    /// drift out of sync with the real one).
+    pub(crate) fn unrolled_delta(&self, delta: Vec2) -> Vec2 {
+        let (sin_r, cos_r) = self.roll.sin_cos();
+        Vec2::new(
+            delta.x * cos_r - delta.y * sin_r,
+            delta.x * sin_r + delta.y * cos_r,
+        )
     }
 
     /// Applies a two-finger-rotate roll increment. Kept as a wholly

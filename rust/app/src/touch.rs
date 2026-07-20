@@ -167,17 +167,48 @@ pub fn read_two_finger_gesture(touches: &Touches) -> Option<TwoFingerGesture> {
     })
 }
 
+/// Live snapshot of the most recent frame's touch-driven camera input --
+/// read by `fps_overlay.rs`'s debug readout so a real on-device repro (a
+/// two-finger twist to some roll, then a single-finger swipe that behaves
+/// unexpectedly) can be diagnosed from a screenshot of the *actual* raw
+/// input this system received, instead of guessing at it from a
+/// description. Updated every frame `touch_camera_input` runs, regardless
+/// of touch count, so "no touch" / "mid-gesture" states are visible too,
+/// not just swipes.
+#[derive(Resource, Clone, Copy, Debug, Default)]
+pub struct TouchDebugInfo {
+    pub active_count: usize,
+    /// The raw `delta` fed to `CameraOrbit::drag` this frame, if a
+    /// single-finger swipe happened -- `None` otherwise (0 or 2+ touches).
+    pub swipe_delta: Option<Vec2>,
+    /// `CameraOrbit::unrolled_delta(swipe_delta)` -- the exact intermediate
+    /// value `drag` splits into yaw/pitch, shown alongside the raw delta so
+    /// a mismatch between "what the finger did" and "what the roll
+    /// compensation turned it into" is visible directly, not just inferred.
+    pub unrolled: Option<Vec2>,
+}
+
 /// Touch-driven camera control (`Update` schedule, alongside
 /// `orbit_camera_input`): exactly 1 active touch swipes (`CameraOrbit::drag`,
 /// identical feel to mouse-drag — same sensitivity constants, applied via
 /// the same method); 2+ applies this frame's rotate delta to `roll` (the
 /// pinch half of a 2-touch gesture is read separately, directly inside the
 /// physics tick — see `physics_sys.rs`).
-pub fn touch_camera_input(touches: Res<Touches>, mut orbit: ResMut<CameraOrbit>) {
+pub fn touch_camera_input(
+    touches: Res<Touches>,
+    mut orbit: ResMut<CameraOrbit>,
+    mut debug: ResMut<TouchDebugInfo>,
+) {
     let active_count = touches.iter().count();
+    debug.active_count = active_count;
+    debug.swipe_delta = None;
+    debug.unrolled = None;
     if active_count == 1 {
         if let Some(touch) = touches.iter().next() {
-            orbit.drag(touch.delta());
+            let delta = touch.delta();
+            debug.swipe_delta = Some(delta);
+            debug.unrolled = Some(orbit.unrolled_delta(delta));
+            orbit.drag(delta);
         }
     } else if active_count >= 2 {
         if let Some(gesture) = read_two_finger_gesture(&touches) {
