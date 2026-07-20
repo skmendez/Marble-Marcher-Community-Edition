@@ -181,11 +181,15 @@ pub struct TouchDebugInfo {
     /// The raw `delta` fed to `CameraOrbit::drag` this frame, if a
     /// single-finger swipe happened -- `None` otherwise (0 or 2+ touches).
     pub swipe_delta: Option<Vec2>,
-    /// `CameraOrbit::unrolled_delta(swipe_delta)` -- the exact intermediate
-    /// value `drag` splits into yaw/pitch, shown alongside the raw delta so
-    /// a mismatch between "what the finger did" and "what the roll
-    /// compensation turned it into" is visible directly, not just inferred.
-    pub unrolled: Option<Vec2>,
+    /// The arcball formula's real intermediates for this frame's swipe --
+    /// `screen_dir` (world-space swipe direction) and `angle_deg` (rotation
+    /// magnitude) -- shown alongside the raw delta so a mismatch between
+    /// "what the finger did" and "what `drag` computed from it" is visible
+    /// directly, not just inferred. Recomputed here from the same public
+    /// fields `drag` itself reads (`orientation`), not a reimplementation
+    /// of `drag`'s formula that could drift out of sync with the real one.
+    pub screen_dir: Option<Vec3>,
+    pub angle_deg: Option<f32>,
 }
 
 /// Touch-driven camera control (`Update` schedule, alongside
@@ -198,21 +202,27 @@ pub fn touch_camera_input(
     touches: Res<Touches>,
     mut orbit: ResMut<CameraOrbit>,
     mut debug: ResMut<TouchDebugInfo>,
+    mut twist_debug: ResMut<crate::fps_overlay::DebugTwistAccum>,
 ) {
     let active_count = touches.iter().count();
     debug.active_count = active_count;
     debug.swipe_delta = None;
-    debug.unrolled = None;
+    debug.screen_dir = None;
+    debug.angle_deg = None;
     if active_count == 1 {
         if let Some(touch) = touches.iter().next() {
             let delta = touch.delta();
             debug.swipe_delta = Some(delta);
-            debug.unrolled = Some(orbit.unrolled_delta(delta));
+            if let Some((screen_dir, angle)) = orbit.drag_intermediates(delta) {
+                debug.screen_dir = Some(screen_dir);
+                debug.angle_deg = Some(angle.to_degrees());
+            }
             orbit.drag(delta);
         }
     } else if active_count >= 2 {
         if let Some(gesture) = read_two_finger_gesture(&touches) {
             orbit.roll(gesture.rotate_delta);
+            twist_debug.0 += gesture.rotate_delta;
         }
     }
 }

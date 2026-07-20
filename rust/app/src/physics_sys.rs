@@ -114,12 +114,13 @@ pub fn marble_physics_tick(
     // independently-written yaw/pitch trig formula that would have to
     // happen to agree in sign convention with `CameraOrbit`'s own — an
     // earlier version did exactly that and got the sign wrong (see
-    // `step_marble`'s doc). `cam_right` intentionally uses
-    // `orbit.orientation` (pure yaw+pitch), not `eye_and_basis`'s rolled
-    // right vector — thrust direction must track where the camera is
-    // *looking*, not how far the player has twisted the screen.
-    let cam_forward = orbit.forward();
-    let cam_right = orbit.orientation * Vec3::X;
+    // `step_marble`'s doc). Both come straight from `eye_and_basis`: the
+    // arcball camera (`camera.rs`) folds twist directly into `orientation`
+    // now, so there's no separate "roll-free" right vector to carve out
+    // any more — A/D strafe tracks the same current screen-right that's
+    // actually rendered, same as W/S already tracked `forward` (never
+    // twist-dependent in any version of this camera).
+    let (_, cam_right, _, cam_forward) = orbit.eye_and_basis(marble_state.marble.pos);
 
     let kill_y = marble_state.kill_y;
     let start = marble_state.start_pos;

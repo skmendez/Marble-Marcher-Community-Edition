@@ -1,11 +1,34 @@
 //! Game camera: orbits a target (the marble) via a free 3D orientation
 //! quaternion + distance (DESIGN.md §7/§8).
+//!
+//! Arcball/trackball model ("the camera sits on a sphere around the
+//! marble, Google Earth-style"): a swipe moves the camera a distance
+//! across that sphere proportional to the swipe's magnitude, in the swiped
+//! direction, without introducing any twist of its own; a two-finger twist
+//! changes heading and *only* heading. This replaced an earlier
+//! yaw(world-Y)/pitch(local-right)/roll(separate scalar) decomposition
+//! that went through three rounds of live-reported bugs (gimbal lock at
+//! the poles under Euler angles; a real pan-vs-twist bug once `roll` was
+//! pulled out as a separate scalar with `drag`'s pitch still rotating
+//! around a roll-tilted axis; then a pitch-dependent yaw/pitch gain
+//! mismatch once roll-compensation was added to fix *that*) — each fix was
+//! a compensation formula patched onto a mismatch between two differently
+//! defined rotation axes, not a removal of the mismatch. The arcball
+//! design has no such mismatch: every swipe is a *single* rotation whose
+//! axis is always perpendicular to `forward` (so it can never twist the
+//! view around its own look direction) and whose angle depends only on
+//! swipe magnitude (so sphere-distance-per-pixel is uniform regardless of
+//! pitch) — see `drag`'s doc for the exact construction and why both of
+//! those hold by construction, not by tuning.
 
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::prelude::*;
 
-pub(crate) const YAW_SENSITIVITY: f32 = 0.006;
-pub(crate) const PITCH_SENSITIVITY: f32 = 0.006;
+/// Radians of rotation per pixel of swipe magnitude (`drag`) — same
+/// numeric value the old yaw/pitch decomposition used for both axes, kept
+/// so a swipe of a given pixel length still produces roughly the same
+/// on-screen motion as before.
+pub(crate) const DRAG_SENSITIVITY: f32 = 0.006;
 /// Focal length (`1/tan(halfFOV)`) baked into `cam_forward.w` everywhere a
 /// `SceneUniforms` is written (`render.rs`/`mrrm.rs`/`shadow_pass.rs`, each
 /// currently as their own `forward.extend(1.5)` literal, pre-existing
@@ -22,27 +45,18 @@ const ZOOM_SENSITIVITY: f32 = 0.5;
 /// marble's position) lives in `MarbleState`, not here, so this resource
 /// stays pure input state.
 ///
-/// `orientation` replaces an earlier yaw/pitch/roll Euler-angle
-/// representation. Composing every rotation (mouse/touch drag, two-finger
-/// roll) directly onto this quaternion, instead of decomposing into and
-/// reconstructing from separate persistent angles each frame, is what
-/// avoids gimbal lock — there's no "pitch" value that can approach +/-90
-/// degrees and collapse yaw/roll onto the same axis (reported as feeling
-/// gimbal-locked when rotating what looked like the Y axis, under the old
-/// representation). This representation has no such singularity anywhere:
-/// `drag`/`roll` below only ever apply an *incremental* rotation relative
-/// to whatever the current orientation already is.
+/// A single quaternion, with no separate `roll`/yaw/pitch fields: `drag`
+/// and `roll` below only ever compose an *incremental* rotation onto
+/// whatever `orientation` already is, never decompose into or reconstruct
+/// from stored angles — which is what avoids gimbal lock (no "pitch" value
+/// that can approach the pole and collapse yaw/roll onto the same axis)
+/// *and* what avoids the roll-vs-orientation sync bugs the previous
+/// (`orientation` + separate `roll: f32`) representation went through —
+/// there's nothing left to fall out of sync, since roll is just part of
+/// `orientation` like everything else.
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct CameraOrbit {
     pub orientation: Quat,
-    /// Screen-tilt roll around the current forward axis, applied only as a
-    /// final step in `eye_and_basis` -- kept fully separate from
-    /// `orientation` (which stays pure yaw+pitch) so that accumulated roll
-    /// can never skew the axis `drag`'s pitch rotates around. See `roll`'s
-    /// doc for why this separation matters ("Google Earth sphere": swipe
-    /// always pans, twist always rolls, and neither ever leaks into the
-    /// other).
-    pub roll: f32,
     pub distance: f32,
 }
 
@@ -79,7 +93,6 @@ impl Default for CameraOrbit {
             // camera to the marble's contact normal at spawn/settle time,
             // which isn't implemented yet.
             orientation: Self::orientation_from_yaw_pitch(-1.448, 0.899),
-            roll: 0.0,
             // Much closer than DESIGN.md §7's original
             // `orbit_dist * marble_rad / 0.035` MMCE-scaling formula
             // (~1.77): that reads as "the marble is a barely-visible speck"
@@ -102,132 +115,95 @@ impl Default for CameraOrbit {
 
 impl CameraOrbit {
     /// Eye position and orthonormal camera basis (right, up, forward)
-    /// looking at `target`, `distance` back along `-forward` (DESIGN.md §8).
-    /// `roll` is applied here, as a final rotation of `right`/`up` about
-    /// `forward` -- `orientation` itself stays pure yaw+pitch, so `forward`
-    /// is never affected by roll.
+    /// looking at `target`, `distance` back along `-forward` (DESIGN.md
+    /// §8). `right`/`up` already include whatever twist has accumulated —
+    /// `orientation` *is* the rendered frame now, there's no separate
+    /// unrolled frame to reconcile it with.
     pub fn eye_and_basis(&self, target: Vec3) -> (Vec3, Vec3, Vec3, Vec3) {
         let forward = self.forward();
-        let right0 = self.orientation * Vec3::X;
-        let up0 = self.orientation * Vec3::Y;
-        let (sin_r, cos_r) = self.roll.sin_cos();
-        let right = right0 * cos_r + up0 * sin_r;
-        let up = up0 * cos_r - right0 * sin_r;
+        let right = self.orientation * Vec3::X;
+        let up = self.orientation * Vec3::Y;
         let eye = target - forward * self.distance;
         (eye, right, up, forward)
     }
 
     /// The direction the camera is currently looking, independent of any
-    /// target (`physics_sys.rs` passes this directly, alongside the
-    /// un-rolled `orientation * Vec3::X` right vector, into
-    /// `marble_csg::step_marble`'s camera-relative thrust).
+    /// target (`physics_sys.rs` passes this, alongside `eye_and_basis`'s
+    /// `right`, into `marble_csg::step_marble`'s camera-relative thrust).
     pub fn forward(&self) -> Vec3 {
         self.orientation * Vec3::NEG_Z
     }
 
-    /// Applies a horizontal/vertical drag (mouse drag or single-finger
-    /// swipe) as incremental rotations: horizontal around the *world* Y
-    /// axis (so a horizontal drag always spins the view the same way
-    /// regardless of current pitch — a stable "compass" feel), vertical
-    /// around the camera's *own current* local right axis (so it always
-    /// tilts relative to however the camera is presently facing). This
-    /// ordering — world-axis yaw pre-multiplied, local-axis pitch
-    /// post-multiplied — is the standard gimbal-lock-free orbit/FPS camera
-    /// composition. No clamping of the result: a full quaternion has no
-    /// pole to clamp away from, and clamping isn't expressible without
-    /// decomposing back into Euler angles, which would reintroduce the
-    /// exact gimbal-lock hazard this representation exists to avoid — the
-    /// camera can now genuinely orbit all the way over the top/bottom, as
-    /// requested ("truly global" movement).
+    /// Applies a swipe (mouse drag or single-finger touch) as a single
+    /// rotation that slides the camera across its sphere in the swiped
+    /// direction, by an angle proportional to the swipe's magnitude —
+    /// the arcball/trackball construction (module doc).
     ///
-    /// `delta` is measured in raw physical screen/pixel space, which does
-    /// *not* rotate with `roll` — only the rendered image content appears
-    /// to tilt when rolled, the physical swipe axes never do. But the
-    /// elementary rotations below are expressed against the *unrolled*
-    /// `orientation` frame (`yaw` about world Y moves `forward` along
-    /// `orientation`'s local X = `right0`; `pitch` about `right0` moves
-    /// `forward` along `orientation`'s local Y = `up0` — see
-    /// `eye_and_basis`). Those only coincide with what's actually drawn
-    /// on screen (`right`/`up`) when `roll == 0`. At any other roll, a
-    /// physically-horizontal swipe needs to drive *both* yaw and pitch, in
-    /// proportion to how much of the current on-screen `right` direction
-    /// projects onto each of `right0`/`up0` (`right = right0*cos(roll) +
-    /// up0*sin(roll)`, `up = up0*cos(roll) - right0*sin(roll)`) — i.e.
-    /// `delta` must be rotated by `+roll` before being split into
-    /// yaw/pitch contributions, not fed straight in. Without this, a swipe
-    /// only pans cleanly along the direction actually swiped when `roll`
-    /// happens to be zero; at any other roll, part of a "purely
-    /// horizontal" physical swipe leaked into `pitch` (and vice versa),
-    /// which read as the drag doing "more of a rotation" than a clean pan
-    /// — reported and confirmed against a live build, not just suspected.
-    /// At `roll == 0` this reduces to the original `delta` exactly
-    /// (`cos(0)=1, sin(0)=0`), so unrolled behavior is unchanged.
+    /// `screen_dir` is the swipe's direction expressed in world space,
+    /// built from the camera's *current* `right`/`up` (twist included —
+    /// there's no "unrolled" frame to convert into first, unlike the
+    /// previous design). `axis`, being `forward.cross(screen_dir)`, is
+    /// perpendicular to both `forward` and `screen_dir` by construction:
+    /// perpendicular to `forward` means rotating around it can *never* put
+    /// a twist component into the result (there's nothing left over to
+    /// spin the view around its own look direction with), and perpendicular
+    /// to `screen_dir` combined with the vector triple product identity
+    /// `(A×B)×A = B` (for unit, orthogonal `A`, `B`) means `forward` moves
+    /// *exactly* along `screen_dir` — not just to first order, for the
+    /// whole finite rotation. Because `angle` depends only on `delta`'s
+    /// magnitude (not a separate yaw/pitch split with different gains at
+    /// different pitches, the previous design's bug), the sphere-distance
+    /// moved per pixel of swipe is the same at any pitch, any roll, any
+    /// swipe direction — verified numerically across a pitch/roll sweep,
+    /// not just at the one configuration each previous round happened to
+    /// test.
+    ///
+    /// Sign convention matches the previously-shipped, already-tuned
+    /// roll=0 behavior exactly (checked independently against the old
+    /// formula for pure horizontal and pure vertical swipes) — this isn't
+    /// a fourth flipped direction.
     pub(crate) fn drag(&mut self, delta: Vec2) {
-        let unrolled = self.unrolled_delta(delta);
-        let forward = self.forward();
-        // Yaw (about world Y) moves `forward` at a rate scaled by
-        // `sqrt(forward.x^2 + forward.z^2)` -- the length of `forward`'s
-        // horizontal projection, equivalently sin(angle between `forward`
-        // and world Y) -- exactly 1 at level pitch, shrinking toward 0 near
-        // the poles (an unavoidable geometric fact: yaw about world Y does
-        // literally nothing to `forward` when `forward` is itself parallel
-        // to that axis, i.e. looking straight up/down). Pitch has no such
-        // scaling: `right0` (`orientation * Vec3::X`) is always exactly
-        // perpendicular to `forward`, a structural property of this
-        // camera's `Ry(yaw)*Rx(pitch)`-decomposable orientation (any
-        // sequence of `drag` calls collapses to that form, since same-axis
-        // quaternion rotations compose additively regardless of
-        // interleaving), so pitch's effect on `forward` never attenuates.
-        // `unrolled_delta`'s roll compensation implicitly assumes yaw and
-        // pitch have *equal* gain on `forward` -- true only exactly at
-        // pitch=0 -- so at any other pitch, a roll-mixed swipe (any roll
-        // that isn't a multiple of 90 degrees, where `unrolled` reduces to
-        // a pure single-axis input either way) under-drives yaw relative
-        // to pitch, and the resulting pan direction leaks off-axis. Worse
-        // the steeper the pitch. Dividing yaw's input by this gain restores
-        // the correct proportion -- confirmed against a live device
-        // repro (see `drag_matches_real_device_repro_at_45_degree_roll`).
-        // Floored well above zero: exactly at the pole this ratio is
-        // genuinely undefined (yaw has no well-defined effect to restore
-        // proportion *to*), so the floor trades "yaw briefly gets coarse
-        // right at the pole" for "no NaN/inf poisoning `orientation`".
-        let yaw_gain = (forward.x * forward.x + forward.z * forward.z)
-            .sqrt()
-            .max(1e-3);
-        let yaw = Quat::from_rotation_y(-unrolled.x * YAW_SENSITIVITY / yaw_gain);
-        let pitch = Quat::from_rotation_x(unrolled.y * PITCH_SENSITIVITY);
+        let Some((screen_dir, angle)) = self.drag_intermediates(delta) else {
+            return;
+        };
+        let axis = self.forward().cross(screen_dir).normalize();
         // Renormalize every step: repeated quaternion multiplication can
         // accumulate tiny floating-point drift away from unit length over
         // a long play session, which would otherwise slowly skew
         // `eye_and_basis`'s basis vectors away from orthonormal.
-        self.orientation = (yaw * self.orientation * pitch).normalize();
+        self.orientation = (Quat::from_axis_angle(axis, angle) * self.orientation).normalize();
     }
 
-    /// The roll-compensation step `drag` applies to a raw physical-screen
-    /// delta before splitting it into yaw/pitch (see `drag`'s doc) --
-    /// pulled out on its own so `touch.rs`'s live debug readout can display
-    /// the exact intermediate value `drag` actually uses, without
-    /// reimplementing the formula a second time (which could silently
-    /// drift out of sync with the real one).
-    pub(crate) fn unrolled_delta(&self, delta: Vec2) -> Vec2 {
-        let (sin_r, cos_r) = self.roll.sin_cos();
-        Vec2::new(
-            delta.x * cos_r - delta.y * sin_r,
-            delta.x * sin_r + delta.y * cos_r,
-        )
+    /// `drag`'s `screen_dir`/`angle` (world-space swipe direction, rotation
+    /// magnitude in radians), or `None` for a zero-length `delta` -- pulled
+    /// out on its own so `touch.rs`'s live debug readout can display the
+    /// exact intermediates `drag` actually computes, without a second,
+    /// independently-written copy of the formula that could drift out of
+    /// sync with the real one.
+    pub(crate) fn drag_intermediates(&self, delta: Vec2) -> Option<(Vec3, f32)> {
+        if delta.length_squared() < 1e-12 {
+            return None;
+        }
+        let right = self.orientation * Vec3::X;
+        let up = self.orientation * Vec3::Y;
+        let screen_dir = (right * delta.x + up * delta.y).normalize();
+        let angle = delta.length() * DRAG_SENSITIVITY;
+        Some((screen_dir, angle))
     }
 
-    /// Applies a two-finger-rotate roll increment. Kept as a wholly
-    /// separate scalar from `orientation` (rather than composed into it via
-    /// `Quat::from_rotation_z` post-multiply, as an earlier version of this
-    /// did) so that accumulated roll can never tilt the axis `drag`'s pitch
-    /// rotates around -- the "Google Earth sphere" model the camera is
-    /// meant to follow: swiping always spins the sphere (pure yaw/pitch
-    /// orbit via `drag`), twisting always rotates the sphere in place
-    /// (pure screen roll, this function), and neither gesture's effect
-    /// leaks into the other no matter how much of either has accumulated.
+    /// Applies a two-finger-rotate twist increment: a *local*-frame
+    /// rotation about the camera's own current forward axis (post-multiply
+    /// by a local-Z rotation — the standard body-rotation identity, same
+    /// one `drag`'s doc leans on for why a world-frame pre-multiply behaves
+    /// differently from a local-frame post-multiply). Local Z is exactly
+    /// `forward`'s axis, and a rotation about Z never touches the Z
+    /// component it's rotating around, so this changes `right`/`up` but
+    /// provably never `forward` (`roll_does_not_change_forward` below) —
+    /// heading changes, nothing else, matching the "twist rotates the
+    /// sphere in place" half of the arcball model. Reproduces the same
+    /// tilt-direction sign the previous separate-`roll`-scalar design had.
     pub(crate) fn roll(&mut self, delta_radians: f32) {
-        self.roll += delta_radians;
+        self.orientation = (self.orientation * Quat::from_rotation_z(delta_radians)).normalize();
     }
 }
 
@@ -235,7 +211,7 @@ impl CameraOrbit {
 /// no multi-touch gesture to roll with otherwise (touch's two-finger rotate
 /// is the only other input path to `CameraOrbit::roll`), so this is a real
 /// accessibility gap on desktop, not just a debug convenience -- though it
-/// also happens to be the only reliable way to drive a nonzero `roll` from
+/// also happens to be the only reliable way to drive a nonzero roll from
 /// browser automation (CDP), since synthetic multi-touch gestures don't
 /// reliably reach this app's touch handling.
 const KEYBOARD_ROLL_RATE: f32 = 1.5;
@@ -248,6 +224,7 @@ pub fn orbit_camera_input(
     mut motion: EventReader<MouseMotion>,
     mut wheel: EventReader<MouseWheel>,
     mut orbit: ResMut<CameraOrbit>,
+    mut twist_debug: ResMut<crate::fps_overlay::DebugTwistAccum>,
 ) {
     if mouse_buttons.pressed(MouseButton::Left) {
         for ev in motion.read() {
@@ -265,7 +242,9 @@ pub fn orbit_camera_input(
         roll_dir += 1.0;
     }
     if roll_dir != 0.0 {
-        orbit.roll(roll_dir * KEYBOARD_ROLL_RATE * time.delta_secs());
+        let delta = roll_dir * KEYBOARD_ROLL_RATE * time.delta_secs();
+        orbit.roll(delta);
+        twist_debug.0 += delta;
     }
 
     for ev in wheel.read() {
@@ -302,12 +281,11 @@ mod tests {
     fn eye_and_basis_matches_old_right_up_derivation() {
         // The old code derived right/up as forward.cross(world_up) /
         // right.cross(forward) rather than rotating basis vectors by the
-        // quaternion directly -- confirm the two approaches agree (at
-        // zero roll) for a few presets, not just that `forward` does.
+        // quaternion directly -- confirm the two approaches agree for a
+        // few presets, not just that `forward` does.
         for (yaw, pitch) in [(0.0, 0.0), (0.8, 0.35), (-1.448, 0.899)] {
             let orbit = CameraOrbit {
                 orientation: CameraOrbit::orientation_from_yaw_pitch(yaw, pitch),
-                roll: 0.0,
                 distance: 1.0,
             };
             let (_, right, up, forward) = orbit.eye_and_basis(Vec3::ZERO);
@@ -320,7 +298,10 @@ mod tests {
 
     #[test]
     fn eye_is_distance_back_along_forward_from_target() {
-        let orbit = CameraOrbit { orientation: CameraOrbit::orientation_from_yaw_pitch(0.4, 0.2), roll: 0.0, distance: 3.0 };
+        let orbit = CameraOrbit {
+            orientation: CameraOrbit::orientation_from_yaw_pitch(0.4, 0.2),
+            distance: 3.0,
+        };
         let target = Vec3::new(1.0, 2.0, 3.0);
         let (eye, _, _, forward) = orbit.eye_and_basis(target);
         assert!((eye - target).length() - 3.0 < 1e-4);
@@ -339,10 +320,10 @@ mod tests {
         // system was physically incapable of ever reaching this state at
         // all; this one lands exactly where continuous rotation predicts,
         // with a still-orthonormal, non-degenerate basis.
-        let mut orbit = CameraOrbit { orientation: Quat::IDENTITY, roll: 0.0, distance: 1.0 };
+        let mut orbit = CameraOrbit { orientation: Quat::IDENTITY, distance: 1.0 };
         let steps = 100;
         let total_pitch = std::f32::consts::PI;
-        let per_step_delta_y = -(total_pitch / PITCH_SENSITIVITY) / steps as f32;
+        let per_step_delta_y = -(total_pitch / DRAG_SENSITIVITY) / steps as f32;
         for _ in 0..steps {
             orbit.drag(Vec2::new(0.0, per_step_delta_y));
         }
@@ -367,7 +348,10 @@ mod tests {
 
     #[test]
     fn roll_does_not_change_forward() {
-        let mut orbit = CameraOrbit { orientation: CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35), roll: 0.0, distance: 1.0 };
+        let mut orbit = CameraOrbit {
+            orientation: CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35),
+            distance: 1.0,
+        };
         let forward_before = orbit.forward();
         orbit.roll(1.2);
         let forward_after = orbit.forward();
@@ -379,7 +363,10 @@ mod tests {
 
     #[test]
     fn roll_does_change_right_and_up() {
-        let mut orbit = CameraOrbit { orientation: CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35), roll: 0.0, distance: 1.0 };
+        let mut orbit = CameraOrbit {
+            orientation: CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35),
+            distance: 1.0,
+        };
         let (_, right_before, up_before, _) = orbit.eye_and_basis(Vec3::ZERO);
         orbit.roll(1.2);
         let (_, right_after, up_after, _) = orbit.eye_and_basis(Vec3::ZERO);
@@ -388,108 +375,144 @@ mod tests {
     }
 
     #[test]
-    fn drag_at_zero_roll_is_unaffected_by_the_roll_compensation() {
-        // The roll-compensation added to `drag` below must be a no-op
-        // exactly when `roll == 0` (`cos(0)=1, sin(0)=0` makes the
-        // rotation an identity) -- a plain regression guard that unrolled
-        // behavior (already extensively verified pre-roll-compensation)
-        // didn't change.
+    fn roll_sign_matches_previously_shipped_tilt_direction() {
+        // The old (separate-scalar) design's `eye_and_basis` computed
+        // `right = right0*cos(roll) + up0*sin(roll)` -- i.e. for a small
+        // positive roll, `right` tilts *toward* `up0`. Confirm the new
+        // local-Z-post-multiply `roll` reproduces the same sign, not just
+        // "changes right/up somehow" (the test above).
         let base = CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35);
-        let mut a = CameraOrbit { orientation: base, roll: 0.0, distance: 1.0 };
-        let mut b = CameraOrbit { orientation: base, roll: 0.0, distance: 1.0 };
-        a.drag(Vec2::new(37.0, -12.0));
-        b.drag(Vec2::new(37.0, -12.0));
-        assert!(a.orientation.angle_between(b.orientation) < 1e-6);
+        let mut orbit = CameraOrbit { orientation: base, distance: 1.0 };
+        let right0 = base * Vec3::X;
+        let up0 = base * Vec3::Y;
+        let small_roll = 0.01;
+        orbit.roll(small_roll);
+        let (_, right, _, _) = orbit.eye_and_basis(Vec3::ZERO);
+        let predicted = (right0 + up0 * small_roll).normalize();
+        assert!(
+            right.distance(predicted) < 1e-3,
+            "expected right to tilt toward up0 for positive roll (old sign convention), \
+             got {right:?}, predicted {predicted:?}"
+        );
     }
 
     #[test]
-    fn drag_along_screen_axes_moves_forward_along_the_current_rolled_right_and_up() {
-        // The actual bug this test guards against (reported live: "swiping
-        // still isn't correct... unless we're already oriented where y is
-        // up"): `drag`'s raw `delta` is measured in physical screen-space,
-        // which does not rotate with `roll` -- only the rendered image
-        // does. Feeding `delta.x`/`delta.y` straight into yaw/pitch (which
-        // are expressed against the *unrolled* `right0`/`up0` axes) only
-        // produces a clean on-screen pan when `roll == 0`; at any other
-        // roll, a physically-horizontal swipe needs to drive a mix of yaw
-        // and pitch to actually track the current (rolled) on-screen
-        // `right` direction, not `right0`.
-        //
-        // Verified via each elementary rotation's *infinitesimal* effect on
-        // `forward`: a small yaw (world-Y rotation) moves `forward` along
-        // `Y.cross(forward0)`, and a small pitch (rotation about `right0`)
-        // moves `forward` along `up0`. Deliberately testing at `pitch = 0`
-        // (level `base`): only there is `Y.cross(forward0)` *exactly*
-        // `-right0` with no extra scaling -- at nonzero pitch, `up0 != Y`,
-        // so yaw's effect on `forward` picks up a `cos(angle(up0, Y))`
-        // factor that has nothing to do with the roll-compensation this
-        // test exists to check, and would just add unrelated noise (an
-        // earlier version of this test used a pitched `base` and failed
-        // for exactly that reason -- not a bug in the fix, a flaw in that
-        // version of the test's own independent derivation). At `pitch =
-        // 0` that confound vanishes, leaving a clean check of the roll
-        // rotation's sign specifically: for a drag to move `forward` along
-        // the *current* `right` (`= right0*cos(roll) + up0*sin(roll)`), it
-        // must split a pure physical-x delta into `cos(roll)` of yaw and
-        // `sin(roll)` of pitch -- exactly the correction `drag` now
-        // applies. This is an independent geometric check (not a
-        // re-statement of the implementation): it would fail both for the
-        // pre-fix code (which moves along `right0`/`up0`, not `right`/`up`,
-        // at nonzero roll) and for a wrong-signed correction (verified by
-        // hand for this roll: the wrong sign produces a direction that is
-        // provably not parallel to `right`/`up` at this angle).
-        let base = CameraOrbit::orientation_from_yaw_pitch(0.8, 0.0);
-        // An arbitrary, non-special roll -- not a multiple of PI/2, so a
-        // sign error can't accidentally still look parallel.
-        let roll = 1.0_f32;
+    fn drag_matches_old_sign_convention_at_zero_roll() {
+        // The old shipped formula at roll=0: yaw_angle = -delta.x*SENS
+        // (world-Y, pre-multiplied), pitch_angle = delta.y*SENS (local
+        // right0, post-multiplied). Confirm the new single-rotation
+        // `drag` moves `forward` in exactly the same direction for pure
+        // horizontal and pure vertical swipes at a level, unrolled start
+        // -- this round must not silently flip a direction that was
+        // already correct and already user-verified.
+        fn old_drag(o: Quat, delta: Vec2) -> Quat {
+            let yaw = Quat::from_rotation_y(-delta.x * DRAG_SENSITIVITY);
+            let pitch = Quat::from_rotation_x(delta.y * DRAG_SENSITIVITY);
+            (yaw * o * pitch).normalize()
+        }
+        let base = CameraOrbit::orientation_from_yaw_pitch(0.0, 0.0);
+        for delta in [Vec2::new(10.0, 0.0), Vec2::new(-10.0, 0.0), Vec2::new(0.0, 10.0), Vec2::new(0.0, -10.0)] {
+            let mut new_orbit = CameraOrbit { orientation: base, distance: 1.0 };
+            new_orbit.drag(delta);
+            let old_orientation = old_drag(base, delta);
 
-        // Horizontal physical drag -> must move `forward` along `right`.
-        let mut h = CameraOrbit { orientation: base, roll, distance: 1.0 };
-        let (_, right, _up, forward_before) = h.eye_and_basis(Vec3::ZERO);
-        h.drag(Vec2::new(1.0, 0.0)); // tiny delta: stays in the linear regime
-        let moved = (h.forward() - forward_before).normalize();
-        assert!(
-            moved.distance(right) < 1e-2,
-            "horizontal drag at roll={roll} should move forward along the current `right` \
-             ({right:?}), got direction {moved:?}"
-        );
+            let new_delta = (new_orbit.forward() - (base * Vec3::NEG_Z)).normalize();
+            let old_delta = (old_orientation * Vec3::NEG_Z - (base * Vec3::NEG_Z)).normalize();
+            assert!(
+                new_delta.distance(old_delta) < 1e-2,
+                "delta={delta:?}: new drag moved forward {new_delta:?}, old drag moved {old_delta:?} -- direction mismatch"
+            );
+        }
+    }
 
-        // Vertical physical drag -> must move `forward` along `up` (or
-        // exactly `-up`, matching whatever sign convention the pre-existing
-        // roll=0 delta.y-to-pitch mapping already used -- this test only
-        // cares that it's parallel to `up`, not which sign, since that
-        // sign was already fixed and verified before roll compensation
-        // existed at all).
-        let mut v = CameraOrbit { orientation: base, roll, distance: 1.0 };
-        let (_, _right, up, forward_before) = v.eye_and_basis(Vec3::ZERO);
-        v.drag(Vec2::new(0.0, 1.0));
-        let moved = (v.forward() - forward_before).normalize();
-        assert!(
-            moved.distance(up) < 1e-2 || moved.distance(-up) < 1e-2,
-            "vertical drag at roll={roll} should move forward along the current `up` \
-             ({up:?}) (either sign), got direction {moved:?}"
-        );
+    #[test]
+    fn drag_moves_by_uniform_angle_regardless_of_pitch() {
+        // The bug that broke round 3: yaw and pitch had different gains on
+        // `forward` except exactly at pitch=0, so a fixed-magnitude swipe
+        // moved the camera different *amounts* (and, mixed with roll,
+        // different *directions*) depending on current pitch. The arcball
+        // design has no yaw/pitch split at all -- confirm a fixed-magnitude
+        // swipe rotates `forward` by *exactly* the same angle at several
+        // very different pitches (and with roll thrown in, since the old
+        // bug was specifically a roll+pitch interaction).
+        let delta = Vec2::new(30.0, -18.0);
+        let mut angles = Vec::new();
+        for pitch_deg in [0.0, 30.0, 60.0, 80.0, -45.0] {
+            let pitch = pitch_deg_to_rad(pitch_deg);
+            let base = CameraOrbit::orientation_from_yaw_pitch(0.8, pitch) * Quat::from_rotation_z(0.6458); // ~37deg roll thrown in
+            let mut orbit = CameraOrbit { orientation: base, distance: 1.0 };
+            let f0 = orbit.forward();
+            orbit.drag(delta);
+            let f1 = orbit.forward();
+            angles.push(f0.angle_between(f1));
+        }
+        let first = angles[0];
+        for (pitch_deg, ang) in [0.0, 30.0, 60.0, 80.0, -45.0].into_iter().zip(angles.iter()) {
+            assert!(
+                (ang - first).abs() < 1e-4,
+                "pitch={pitch_deg}: rotated {ang} rad, expected {first} rad (uniform regardless of pitch)"
+            );
+        }
+    }
+
+    fn pitch_deg_to_rad(d: f32) -> f32 {
+        d.to_radians()
+    }
+
+    #[test]
+    fn drag_out_and_back_returns_to_exact_original_orientation() {
+        // The bug that broke round 2 (and was only incompletely fixed by
+        // round 3): a swipe should never leave any residual twist behind.
+        // The strongest testable form: drag by delta, then immediately
+        // drag by -delta from the *resulting* state (recomputing
+        // screen_dir/axis fresh each time, exactly as real input does) --
+        // must land back at exactly the starting orientation, full
+        // right/up/forward included, not just forward.
+        for (pitch_deg, roll, delta) in [
+            (0.0, 0.0, Vec2::new(20.0, 0.0)),
+            (40.0, 1.3, Vec2::new(-15.0, 22.0)),
+            (-60.0, -2.1, Vec2::new(8.0, -30.0)),
+            (75.0, 0.7, Vec2::new(-40.0, -5.0)),
+        ] {
+            let pitch = pitch_deg_to_rad(pitch_deg);
+            let base = CameraOrbit::orientation_from_yaw_pitch(0.3, pitch) * Quat::from_rotation_z(roll);
+            let mut orbit = CameraOrbit { orientation: base, distance: 1.0 };
+            orbit.drag(delta);
+            orbit.drag(-delta);
+            let ang = base.angle_between(orbit.orientation);
+            // Exact in infinite precision (verified algebraically: the
+            // second drag's rotation is provably the exact inverse of the
+            // first, via the rotation-conjugation identity R*Rot(axis,th)*
+            // R^-1 = Rot(R*axis,th)) -- this tolerance is `f32`-precision
+            // headroom for a handful of chained trig/cross/normalize ops at
+            // up to a ~14 degree single-step rotation, not slack for a real
+            // bug: a genuine twist-leak would be comparable in size to the
+            // swipe's own rotation angle (tenths of a radian), not 1e-3.
+            assert!(
+                ang < 5e-3,
+                "pitch={pitch_deg} roll={roll} delta={delta:?}: out-and-back left {ang} rad of residual twist"
+            );
+        }
     }
 
     #[test]
     fn drag_matches_real_device_repro_at_45_degree_roll() {
-        // Regression test grounded in an actual live repro, not a synthetic
-        // case: the previous round's roll-compensation fix
-        // (`unrolled_delta`) was verified only at `pitch = 0`, where yaw
-        // and pitch happen to have equal effect on `forward` -- but a real
-        // on-device screenshot (`roll: 46.2deg`, `forward: (-0.290, -0.800,
-        // -0.526)`, swiping bottom-to-top gave `delta: (-0.1, -1.6)`) showed
-        // that a nearly-pure-vertical swipe at that roll/pitch combination
-        // produced a `forward`-motion direction with a real ~30% leak onto
-        // the `right`/`left` axis (dot product ~-0.30) -- exactly the
-        // "swipe up tilts left" symptom reported. This test reconstructs
-        // that state (yaw/pitch solved from the reported `forward` via the
-        // same closed-form `old_forward` inverts) and asserts the
-        // now-gain-corrected `drag` keeps the cross-axis leak small.
+        // Regression test grounded in an actual live repro, not a
+        // synthetic case: an on-device screenshot showed `roll: 46.2deg`,
+        // `forward: (-0.290, -0.800, -0.526)`, and a bottom-to-top swipe
+        // giving `delta: (-0.1, -1.6)` -- under the *previous* (gain-
+        // mismatched) design this nearly-pure-vertical swipe leaked ~30%
+        // onto the right/left axis (dot ~-0.30), matching the reported
+        // "swipe up tilts left" bug. Reconstruct that exact state under the
+        // new design (roll composed via `roll()`, not a field) and confirm
+        // the swipe stays cleanly on-axis.
         let pitch = 0.8_f32.asin(); // sin(pitch) = -forward.y = 0.800
         let yaw = (0.290_f32 / pitch.cos()).asin(); // cos(pitch)*sin(yaw) = -forward.x = 0.290
-        let roll = 46.2_f32.to_radians();
-        let mut orbit = CameraOrbit { orientation: CameraOrbit::orientation_from_yaw_pitch(yaw, pitch), roll, distance: 1.0 };
+        let mut orbit = CameraOrbit {
+            orientation: CameraOrbit::orientation_from_yaw_pitch(yaw, pitch),
+            distance: 1.0,
+        };
+        orbit.roll(46.2_f32.to_radians());
         let forward_before = orbit.forward();
         assert!(
             forward_before.distance(Vec3::new(-0.290, -0.800, -0.526)) < 0.02,
@@ -504,8 +527,7 @@ mod tests {
         assert!(
             cross_axis_leak < 0.1,
             "a near-pure-vertical swipe at roll=46.2deg leaked {cross_axis_leak:.3} onto \
-             `right` (pre-fix this was ~0.30, matching the reported 'swipe up tilts left' bug) \
-             -- moved={moved:?} right={right:?}"
+             `right` (pre-fix this was ~0.30) -- moved={moved:?} right={right:?}"
         );
         let up_alignment = moved.dot(up.normalize()).abs();
         assert!(

@@ -76,11 +76,25 @@ pub struct FpsOverlayPlugin;
 impl Plugin for FpsOverlayPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FrameTimeWindow>()
+            .init_resource::<DebugTwistAccum>()
             .add_systems(Startup, spawn_fps_overlay)
             .add_systems(Update, (record_frame_time, update_fps_text).chain())
             .add_systems(Update, update_orbit_debug_text);
     }
 }
+
+/// Running total of every `delta_radians` ever passed to
+/// `CameraOrbit::roll` (Q/E and two-finger twist alike) -- display-only,
+/// never read by any real camera math. The arcball `CameraOrbit` has no
+/// standalone "roll" value anymore (twist is just part of `orientation`,
+/// same as everything else), but a numeric roll readout has been genuinely
+/// useful for diagnosing three rounds of live camera bugs, so this keeps it
+/// available without reintroducing a second piece of state the real camera
+/// logic has to stay in sync with -- incremented at each `orbit.roll(...)`
+/// call site (`camera.rs`'s `orbit_camera_input`, `touch.rs`'s
+/// `touch_camera_input`), never read there.
+#[derive(Resource, Default)]
+pub struct DebugTwistAccum(pub f32);
 
 /// Rolling window of recent per-frame wall-clock times (seconds), used to
 /// compute a windowed-average fps/frame-time pair -- see the module doc for
@@ -124,11 +138,11 @@ fn record_frame_time(time: Res<Time>, mut window: ResMut<FrameTimeWindow>) {
 #[derive(Component)]
 struct FpsText;
 
-/// Marker for the `Text` entity showing live `CameraOrbit` state (roll in
-/// degrees + `forward`) -- a numeric readout precise enough to verify
-/// camera-direction fixes (roll-compensated drag, thrust direction) against
-/// exact expected values from a screenshot, rather than eyeballing whether
-/// the rendered fractal "looks" rotated correctly.
+/// Marker for the `Text` entity showing live camera state (accumulated
+/// twist + `forward`) -- a numeric readout precise enough to verify
+/// camera-direction fixes against exact expected values from a screenshot,
+/// rather than eyeballing whether the rendered fractal "looks" rotated
+/// correctly.
 #[derive(Component)]
 struct OrbitDebugText;
 
@@ -159,7 +173,7 @@ fn spawn_fps_overlay(mut commands: Commands) {
                 FpsText,
             ));
             parent.spawn((
-                Text::new("roll: -- forward: --"),
+                Text::new("twist: -- forward: --"),
                 TextFont {
                     font_size: 14.0,
                     ..default()
@@ -172,6 +186,7 @@ fn spawn_fps_overlay(mut commands: Commands) {
 
 fn update_orbit_debug_text(
     orbit: Res<crate::camera::CameraOrbit>,
+    twist_debug: Res<DebugTwistAccum>,
     touch_debug: Res<crate::touch::TouchDebugInfo>,
     mut text: Query<&mut Text, With<OrbitDebugText>>,
 ) {
@@ -180,21 +195,21 @@ fn update_orbit_debug_text(
     };
     let f = orbit.forward();
     // `touches` line always shows the live count (0/1/2+), and the raw
-    // swipe delta + its roll-compensated `unrolled` counterpart whenever a
-    // single-finger swipe actually happened this frame -- lets a real
-    // on-device repro (twist to some roll, then swipe) be diagnosed from a
-    // screenshot of exactly what raw input `drag` received, rather than a
-    // description of it. See `touch::TouchDebugInfo`'s doc.
-    let touch_line = match (touch_debug.swipe_delta, touch_debug.unrolled) {
-        (Some(d), Some(u)) => format!(
-            "touches: {} delta: ({:.1}, {:.1}) unrolled: ({:.1}, {:.1})",
-            touch_debug.active_count, d.x, d.y, u.x, u.y
+    // swipe delta + the arcball formula's real intermediates (`screen_dir`,
+    // `angle`) whenever a single-finger swipe actually happened this frame
+    // -- lets a real on-device repro (twist to some roll, then swipe) be
+    // diagnosed from a screenshot of exactly what `drag` computed, rather
+    // than a description of it. See `touch::TouchDebugInfo`'s doc.
+    let touch_line = match (touch_debug.swipe_delta, touch_debug.screen_dir, touch_debug.angle_deg) {
+        (Some(d), Some(s), Some(a)) => format!(
+            "touches: {} delta: ({:.1}, {:.1}) screen_dir: ({:.2}, {:.2}, {:.2}) angle: {:.2}deg",
+            touch_debug.active_count, d.x, d.y, s.x, s.y, s.z, a
         ),
         _ => format!("touches: {}", touch_debug.active_count),
     };
     text.0 = format!(
-        "roll: {:.1}deg forward: ({:.3}, {:.3}, {:.3})\n{touch_line}",
-        orbit.roll.to_degrees(),
+        "twist: {:.1}deg forward: ({:.3}, {:.3}, {:.3})\n{touch_line}",
+        twist_debug.0.to_degrees(),
         f.x,
         f.y,
         f.z

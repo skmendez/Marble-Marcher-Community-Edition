@@ -198,11 +198,12 @@ mod tests {
     fn marble_target_is_always_screen_center_regardless_of_roll() {
         // Regression check for the module doc's key invariant: eye_and_basis
         // always targets `marble.pos`, so it must project to exactly (0,0)
-        // for any orientation/roll/distance.
+        // for any orientation (twist included -- composed directly into
+        // `orientation` via `Quat::from_rotation_z`, matching what
+        // `CameraOrbit::roll` itself does) /distance.
         for roll in [0.0_f32, 0.7, 2.9, -1.4] {
             let orbit = CameraOrbit {
-                orientation: CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35),
-                roll,
+                orientation: CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35) * Quat::from_rotation_z(roll),
                 distance: 0.6,
             };
             let target = Vec3::new(1.0, 2.0, 3.0);
