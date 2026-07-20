@@ -77,7 +77,8 @@ impl Plugin for FpsOverlayPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FrameTimeWindow>()
             .add_systems(Startup, spawn_fps_overlay)
-            .add_systems(Update, (record_frame_time, update_fps_text).chain());
+            .add_systems(Update, (record_frame_time, update_fps_text).chain())
+            .add_systems(Update, update_orbit_debug_text);
     }
 }
 
@@ -123,6 +124,14 @@ fn record_frame_time(time: Res<Time>, mut window: ResMut<FrameTimeWindow>) {
 #[derive(Component)]
 struct FpsText;
 
+/// Marker for the `Text` entity showing live `CameraOrbit` state (roll in
+/// degrees + `forward`) -- a numeric readout precise enough to verify
+/// camera-direction fixes (roll-compensated drag, thrust direction) against
+/// exact expected values from a screenshot, rather than eyeballing whether
+/// the rendered fractal "looks" rotated correctly.
+#[derive(Component)]
+struct OrbitDebugText;
+
 fn spawn_fps_overlay(mut commands: Commands) {
     commands
         .spawn((
@@ -131,22 +140,51 @@ fn spawn_fps_overlay(mut commands: Commands) {
                 top: Val::Px(6.0),
                 left: Val::Px(6.0),
                 padding: UiRect::axes(Val::Px(6.0), Val::Px(3.0)),
+                flex_direction: FlexDirection::Column,
                 ..default()
             },
             // Semi-transparent dark backing so the text reads over any part
             // of the (arbitrarily bright/colorful) fractal render.
             BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
         ))
-        .with_child((
-            Text::new("FPS: --"),
-            TextFont {
-                font_size: 18.0,
-                ..default()
-            },
-            // Bright, high-contrast against the dark backing panel.
-            TextColor(Color::srgb(0.2, 1.0, 0.4)),
-            FpsText,
-        ));
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new("FPS: --"),
+                TextFont {
+                    font_size: 18.0,
+                    ..default()
+                },
+                // Bright, high-contrast against the dark backing panel.
+                TextColor(Color::srgb(0.2, 1.0, 0.4)),
+                FpsText,
+            ));
+            parent.spawn((
+                Text::new("roll: -- forward: --"),
+                TextFont {
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.6, 0.9, 1.0)),
+                OrbitDebugText,
+            ));
+        });
+}
+
+fn update_orbit_debug_text(
+    orbit: Res<crate::camera::CameraOrbit>,
+    mut text: Query<&mut Text, With<OrbitDebugText>>,
+) {
+    let Ok(mut text) = text.single_mut() else {
+        return;
+    };
+    let f = orbit.forward();
+    text.0 = format!(
+        "roll: {:.1}deg forward: ({:.3}, {:.3}, {:.3})",
+        orbit.roll.to_degrees(),
+        f.x,
+        f.y,
+        f.z
+    );
 }
 
 fn update_fps_text(window: Res<FrameTimeWindow>, mut text: Query<&mut Text, With<FpsText>>) {

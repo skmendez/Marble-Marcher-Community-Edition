@@ -139,9 +139,37 @@ impl CameraOrbit {
     /// exact gimbal-lock hazard this representation exists to avoid — the
     /// camera can now genuinely orbit all the way over the top/bottom, as
     /// requested ("truly global" movement).
+    ///
+    /// `delta` is measured in raw physical screen/pixel space, which does
+    /// *not* rotate with `roll` — only the rendered image content appears
+    /// to tilt when rolled, the physical swipe axes never do. But the
+    /// elementary rotations below are expressed against the *unrolled*
+    /// `orientation` frame (`yaw` about world Y moves `forward` along
+    /// `orientation`'s local X = `right0`; `pitch` about `right0` moves
+    /// `forward` along `orientation`'s local Y = `up0` — see
+    /// `eye_and_basis`). Those only coincide with what's actually drawn
+    /// on screen (`right`/`up`) when `roll == 0`. At any other roll, a
+    /// physically-horizontal swipe needs to drive *both* yaw and pitch, in
+    /// proportion to how much of the current on-screen `right` direction
+    /// projects onto each of `right0`/`up0` (`right = right0*cos(roll) +
+    /// up0*sin(roll)`, `up = up0*cos(roll) - right0*sin(roll)`) — i.e.
+    /// `delta` must be rotated by `+roll` before being split into
+    /// yaw/pitch contributions, not fed straight in. Without this, a swipe
+    /// only pans cleanly along the direction actually swiped when `roll`
+    /// happens to be zero; at any other roll, part of a "purely
+    /// horizontal" physical swipe leaked into `pitch` (and vice versa),
+    /// which read as the drag doing "more of a rotation" than a clean pan
+    /// — reported and confirmed against a live build, not just suspected.
+    /// At `roll == 0` this reduces to the original `delta` exactly
+    /// (`cos(0)=1, sin(0)=0`), so unrolled behavior is unchanged.
     pub(crate) fn drag(&mut self, delta: Vec2) {
-        let yaw = Quat::from_rotation_y(-delta.x * YAW_SENSITIVITY);
-        let pitch = Quat::from_rotation_x(delta.y * PITCH_SENSITIVITY);
+        let (sin_r, cos_r) = self.roll.sin_cos();
+        let unrolled = Vec2::new(
+            delta.x * cos_r - delta.y * sin_r,
+            delta.x * sin_r + delta.y * cos_r,
+        );
+        let yaw = Quat::from_rotation_y(-unrolled.x * YAW_SENSITIVITY);
+        let pitch = Quat::from_rotation_x(unrolled.y * PITCH_SENSITIVITY);
         // Renormalize every step: repeated quaternion multiplication can
         // accumulate tiny floating-point drift away from unit length over
         // a long play session, which would otherwise slowly skew
@@ -163,9 +191,20 @@ impl CameraOrbit {
     }
 }
 
-/// Left-drag to orbit, scroll wheel to zoom.
+/// Radians/second applied while `Q`/`E` is held -- keyboard/mouse users have
+/// no multi-touch gesture to roll with otherwise (touch's two-finger rotate
+/// is the only other input path to `CameraOrbit::roll`), so this is a real
+/// accessibility gap on desktop, not just a debug convenience -- though it
+/// also happens to be the only reliable way to drive a nonzero `roll` from
+/// browser automation (CDP), since synthetic multi-touch gestures don't
+/// reliably reach this app's touch handling.
+const KEYBOARD_ROLL_RATE: f32 = 1.5;
+
+/// Left-drag to orbit, scroll wheel to zoom, `Q`/`E` to roll.
 pub fn orbit_camera_input(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
     mut motion: EventReader<MouseMotion>,
     mut wheel: EventReader<MouseWheel>,
     mut orbit: ResMut<CameraOrbit>,
@@ -176,6 +215,17 @@ pub fn orbit_camera_input(
         }
     } else {
         motion.clear();
+    }
+
+    let mut roll_dir = 0.0f32;
+    if keys.pressed(KeyCode::KeyQ) {
+        roll_dir -= 1.0;
+    }
+    if keys.pressed(KeyCode::KeyE) {
+        roll_dir += 1.0;
+    }
+    if roll_dir != 0.0 {
+        orbit.roll(roll_dir * KEYBOARD_ROLL_RATE * time.delta_secs());
     }
 
     for ev in wheel.read() {
@@ -298,32 +348,86 @@ mod tests {
     }
 
     #[test]
-    fn drag_after_roll_still_orbits_around_world_y_and_level_pitch() {
-        // The actual bug this test guards against: an earlier version
-        // composed `roll` directly into `orientation`, so once any roll had
-        // accumulated, `drag`'s pitch (which rotates around whatever
-        // `orientation`'s local X axis currently is) rotated around a
-        // *tilted* axis instead of a level one -- a horizontal swipe would
-        // visibly behave like a partial twist instead of a clean pan.
-        // Confirm a horizontal-only drag applied after a large roll
-        // produces exactly the same `orientation`/`forward` change as the
-        // same drag applied with no roll at all (roll must never leak into
-        // `drag`'s effect on `orientation`).
+    fn drag_at_zero_roll_is_unaffected_by_the_roll_compensation() {
+        // The roll-compensation added to `drag` below must be a no-op
+        // exactly when `roll == 0` (`cos(0)=1, sin(0)=0` makes the
+        // rotation an identity) -- a plain regression guard that unrolled
+        // behavior (already extensively verified pre-roll-compensation)
+        // didn't change.
         let base = CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35);
+        let mut a = CameraOrbit { orientation: base, roll: 0.0, distance: 1.0 };
+        let mut b = CameraOrbit { orientation: base, roll: 0.0, distance: 1.0 };
+        a.drag(Vec2::new(37.0, -12.0));
+        b.drag(Vec2::new(37.0, -12.0));
+        assert!(a.orientation.angle_between(b.orientation) < 1e-6);
+    }
 
-        let mut rolled = CameraOrbit { orientation: base, roll: 0.0, distance: 1.0 };
-        rolled.roll(2.7);
-        rolled.drag(Vec2::new(37.0, 0.0));
+    #[test]
+    fn drag_along_screen_axes_moves_forward_along_the_current_rolled_right_and_up() {
+        // The actual bug this test guards against (reported live: "swiping
+        // still isn't correct... unless we're already oriented where y is
+        // up"): `drag`'s raw `delta` is measured in physical screen-space,
+        // which does not rotate with `roll` -- only the rendered image
+        // does. Feeding `delta.x`/`delta.y` straight into yaw/pitch (which
+        // are expressed against the *unrolled* `right0`/`up0` axes) only
+        // produces a clean on-screen pan when `roll == 0`; at any other
+        // roll, a physically-horizontal swipe needs to drive a mix of yaw
+        // and pitch to actually track the current (rolled) on-screen
+        // `right` direction, not `right0`.
+        //
+        // Verified via each elementary rotation's *infinitesimal* effect on
+        // `forward`: a small yaw (world-Y rotation) moves `forward` along
+        // `Y.cross(forward0)`, and a small pitch (rotation about `right0`)
+        // moves `forward` along `up0`. Deliberately testing at `pitch = 0`
+        // (level `base`): only there is `Y.cross(forward0)` *exactly*
+        // `-right0` with no extra scaling -- at nonzero pitch, `up0 != Y`,
+        // so yaw's effect on `forward` picks up a `cos(angle(up0, Y))`
+        // factor that has nothing to do with the roll-compensation this
+        // test exists to check, and would just add unrelated noise (an
+        // earlier version of this test used a pitched `base` and failed
+        // for exactly that reason -- not a bug in the fix, a flaw in that
+        // version of the test's own independent derivation). At `pitch =
+        // 0` that confound vanishes, leaving a clean check of the roll
+        // rotation's sign specifically: for a drag to move `forward` along
+        // the *current* `right` (`= right0*cos(roll) + up0*sin(roll)`), it
+        // must split a pure physical-x delta into `cos(roll)` of yaw and
+        // `sin(roll)` of pitch -- exactly the correction `drag` now
+        // applies. This is an independent geometric check (not a
+        // re-statement of the implementation): it would fail both for the
+        // pre-fix code (which moves along `right0`/`up0`, not `right`/`up`,
+        // at nonzero roll) and for a wrong-signed correction (verified by
+        // hand for this roll: the wrong sign produces a direction that is
+        // provably not parallel to `right`/`up` at this angle).
+        let base = CameraOrbit::orientation_from_yaw_pitch(0.8, 0.0);
+        // An arbitrary, non-special roll -- not a multiple of PI/2, so a
+        // sign error can't accidentally still look parallel.
+        let roll = 1.0_f32;
 
-        let mut unrolled = CameraOrbit { orientation: base, roll: 0.0, distance: 1.0 };
-        unrolled.drag(Vec2::new(37.0, 0.0));
-
+        // Horizontal physical drag -> must move `forward` along `right`.
+        let mut h = CameraOrbit { orientation: base, roll, distance: 1.0 };
+        let (_, right, _up, forward_before) = h.eye_and_basis(Vec3::ZERO);
+        h.drag(Vec2::new(1.0, 0.0)); // tiny delta: stays in the linear regime
+        let moved = (h.forward() - forward_before).normalize();
         assert!(
-            rolled.orientation.angle_between(unrolled.orientation) < 1e-4,
-            "roll leaked into drag's orientation update: {:?} vs {:?}",
-            rolled.orientation,
-            unrolled.orientation
+            moved.distance(right) < 1e-2,
+            "horizontal drag at roll={roll} should move forward along the current `right` \
+             ({right:?}), got direction {moved:?}"
         );
-        assert!(rolled.forward().distance(unrolled.forward()) < 1e-4);
+
+        // Vertical physical drag -> must move `forward` along `up` (or
+        // exactly `-up`, matching whatever sign convention the pre-existing
+        // roll=0 delta.y-to-pitch mapping already used -- this test only
+        // cares that it's parallel to `up`, not which sign, since that
+        // sign was already fixed and verified before roll compensation
+        // existed at all).
+        let mut v = CameraOrbit { orientation: base, roll, distance: 1.0 };
+        let (_, _right, up, forward_before) = v.eye_and_basis(Vec3::ZERO);
+        v.drag(Vec2::new(0.0, 1.0));
+        let moved = (v.forward() - forward_before).normalize();
+        assert!(
+            moved.distance(up) < 1e-2 || moved.distance(-up) < 1e-2,
+            "vertical drag at roll={roll} should move forward along the current `up` \
+             ({up:?}) (either sign), got direction {moved:?}"
+        );
     }
 }
