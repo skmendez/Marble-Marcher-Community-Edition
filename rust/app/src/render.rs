@@ -35,15 +35,17 @@ use bevy::window::PrimaryWindow;
 use marble_csg::codegen::generate_shader;
 use marble_csg::physics::{Marble, PhysicsConfig};
 use marble_csg::scenes::{
-    beware_of_bumps, classic, demo_scene, menger_sphere, menger_sponge, set_fractal_params,
-    set_menger_params, ClassicHandles, MengerHandles,
+    beware_of_bumps, classic, demo_scene, menger_oscillating_sphere, menger_sphere, menger_sponge,
+    set_fractal_params, set_menger_params, ClassicHandles, MengerHandles,
+    MengerOscillatingSphereHandles, MENGER_BITE_MAX_RADIUS, MENGER_BITE_MIN_RADIUS,
 };
 use marble_csg::{Object, Params};
 
 use crate::camera::CameraOrbit;
 use crate::physics_sys::MarbleState;
 
-/// Which scene to build, selected via `MM_SCENE=demo|classic_only|menger_sponge|menger_sphere`.
+/// Which scene to build, selected via
+/// `MM_SCENE=demo|classic_only|menger_sponge|menger_sphere|menger_oscillating_sphere`.
 /// Defaults to `MengerSponge` — this is what actually determines the
 /// deployed web build's default scene, since `std::env::var` always returns
 /// `Err` on wasm32-unknown-unknown (no OS environment in a browser), so
@@ -65,6 +67,14 @@ pub enum SceneKind {
     ClassicOnly,
     MengerSponge,
     MengerSphere,
+    /// [`menger_oscillating_sphere`] — same shape as `MengerSphere`, but the
+    /// bite sphere's radius is a runtime `Param` animated every frame
+    /// (`update_material`) between `MENGER_BITE_MIN_RADIUS` (removes
+    /// nothing) and `MENGER_BITE_MAX_RADIUS` (only the corners survive) —
+    /// a live demo of the CSG tree's existing runtime-uniform support
+    /// (`marble_csg`'s `*Value::Param`/`Params`) animating actual geometry,
+    /// not just a fractal fold's rotation/color/iteration-count.
+    MengerOscillatingSphere,
 }
 
 /// Marble spawn parameters for a scene: start position, radius, kill-plane
@@ -83,6 +93,7 @@ impl SceneKind {
             Ok("demo") => Self::Demo,
             Ok("classic_only") => Self::ClassicOnly,
             Ok("menger_sphere") => Self::MengerSphere,
+            Ok("menger_oscillating_sphere") => Self::MengerOscillatingSphere,
             _ => Self::MengerSponge,
         }
     }
@@ -125,12 +136,18 @@ impl SceneKind {
             // marble spawned outside the structure doesn't need to.
             // `kill_y = -50.0` is a generous "fell way out of the
             // structure" bound for if `G` is toggled to `Rolling` mode
-            // while in one of these scenes.
-            Self::MengerSponge | Self::MengerSphere => MarbleSpawn {
-                start: Vec3::new(3.32, 1.69, 3.22),
-                rad: 0.15,
-                kill_y: -50.0,
-            },
+            // while in one of these scenes. Reused as-is for
+            // `MengerOscillatingSphere`: this spawn point's distance from
+            // the origin (~4.92) stays well clear of even
+            // `MENGER_BITE_MAX_RADIUS` (~3.03), so the marble is never
+            // engulfed by the oscillating bite sphere.
+            Self::MengerSponge | Self::MengerSphere | Self::MengerOscillatingSphere => {
+                MarbleSpawn {
+                    start: Vec3::new(3.32, 1.69, 3.22),
+                    rad: 0.15,
+                    kill_y: -50.0,
+                }
+            }
         }
     }
 }
@@ -144,6 +161,9 @@ pub enum SceneHandles {
     /// toggle on the static display fractals, symmetric to Classic's ang1.
     #[allow(dead_code)]
     Menger(MengerHandles),
+    /// [`SceneKind::MengerOscillatingSphere`]'s handles, read every frame by
+    /// [`update_material`] to animate the bite sphere's radius.
+    MengerOscillatingSphere(MengerOscillatingSphereHandles),
 }
 
 /// Fixed weak handle for the generated ray-marcher shader. A startup system
@@ -310,6 +330,13 @@ impl Material2d for FineMarcherMaterial {
 const MENGER_DEPTH: i32 = 5;
 const MENGER_SPONGE_COLOR: Vec3 = Vec3::new(0.9, 0.65, 0.15);
 const MENGER_SPHERE_COLOR: Vec3 = Vec3::new(0.25, 0.65, 0.9);
+const MENGER_OSCILLATING_SPHERE_COLOR: Vec3 = Vec3::new(0.75, 0.25, 0.85);
+
+/// Full period (seconds) of [`SceneKind::MengerOscillatingSphere`]'s bite
+/// radius oscillation -- tuned by eye for a pace that reads clearly as
+/// "growing, then shrinking" rather than either a barely-visible drift or a
+/// dizzying flicker.
+const MENGER_OSCILLATING_SPHERE_PERIOD_SECS: f32 = 12.0;
 
 /// The CSG scene + its live parameter table, kept around so per-frame systems
 /// can animate params and (M5) run the marble's CPU distance/nearest-point
@@ -394,10 +421,28 @@ pub fn setup(
     // to the Demo scene's own close default -- verified visually to show
     // the marble prominently with the corner as a backdrop, no
     // embedded-camera speckle.
-    let is_menger = matches!(kind, SceneKind::MengerSponge | SceneKind::MengerSphere);
+    let is_menger = matches!(
+        kind,
+        SceneKind::MengerSponge | SceneKind::MengerSphere | SceneKind::MengerOscillatingSphere
+    );
     if is_menger {
         camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35);
-        camera_orbit.distance = 1.2;
+        camera_orbit.distance = if kind == SceneKind::MengerOscillatingSphere {
+            // The other two Menger scenes are static, so `distance = 1.2`'s
+            // tight corner-detail framing (see the doc above) is the right
+            // shot. This scene's entire point is a *global* structural
+            // change -- the center hollowing out while the corners survive
+            // -- which that framing can't show at all: verified visually
+            // (screenshot) that at `distance = 1.2` the same close-up patch
+            // of corner surface renders identically at both bite-radius
+            // extremes, since everything in frame sits well outside even
+            // `MENGER_BITE_MAX_RADIUS`. Pulled back enough to fit the whole
+            // ~6-unit sponge (bounding half-extent `MENGER_BITE_MAX_RADIUS
+            // ~= 3.03`) in frame with margin.
+            9.0
+        } else {
+            1.2
+        };
     }
 
     let (object, handles) = match kind {
@@ -438,6 +483,21 @@ pub fn setup(
             let (object, menger_handles) = menger_sphere(&mut params);
             set_menger_params(&mut params, &menger_handles, MENGER_DEPTH, MENGER_SPHERE_COLOR);
             (object, SceneHandles::Menger(menger_handles))
+        }
+        SceneKind::MengerOscillatingSphere => {
+            let (object, osc_handles) = menger_oscillating_sphere(&mut params);
+            set_menger_params(
+                &mut params,
+                &osc_handles.menger,
+                MENGER_DEPTH,
+                MENGER_OSCILLATING_SPHERE_COLOR,
+            );
+            // `update_material` overwrites this every frame; the initial
+            // value just needs to match what it computes at t=0
+            // (MENGER_BITE_MIN_RADIUS) so the very first rendered frame,
+            // before that system has run, isn't briefly wrong.
+            params.set_scalar(osc_handles.radius, MENGER_BITE_MIN_RADIUS);
+            (object, SceneHandles::MengerOscillatingSphere(osc_handles))
         }
     };
 
@@ -566,6 +626,27 @@ pub fn update_material(
             if let Some(buffer) = storage_buffers.get_mut(&scene_state.params_buffer) {
                 buffer.set_data(scene_state.params.slots().to_vec());
             }
+        }
+    }
+
+    // `MengerOscillatingSphere`'s bite-sphere radius: always animated (not
+    // gated behind `animate_fractal()` like `ang1` above) -- unlike Demo's
+    // level, this scene's marble spawns well outside the sponge entirely
+    // (`SceneKind::spawn_params`), so there's no strut for a moving fractal
+    // boundary to pull out from under it; the whole point of this scene is
+    // showing the CSG tree's runtime-uniform support animating live.
+    // Smoothly oscillates MENGER_BITE_MIN_RADIUS (removes nothing) up to
+    // MENGER_BITE_MAX_RADIUS (only the corners survive) and back, starting
+    // exactly at the minimum at t=0 (`cos(0) = 1`, matching `setup`'s
+    // initial value so the very first frame isn't already mid-cycle).
+    if let SceneHandles::MengerOscillatingSphere(handles) = &scene_state.handles {
+        let handles = *handles;
+        let omega = std::f32::consts::TAU / MENGER_OSCILLATING_SPHERE_PERIOD_SECS;
+        let radius = MENGER_BITE_MIN_RADIUS
+            + (MENGER_BITE_MAX_RADIUS - MENGER_BITE_MIN_RADIUS) * 0.5 * (1.0 - (t * omega).cos());
+        scene_state.params.set_scalar(handles.radius, radius);
+        if let Some(buffer) = storage_buffers.get_mut(&scene_state.params_buffer) {
+            buffer.set_data(scene_state.params.slots().to_vec());
         }
     }
 

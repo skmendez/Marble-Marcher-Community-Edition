@@ -1205,6 +1205,17 @@ struct VertexOutput {
     }
 
     #[test]
+    fn menger_oscillating_sphere_shader_validates() {
+        // Also the first naga coverage of `Object::Difference` specifically
+        // (`demo_scene`/`nested_union`/`nested_repeat` above only exercise
+        // `Union`/`Intersect`) -- this scene's tree is `Difference(Fractal,
+        // Sphere{radius: Param})`, same shape as the existing `menger_sphere`.
+        let mut params = Params::new();
+        let (obj, _handles) = scenes::menger_oscillating_sphere(&mut params);
+        validate_wgsl(&full_source(&obj));
+    }
+
+    #[test]
     fn nested_repeat_validates() {
         // Regression test for the C++ FoldRepeat::GLSL bug: a function-static
         // depth counter for the loop variable name, which is wrong for a
