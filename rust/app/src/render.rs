@@ -26,7 +26,10 @@
 use bevy::asset::weak_handle;
 use bevy::image::Image;
 use bevy::prelude::*;
-use bevy::render::render_resource::{AsBindGroup, ShaderRef};
+use bevy::render::render_resource::{
+    AsBindGroup, Extent3d, ShaderRef, TextureDimension, TextureFormat, TextureViewDescriptor,
+    TextureViewDimension,
+};
 use bevy::render::storage::ShaderStorageBuffer;
 use bevy::sprite::Material2d;
 use bevy::ui::IsDefaultUiCamera;
@@ -300,12 +303,140 @@ pub struct FineMarcherMaterial {
     pub shadow: Handle<Image>,
     #[storage(4, read_only)]
     pub marbles: Handle<ShaderStorageBuffer>,
+    /// The marble's cubemap texture (`MarbleCubemap`'s doc) -- unlike
+    /// `coarse`/`shadow` this genuinely needs a paired `#[sampler]`: the
+    /// shader samples it with `textureSample` (a filtered, direction-vector
+    /// lookup), not `textureLoad`, so a real sampler binding is required,
+    /// not optional (`marble_csg::codegen::MARBLE_TEXTURE_BINDING`'s doc).
+    #[texture(5, dimension = "cube")]
+    #[sampler(6)]
+    pub marble_texture: Handle<Image>,
 }
 
 impl Material2d for FineMarcherMaterial {
     fn fragment_shader() -> ShaderRef {
         MARCHER_SHADER_HANDLE.into()
     }
+}
+
+/// A minimal (1x1 per face) placeholder cube texture, already correctly
+/// `Cube`-dimensioned -- used as `marble_texture`'s initial value in `setup`
+/// while the real `marble_cubemap.png` is still loading. `Handle::default()`
+/// (what `coarse`/`shadow` use for their own startup placeholders) is *not*
+/// substitutable here: it resolves to Bevy's generic placeholder image,
+/// which is a plain 1x1 **2D** texture -- dimensionally incompatible with a
+/// binding declared `dimension = "cube"` (confirmed live: wgpu rejects the
+/// bind group with "Dimension (e2D) ... doesn't match the expected
+/// dimension (Cube)" the moment that mismatch is actually bound). `coarse`/
+/// `shadow` get away with the generic default only because their own
+/// bindings don't override the dimension at all (plain `texture_2d<f32>`),
+/// so a plain-2D placeholder is exactly what they expect.
+fn make_placeholder_cubemap() -> Image {
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 6,
+        },
+        TextureDimension::D2,
+        &[255, 255, 255, 255],
+        TextureFormat::Rgba8UnormSrgb,
+        bevy::asset::RenderAssetUsages::default(),
+    );
+    image.texture_view_descriptor = Some(TextureViewDescriptor {
+        dimension: Some(TextureViewDimension::Cube),
+        ..default()
+    });
+    image
+}
+
+/// The marble's cubemap texture: loaded from `assets/marble_cubemap.png`, a
+/// vertical strip of 6 square faces in `+X, -X, +Y, -Y, +Z, -Z` order --
+/// exactly wgpu/WebGPU's own cube-array layer order, so treating the 6
+/// stacked regions as sequential array layers (below) needs no manual face
+/// remapping.
+///
+/// `AssetServer::load` returns a usable-immediately `Handle<Image>`, but the
+/// actual pixel data doesn't exist until it finishes loading asynchronously
+/// (a local file read natively, an HTTP fetch on wasm) -- so `setup` can't
+/// build the final cube-shaped image in the same frame it starts the load.
+/// `finalize_marble_cubemap` (`Update`) does that the first frame the data
+/// actually exists, gated by `done` so it only ever runs once.
+///
+/// `loading: Handle<Image>` is the raw 2D-strip asset from `AssetServer::load`
+/// -- never bound to any material, never rendered, exists only so
+/// `finalize_marble_cubemap` has something to poll for "has the PNG finished
+/// downloading/decoding yet." The *real*, cube-shaped image the shader
+/// actually samples is a **separate** `Image` built fresh once that data
+/// exists (see that fn's doc for why this indirection is load-bearing, not
+/// incidental complexity).
+#[derive(Resource)]
+pub(crate) struct MarbleCubemap {
+    loading: Handle<Image>,
+    done: bool,
+}
+
+/// `Update` system: the other half of `MarbleCubemap`'s doc. Once the PNG's
+/// pixel data actually exists, this builds a **new** `Image` already
+/// correctly cube-shaped from that data and redirects
+/// [`FineMarcherMaterial::marble_texture`] to it.
+///
+/// This is deliberate, not incidental: an earlier version of this function
+/// instead reinterpreted `MarbleCubemap::loading`'s own `Image` in place
+/// (`Image::reinterpret_stacked_2d_as_array` plus overriding
+/// `texture_view_descriptor`), and that broke production (commit `86ebb1d`,
+/// reverted in `d5785ed`). Chrome's real WebGPU implementation rejected the
+/// generated shader module outright at `CreateRenderPipeline` time, even
+/// though naga's own offline parse+validate considered it fully valid.
+/// Root-caused via a live diagnostic build: the render pipeline is already
+/// created (against `FallbackImage::cube`, a real, correctly-dimensioned
+/// fallback Bevy provides for exactly this still-loading-handle window) for
+/// the several frames before the PNG finishes loading. The crash appeared
+/// immediately after mutating the already-bound, already-extracted
+/// `loading` image's dimension in place from 2D to a 6-layer cube — the
+/// same "mutating an actively-bound `Image` corrupts rendering" bug class
+/// this codebase already hit and fixed twice before
+/// (`mrrm::resize_coarse_render_target`, `shadow_pass::resize_shadow_render_target`,
+/// both of which build a new `Image` and redirect handles rather than
+/// resize in place, for the same underlying reason). Building an entirely
+/// separate, never-previously-bound `Image` here avoids ever presenting
+/// Bevy's render extraction with a resource that changes shape after it's
+/// already live, exactly like those two fixes.
+pub fn finalize_marble_cubemap(
+    mut cubemap: ResMut<MarbleCubemap>,
+    mut images: ResMut<Assets<Image>>,
+    fine_quads: Query<&MeshMaterial2d<FineMarcherMaterial>, With<MarcherQuad>>,
+    mut fine_materials: ResMut<Assets<FineMarcherMaterial>>,
+) {
+    if cubemap.done {
+        return;
+    }
+    let Some(loaded) = images.get(&cubemap.loading) else {
+        return;
+    };
+
+    let mut cube_image = loaded.clone();
+    cube_image.reinterpret_stacked_2d_as_array(6);
+    cube_image.texture_view_descriptor = Some(TextureViewDescriptor {
+        dimension: Some(TextureViewDimension::Cube),
+        ..default()
+    });
+    let cube_handle = images.add(cube_image);
+
+    for fine_quad in &fine_quads {
+        if let Some(mat) = fine_materials.get_mut(&fine_quad.0) {
+            mat.marble_texture = cube_handle.clone();
+        }
+    }
+
+    // The raw 2D-strip loading handle is never bound to anything and never
+    // will be again -- drop it now rather than leaking it for the rest of
+    // the session. `cubemap.done` (not removing the resource entirely) is
+    // what stops this system doing any of this a second time -- `main.rs`
+    // schedules it unconditionally every frame, so removing the resource
+    // outright would panic the next time it runs.
+    images.remove(&cubemap.loading);
+    cubemap.done = true;
 }
 
 /// Default depth/color for the two static display fractals ([`SceneKind::MengerSponge`]/
@@ -407,6 +538,7 @@ fn pack_marbles(marbles: &[Marble]) -> Vec<Vec4> {
 /// Startup system: builds the selected scene ([`SceneKind::from_config`]),
 /// generates its WGSL, and spawns the fullscreen quad that renders it
 /// (DESIGN.md §8).
+#[allow(clippy::too_many_arguments)]
 pub fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -414,6 +546,8 @@ pub fn setup(
     mut shaders: ResMut<Assets<Shader>>,
     mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
     mut camera_orbit: ResMut<CameraOrbit>,
+    asset_server: Res<AssetServer>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     let kind = SceneKind::from_config();
     let mut params = Params::new();
@@ -568,14 +702,24 @@ pub fn setup(
     // run after this one) correct them to the real render targets once
     // those `Image`s exist. Every Startup system finishes before the first
     // frame is ever rendered, so these placeholders are never actually read
-    // by the GPU.
+    // by the GPU. `marble_texture` gets exactly the same placeholder
+    // treatment, for the same reason -- `finalize_marble_cubemap` (`Update`)
+    // redirects it to a freshly-built, already-cube-shaped `Image` once the
+    // PNG finishes loading (see that fn's doc for why it builds a *new*
+    // `Image` rather than reinterpreting the loading handle's own image in
+    // place: binding the raw loading handle here directly, even as a
+    // temporary stand-in, hits the exact same "already-bound `Image` that
+    // later changes shape" issue that broke production once already).
+    let marble_cubemap_handle: Handle<Image> = asset_server.load("marble_cubemap.png");
     let material = materials.add(FineMarcherMaterial {
         scene: SceneUniforms::default(),
         params: params_buffer.clone(),
         coarse: Handle::default(),
         shadow: Handle::default(),
         marbles: marbles_buffer.clone(),
+        marble_texture: images.add(make_placeholder_cubemap()),
     });
+    commands.insert_resource(MarbleCubemap { loading: marble_cubemap_handle, done: false });
 
     // Renders straight to the primary window (no adaptive-resolution
     // render-to-texture indirection -- removed after it turned out to cause

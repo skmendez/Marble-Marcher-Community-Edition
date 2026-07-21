@@ -65,6 +65,13 @@ jobs:
           mkdir -p dist
           cp rust/web/index.html dist/
           cp rust/web/net.js dist/
+          # Image assets (e.g. the marble's cubemap texture): Bevy's
+          # AssetPlugin fetches these via HTTP relative to the served page
+          # on wasm, they are not bundled into the wasm binary by cargo --
+          # `rust/app/assets/` is the source of truth, native builds find it
+          # directly, this copy is what makes it reachable on the deployed
+          # site at all.
+          cp -r rust/app/assets dist/assets
           wasm-bindgen --no-typescript --target web \
             --out-dir dist --out-name marble-marcher \
             rust/target/wasm32-unknown-unknown/release/marble-marcher-bevy.wasm
