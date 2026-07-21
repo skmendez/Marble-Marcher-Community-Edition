@@ -52,19 +52,25 @@ const SHADOW_LAYER: usize = 3;
 /// shader-config doc calls half resolution the standard case.
 const SHADOW_SCALE_DIVISOR: u32 = 2;
 
-/// `MM_SHADOW_LOD=0` disables the fine pass's use of this module's cached
-/// shadow value (falls back to marching a fresh shadow ray per full-res
-/// pixel, i.e. exactly the pre-this-change behavior) -- a per-frame
-/// *shader* toggle (`SceneUniforms::misc2.y`, written by
-/// `render::update_material`), not an entity/system-level one, for the same
-/// A/B-comparability reason as `mrrm::mrrm_enabled`'s doc: every frame's
-/// cameras/passes are identical whether this is on or off, so an
-/// `MM_SHADOW_LOD=0` vs `=1` screenshot comparison at a fixed camera state
-/// only ever differs in this one value. `std::env::var` always errors on
-/// wasm32-unknown-unknown, so this has no effect (shadow LOD always on) in
-/// the deployed web build.
+/// `?shadowlod=0` (web) / `MM_SHADOW_LOD=0` (native) disables the fine
+/// pass's use of this module's cached shadow value (falls back to marching
+/// a fresh shadow ray per full-res pixel, i.e. exactly the pre-this-change
+/// behavior) -- a per-frame *shader* toggle (`SceneUniforms::misc2.y`,
+/// written by `render::update_material`), not an entity/system-level one,
+/// for the same A/B-comparability reason as `mrrm::mrrm_enabled`'s doc:
+/// every frame's cameras/passes are identical whether this is on or off, so
+/// an `?shadowlod=0` vs `=1` screenshot comparison at a fixed camera state
+/// only ever differs in this one value. Matches `mrrm_enabled`'s
+/// query-param-then-env-var layering -- this now actually has an effect on
+/// the deployed web build, not just native. Cached in a `OnceLock` rather
+/// than re-parsing the URL every frame.
 pub fn shadow_lod_enabled() -> bool {
-    std::env::var("MM_SHADOW_LOD").as_deref() != Ok("0")
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value =
+            crate::web_config::query_param("shadowlod").or_else(|| std::env::var("MM_SHADOW_LOD").ok());
+        value.as_deref() != Some("0")
+    })
 }
 
 /// Rounds the window's current physical pixel size down by
@@ -304,7 +310,28 @@ pub fn sync_shadow_quad_scale(
 /// bounding sphere (`ray_sphere_clip`'s pre-test, same value every pass
 /// writes -- `SceneState::bounding_sphere`'s doc).
 #[allow(clippy::too_many_arguments)]
+/// Thin timing wrapper -- see `fps_overlay::PhaseTimings`'s doc for exactly
+/// what this measures (CPU-side uniform computation, not GPU execution).
 pub fn update_shadow_material(
+    time: Res<Time>,
+    orbit: Res<CameraOrbit>,
+    marble_state: Res<MarbleState>,
+    scene_state: Res<SceneState>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    shadow_render_target: Res<ShadowRenderTarget>,
+    quads: Query<&MeshMaterial2d<ShadowMarcherMaterial>, With<ShadowQuad>>,
+    materials: ResMut<Assets<ShadowMarcherMaterial>>,
+    mut timings: ResMut<crate::fps_overlay::PhaseTimings>,
+) {
+    let start = std::time::Instant::now();
+    update_shadow_material_impl(
+        time, orbit, marble_state, scene_state, windows, shadow_render_target, quads, materials,
+    );
+    timings.record("shadow", start.elapsed());
+}
+
+#[allow(clippy::too_many_arguments)] // SystemParam count, unchanged from before the timing wrapper split
+fn update_shadow_material_impl(
     time: Res<Time>,
     orbit: Res<CameraOrbit>,
     marble_state: Res<MarbleState>,
