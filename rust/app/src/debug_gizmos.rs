@@ -116,7 +116,7 @@ pub fn draw_thrust_debug(
     let window_size = Vec2::new(window.width(), window.height());
     let aspect = window_size.x / window_size.y.max(1.0);
 
-    let marble = marble_state.marble;
+    let marble = marble_state.local_marble();
     let (eye, right, up, forward) = orbit.eye_and_basis(marble.pos);
 
     // The marble is always exactly at screen center by construction (module

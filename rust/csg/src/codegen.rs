@@ -267,7 +267,6 @@ struct SceneUniforms {
     cam_right: vec4<f32>,
     cam_up: vec4<f32>,
     cam_forward: vec4<f32>,
-    marble: vec4<f32>,
     sun: vec4<f32>,
     sun_col: vec4<f32>,
     bg_col: vec4<f32>,
@@ -382,6 +381,20 @@ const COARSE_TEXTURE_BINDING: &str = "\
 /// `COARSE_TEXTURE_BINDING`.
 const SHADOW_TEXTURE_BINDING: &str = "\
 @group(2) @binding(3) var shadow_tex: texture_2d<f32>;
+";
+
+/// The fine pass's extra binding for the live marble list (multiplayer
+/// milestone 0): one `vec4<f32>` per marble (`xyz = center, w = radius`,
+/// `w <= 0.0` meaning "inactive/hidden", same convention the old single
+/// `scene.marble` uniform used), mirroring `BINDINGS`'s own
+/// `params: array<vec4<f32>>` storage binding rather than a fixed-size
+/// uniform array (sidesteps WGSL's uniform-array padding/alignment rules
+/// entirely, and `arrayLength(&marbles)` gives the fragment shader the
+/// active count for free with no separate count field to keep in sync).
+/// Only the fine pass reads it -- `COARSE_MARCHER`/`SHADOW_MARCHER` skip all
+/// shading (including the marble reflection), so neither needs this.
+const MARBLE_BUFFER_BINDING: &str = "\
+@group(2) @binding(4) var<storage, read> marbles: array<vec4<f32>>;
 ";
 
 /// The over-relaxed march loop + its supporting constants, shared verbatim
@@ -723,6 +736,20 @@ fn shadow(ro: vec3<f32>, rd: vec3<f32>, pixel_angle: f32) -> f32 {
 /// [`generate_shader`]. Kept deliberately simple (v1 — DESIGN.md §5); will
 /// grow toward MMCE's quality (fog, glow, GI) later.
 const MARCHER: &str = "\
+// A small fixed palette so multiple marbles read as visibly distinct
+// bodies (not player *identity* -- just enough to tell them apart while
+// verifying/playing) -- cycles via modulo for player counts beyond the
+// palette size.
+fn marble_color(idx: u32) -> vec3<f32> {
+    let palette = array<vec3<f32>, 4>(
+        vec3<f32>(0.95, 0.08, 0.05),
+        vec3<f32>(0.10, 0.55, 0.95),
+        vec3<f32>(0.15, 0.85, 0.25),
+        vec3<f32>(0.95, 0.75, 0.05),
+    );
+    return palette[idx % 4u];
+}
+
 fn sphere_hit(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, r: f32) -> f32 {
     let oc = ro - center;
     let b = dot(oc, rd);
@@ -820,9 +847,23 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     let half_fov = atan(1.0 / scene.cam_forward.w);
     let pixel_angle = 2.0 * half_fov / max(scene.misc.z, 1.0);
 
+    // Nearest hit among every active marble (multiplayer milestone 0: N
+    // marbles instead of one, `marbles` storage buffer -- `MARBLE_BUFFER_BINDING`'s
+    // doc). `arrayLength` gives the live count with no separate uniform
+    // field to keep in sync. Inactive slots (`w <= 0.0`) are skipped, same
+    // \"hidden\" convention the old single-marble uniform used.
     var marble_t = -1.0;
-    if (scene.marble.w > 0.0) {
-        marble_t = sphere_hit(ro, rd, scene.marble.xyz, scene.marble.w);
+    var marble_idx = 0u;
+    let marble_count = arrayLength(&marbles);
+    for (var mi = 0u; mi < marble_count; mi++) {
+        let m = marbles[mi];
+        if (m.w > 0.0) {
+            let mt = sphere_hit(ro, rd, m.xyz, m.w);
+            if (mt > 0.0 && (marble_t < 0.0 || mt < marble_t)) {
+                marble_t = mt;
+                marble_idx = mi;
+            }
+        }
     }
 
     // Ray-vs-bounding-sphere pre-test (`marble_csg::Object::bounding_sphere`,
@@ -883,8 +924,9 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     let marble_hit = marble_t > 0.0 && (!hit_frac || marble_t < t);
 
     if (marble_hit) {
+        let hit_marble = marbles[marble_idx];
         let mp = ro + rd * marble_t;
-        let mn = normalize(mp - scene.marble.xyz);
+        let mn = normalize(mp - hit_marble.xyz);
         let refl = reflect(rd, mn);
         let fresnel = pow(1.0 - max(dot(-rd, mn), 0.0), 5.0);
         // A distinct, saturated base color (not just a sky-reflecting mirror)
@@ -895,8 +937,10 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         // rendering a close-up: shape/position/tangency were all correct,
         // only the color read wrong) -- an additive, fresnel-gated rim
         // highlight keeps the base color dominant everywhere except a thin
-        // bright rim at grazing angles.
-        let base_col = vec3<f32>(0.95, 0.08, 0.05);
+        // bright rim at grazing angles. `marble_color(marble_idx)` (not a
+        // single fixed color): multiple marbles need to read as visibly
+        // distinct bodies, not indistinguishable clones.
+        let base_col = marble_color(marble_idx);
         let ambient = 0.3;
         let diffuse = max(dot(mn, scene.sun.xyz), 0.0);
         let shaded = base_col * (ambient + (1.0 - ambient) * diffuse);
@@ -1016,6 +1060,8 @@ pub fn generate_shader(obj: &Object) -> String {
     s.push_str(COARSE_TEXTURE_BINDING);
     s.push('\n');
     s.push_str(SHADOW_TEXTURE_BINDING);
+    s.push('\n');
+    s.push_str(MARBLE_BUFFER_BINDING);
     s.push('\n');
     s.push_str(&generate_scene_functions(obj));
     s.push_str("\n\n");
@@ -1338,6 +1384,21 @@ struct VertexOutput {
         let c = generate_scene_functions(&obj);
         let d = generate_scene_functions(&obj);
         assert_eq!(c, d);
+    }
+
+    #[test]
+    fn fine_shader_has_marble_buffer_binding_but_coarse_and_shadow_do_not() {
+        // Multiplayer milestone 0: only the fine pass shades/reflects
+        // marbles (`MARBLE_BUFFER_BINDING`'s doc) -- the coarse and shadow
+        // passes skip all shading, so referencing this binding there would
+        // be a real bind-group-layout mismatch (`CoarseMarcherMaterial`/
+        // `ShadowMarcherMaterial` have no such binding), same risk class as
+        // `coarse_shader_has_no_coarse_texture_binding` below.
+        let mut params = Params::new();
+        let (obj, _handles) = scenes::demo_scene(&mut params);
+        assert!(generate_shader(&obj).contains("var<storage, read> marbles"));
+        assert!(!generate_coarse_shader(&obj).contains("marbles"));
+        assert!(!generate_shadow_shader(&obj).contains("marbles"));
     }
 
     #[test]

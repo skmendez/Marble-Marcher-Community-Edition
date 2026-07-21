@@ -40,32 +40,54 @@
 use bevy::input::touch::Touches;
 use bevy::prelude::*;
 
-use marble_csg::physics::{step_marble, GravityMode, Marble, PhysicsConfig};
+use marble_csg::physics::{step_marbles, GravityMode, Marble, PhysicsConfig, PlayerInput};
 
 use crate::camera::CameraOrbit;
 use crate::render::SceneState;
 use crate::touch::read_two_finger_gesture;
 
-/// The marble's live physics state + tuning constants, plus the current
-/// scene's spawn point and kill-plane height (used for `R`/kill-plane
-/// respawns — every scene has different values now that all scenes have a
-/// marble, see `SceneKind::spawn_params`, so these can no longer be a fixed
-/// constant read directly from `physics_sys.rs`). Constructed per-scene in
-/// `render::setup` (there's no scene-independent `Default` to speak of).
+/// N marbles' live physics state + shared tuning constants, plus each
+/// marble's spawn point and the scene's shared kill-plane height (used for
+/// `R`/kill-plane respawns — every scene has different values now that all
+/// scenes have a marble, see `SceneKind::spawn_params`, so these can no
+/// longer be a fixed constant read directly from `physics_sys.rs`).
+/// Constructed per-scene in `render::setup` (there's no scene-independent
+/// `Default` to speak of).
+///
+/// Multiplayer milestone 0: was a single `Marble` before this — `marbles`/
+/// `start_positions` are parallel `Vec`s (same index = same marble,
+/// [`step_marbles`]'s own convention) rather than a `HashMap` keyed by some
+/// player id, since stable index order is what determinism (a future
+/// rollback engine's whole point) depends on.
 #[derive(Resource)]
 pub struct MarbleState {
-    pub marble: Marble,
+    pub marbles: Vec<Marble>,
     pub cfg: PhysicsConfig,
-    pub start_pos: Vec3,
+    pub start_positions: Vec<Vec3>,
     pub kill_y: f32,
+    /// Which `marbles` index this client controls/watches -- always `0`
+    /// today (no networking exists yet), named for milestone 2's benefit
+    /// rather than assumed to always be zero everywhere it's read.
+    pub local_player_index: usize,
+}
+
+impl MarbleState {
+    /// The marble this client controls/watches -- what the camera follows,
+    /// what WASD/touch input drives, what `R` respawns.
+    pub fn local_marble(&self) -> Marble {
+        self.marbles[self.local_player_index]
+    }
 }
 
 /// One 60 Hz physics tick (`FixedUpdate`): reads WASD + a 2-finger pinch
-/// (additive — see module doc) + the orbit camera's yaw/pitch, steps the
-/// marble against the live CSG scene tree, lets `R` force an immediate
-/// manual respawn, and `G` toggle [`GravityMode`]. A no-op for scenes
-/// without a real marble (`SceneKind::has_marble` — the static display
-/// fractals, not the tuned demo level).
+/// (additive — see module doc) + the orbit camera's orientation, steps every
+/// marble against the live CSG scene tree (`step_marbles`, resolving
+/// marble-vs-marble collision along the way), lets `R` force an immediate
+/// manual respawn of the *local* marble, and `G` toggle [`GravityMode`] for
+/// everyone (there's only one shared `cfg` — per-player physics config isn't
+/// a thing this milestone needs). A no-op for scenes without a real marble
+/// (`SceneKind::has_marble` — the static display fractals, not the tuned
+/// demo level).
 pub fn marble_physics_tick(
     keys: Res<ButtonInput<KeyCode>>,
     touches: Res<Touches>,
@@ -85,8 +107,9 @@ pub fn marble_physics_tick(
     }
 
     if keys.just_pressed(KeyCode::KeyR) {
-        let start = marble_state.start_pos;
-        marble_state.marble.respawn(start);
+        let idx = marble_state.local_player_index;
+        let start = marble_state.start_positions[idx];
+        marble_state.marbles[idx].respawn(start);
         return;
     }
 
@@ -108,32 +131,39 @@ pub fn marble_physics_tick(
         dy += gesture.pinch_dy;
     }
 
-    // `step_marble` (marble_csg, a pure-logic crate with no bevy
-    // dependency) takes the camera's actual forward/right basis vectors
-    // directly, rather than re-deriving an approximation via a second,
+    // `PlayerInput.orientation` carries the camera's actual current
+    // orientation, not `dx`/`dy` re-derived from it via a second,
     // independently-written yaw/pitch trig formula that would have to
     // happen to agree in sign convention with `CameraOrbit`'s own — an
-    // earlier version did exactly that and got the sign wrong (see
-    // `step_marble`'s doc). Both come straight from `eye_and_basis`: the
-    // arcball camera (`camera.rs`) folds twist directly into `orientation`
-    // now, so there's no separate "roll-free" right vector to carve out
-    // any more — A/D strafe tracks the same current screen-right that's
-    // actually rendered, same as W/S already tracked `forward` (never
-    // twist-dependent in any version of this camera).
-    let (_, cam_right, _, cam_forward) = orbit.eye_and_basis(marble_state.marble.pos);
+    // earlier version of the old single-marble call site did exactly that
+    // and got the sign wrong (see `marble_csg::physics::step_marbles`'s
+    // doc). `step_marbles` derives `cam_forward`/`cam_right` from it
+    // directly (`PlayerInput::cam_basis`), the same math `CameraOrbit`
+    // itself uses (`orientation * Vec3::NEG_Z` / `orientation * Vec3::X`).
+    //
+    // Every marble gets *some* `PlayerInput` this tick, since `step_marbles`
+    // needs one per marble — the local player's is built from real input
+    // above; every other marble gets a placeholder zero-input one (they just
+    // sit under gravity/collision) until milestone 2's real networking
+    // supplies a real one per remote player.
+    let local_idx = marble_state.local_player_index;
+    let inputs: Vec<PlayerInput> = (0..marble_state.marbles.len())
+        .map(|i| PlayerInput {
+            dx: if i == local_idx { dx } else { 0.0 },
+            dy: if i == local_idx { dy } else { 0.0 },
+            orientation: orbit.orientation,
+        })
+        .collect();
 
     let kill_y = marble_state.kill_y;
-    let start = marble_state.start_pos;
-    let MarbleState { marble, cfg, .. } = &mut *marble_state;
-    let _event = step_marble(
-        marble,
+    let MarbleState { marbles, cfg, start_positions, .. } = &mut *marble_state;
+    let _events = step_marbles(
+        marbles,
+        &inputs,
         &scene.object,
         &scene.params,
-        Vec2::new(dx, dy),
-        cam_forward,
-        cam_right,
         cfg,
         kill_y,
-        start,
+        start_positions,
     );
 }

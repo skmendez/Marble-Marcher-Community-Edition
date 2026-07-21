@@ -79,7 +79,7 @@ impl Plugin for FpsOverlayPlugin {
             .init_resource::<DebugTwistAccum>()
             .add_systems(Startup, spawn_fps_overlay)
             .add_systems(Update, (record_frame_time, update_fps_text).chain())
-            .add_systems(Update, update_orbit_debug_text);
+            .add_systems(Update, (update_orbit_debug_text, update_marbles_debug_text));
     }
 }
 
@@ -146,6 +146,18 @@ struct FpsText;
 #[derive(Component)]
 struct OrbitDebugText;
 
+/// Marker for the `Text` entity showing every marble's live state
+/// (multiplayer milestone 0) -- exact positions/velocities are what let a
+/// live build's marble-vs-marble collision be verified precisely (are they
+/// actually separating, actually bouncing) instead of squinting at
+/// screenshots for spheres that can be a few hundredths of a world unit
+/// across. Worth keeping past this milestone's own verification too: a
+/// future rollback engine (milestone 1) and real networking (milestone 2)
+/// will keep needing exactly this kind of visibility into every marble's
+/// state, not just the local player's.
+#[derive(Component)]
+struct MarblesDebugText;
+
 fn spawn_fps_overlay(mut commands: Commands) {
     commands
         .spawn((
@@ -181,6 +193,15 @@ fn spawn_fps_overlay(mut commands: Commands) {
                 TextColor(Color::srgb(0.6, 0.9, 1.0)),
                 OrbitDebugText,
             ));
+            parent.spawn((
+                Text::new("marbles: --"),
+                TextFont {
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(1.0, 0.75, 0.4)),
+                MarblesDebugText,
+            ));
         });
 }
 
@@ -214,6 +235,31 @@ fn update_orbit_debug_text(
         f.y,
         f.z
     );
+}
+
+/// See [`MarblesDebugText`]'s doc for why this exists. One line per marble:
+/// index, position, and speed (`|vel|`, not the full vector -- position is
+/// what matters for "are they separated," speed for "did collision actually
+/// impart an impulse, or is it just sitting still").
+fn update_marbles_debug_text(
+    marble_state: Res<crate::physics_sys::MarbleState>,
+    mut text: Query<&mut Text, With<MarblesDebugText>>,
+) {
+    let Ok(mut text) = text.single_mut() else {
+        return;
+    };
+    let mut lines = vec![format!("marbles: {}", marble_state.marbles.len())];
+    for (i, m) in marble_state.marbles.iter().enumerate() {
+        let marker = if i == marble_state.local_player_index { "*" } else { " " };
+        lines.push(format!(
+            "{marker}{i}: ({:.3}, {:.3}, {:.3}) |vel|={:.4}",
+            m.pos.x,
+            m.pos.y,
+            m.pos.z,
+            m.vel.length()
+        ));
+    }
+    text.0 = lines.join("\n");
 }
 
 fn update_fps_text(window: Res<FrameTimeWindow>, mut text: Query<&mut Text, With<FpsText>>) {

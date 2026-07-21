@@ -194,7 +194,10 @@ mod scene_uniforms_impl {
     use bevy::render::render_resource::ShaderType;
 
     /// Field-for-field match of the WGSL `SceneUniforms` struct emitted by
-    /// `marble_csg::codegen` (DESIGN.md §5) — eleven `vec4<f32>`s, same order.
+    /// `marble_csg::codegen` (DESIGN.md §5) — ten `vec4<f32>`s, same order.
+    /// The marble list moved out to its own storage buffer (multiplayer
+    /// milestone 0, `FineMarcherMaterial::marbles`/`MARBLE_BUFFER_BINDING`'s
+    /// doc) -- N marbles don't fit a fixed uniform field the way one did.
     #[derive(Clone, Copy, Debug, ShaderType)]
     pub struct SceneUniforms {
         /// xyz eye position.
@@ -205,8 +208,6 @@ mod scene_uniforms_impl {
         pub cam_up: Vec4,
         /// xyz unit forward, w = focal length (1 / tan(fov/2)).
         pub cam_forward: Vec4,
-        /// xyz center, w radius (r <= 0 -> hidden). Unused until M5.
-        pub marble: Vec4,
         /// xyz unit direction toward the sun.
         pub sun: Vec4,
         /// rgb.
@@ -247,7 +248,6 @@ mod scene_uniforms_impl {
                 cam_right: Vec4::X,
                 cam_up: Vec4::Y,
                 cam_forward: Vec4::new(0.0, 0.0, -1.0, 1.5),
-                marble: Vec4::ZERO,
                 sun: Vec4::new(0.0, 1.0, 0.0, 0.0),
                 sun_col: Vec4::ONE,
                 bg_col: Vec4::ONE,
@@ -275,16 +275,19 @@ pub struct MarcherCamera;
 pub struct MarcherQuad;
 
 /// The fine (full-resolution) marcher's material. Two bindings unchanged
-/// from pre-MRRM (`scene`/`params`), plus the MRRM coarse pre-pass's cached
+/// from pre-MRRM (`scene`/`params`), the MRRM coarse pre-pass's cached
 /// hit-distance render target (`mrrm.rs`) and the half-resolution shadow/AO
 /// pass's cached visibility (`shadow_pass.rs`) as a third and fourth -- no
 /// paired `#[sampler]` bindings: the generated shader only ever reads these
 /// textures with `textureLoad` (exact texel; `sample_shadow` does its own
 /// hand-rolled depth-aware 4-tap blend for the shadow one), never
-/// `textureSample`, so no sampler is needed at all. See
-/// `marble_csg::codegen::COARSE_TEXTURE_BINDING`'s doc for a known,
-/// environment-specific (llvmpipe-only) crash this exact data flow triggers
-/// in this project's native test sandbox -- not a bug in this binding/shader.
+/// `textureSample`, so no sampler is needed at all -- and a fifth, the live
+/// marble list (multiplayer milestone 0, `marble_csg::codegen::MARBLE_BUFFER_BINDING`),
+/// mirroring `params`' own storage-buffer pattern rather than a fixed-size
+/// uniform array. See `marble_csg::codegen::COARSE_TEXTURE_BINDING`'s doc
+/// for a known, environment-specific (llvmpipe-only) crash this exact data
+/// flow triggers in this project's native test sandbox -- not a bug in this
+/// binding/shader.
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
 pub struct FineMarcherMaterial {
     #[uniform(0)]
@@ -295,6 +298,8 @@ pub struct FineMarcherMaterial {
     pub coarse: Handle<Image>,
     #[texture(3)]
     pub shadow: Handle<Image>,
+    #[storage(4, read_only)]
+    pub marbles: Handle<ShaderStorageBuffer>,
 }
 
 impl Material2d for FineMarcherMaterial {
@@ -361,6 +366,10 @@ pub struct SceneState {
     pub handles: SceneHandles,
     pub material: Handle<FineMarcherMaterial>,
     pub params_buffer: Handle<ShaderStorageBuffer>,
+    /// The live marble list (`FineMarcherMaterial::marbles`/
+    /// `MARBLE_BUFFER_BINDING`'s doc), rewritten every frame by
+    /// `update_material` from `MarbleState::marbles`.
+    pub marbles_buffer: Handle<ShaderStorageBuffer>,
     /// The scene's world-space bounding sphere (`object.bounding_sphere`),
     /// packed as `xyz = center, w = radius` (`w <= 0.0` means "no bound" --
     /// `bounding_sphere` returned `None`), computed once here at setup
@@ -384,6 +393,15 @@ fn pack_bounding_sphere(object: &Object, params: &Params) -> Vec4 {
         Some((center, radius)) => center.extend(radius),
         None => Vec4::ZERO,
     }
+}
+
+/// `marbles` packed for [`FineMarcherMaterial::marbles`]/
+/// `marble_csg::codegen::MARBLE_BUFFER_BINDING`: one `vec4<f32>` per marble
+/// (`xyz = center, w = radius`), same order as `MarbleState::marbles` (so
+/// `marble_idx` in the shader is directly `local_player_index`-comparable if
+/// a future feature needs that).
+fn pack_marbles(marbles: &[Marble]) -> Vec<Vec4> {
+    marbles.iter().map(|m| m.pos.extend(m.rad)).collect()
 }
 
 /// Startup system: builds the selected scene ([`SceneKind::from_config`]),
@@ -518,6 +536,33 @@ pub fn setup(
 
     let params_buffer = storage_buffers.add(ShaderStorageBuffer::from(params.slots().to_vec()));
     let bounding_sphere = pack_bounding_sphere(&object, &params);
+
+    let spawn = kind.spawn_params();
+    // Multiplayer milestone 0: spawn a few extra marbles in `Demo` (the one
+    // scene with a real, sizeable resting platform, not the Menger scenes'
+    // narrow open-air pocket) purely so marble-vs-marble collision is
+    // visually verifiable without inventing per-scene spawn layouts this
+    // milestone doesn't need. Stacked above the primary spawn (not spread
+    // out in X/Z): `beware_of_bumps::START` rests on a ledge only about 1x
+    // the marble's own radius wide (`animate_fractal`'s doc below), so they
+    // fall onto/into each other and the ledge together instead of each
+    // needing their own independently-verified flat spot to land on.
+    // Exact same X/Z, staggered only in Y: guarantees they actually collide
+    // with each other on the way down (the lowest one lands first, the ones
+    // still falling above it are on the same vertical line and *must* pass
+    // through its combined-radius zone), rather than each independently
+    // landing on unrelated nearby terrain with an X/Z offset large enough
+    // to never truly overlap.
+    let extra_marbles = if kind == SceneKind::Demo { 2 } else { 0 };
+    let start_positions: Vec<Vec3> = (0..=extra_marbles)
+        .map(|i| spawn.start + Vec3::new(0.0, spawn.rad * 4.0 * i as f32, 0.0))
+        .collect();
+    let marbles: Vec<Marble> = start_positions
+        .iter()
+        .map(|&start| Marble::spawn(start, spawn.rad))
+        .collect();
+    let marbles_buffer = storage_buffers.add(ShaderStorageBuffer::from(pack_marbles(&marbles)));
+
     // `coarse`/`shadow: Handle::default()` are placeholders -- `mrrm::setup_mrrm_pipeline`
     // and `shadow_pass::setup_shadow_pipeline` (Startup systems chained to
     // run after this one) correct them to the real render targets once
@@ -529,6 +574,7 @@ pub fn setup(
         params: params_buffer.clone(),
         coarse: Handle::default(),
         shadow: Handle::default(),
+        marbles: marbles_buffer.clone(),
     });
 
     // Renders straight to the primary window (no adaptive-resolution
@@ -554,15 +600,16 @@ pub fn setup(
         handles,
         material,
         params_buffer,
+        marbles_buffer,
         bounding_sphere,
     });
 
-    let spawn = kind.spawn_params();
     commands.insert_resource(MarbleState {
-        marble: Marble::spawn(spawn.start, spawn.rad),
+        marbles,
         cfg: PhysicsConfig::default(),
-        start_pos: spawn.start,
+        start_positions,
         kill_y: spawn.kill_y,
+        local_player_index: 0,
     });
 }
 
@@ -598,10 +645,11 @@ fn animate_fractal() -> bool {
 }
 
 /// Per-frame system: writes the orbit camera basis (now following the
-/// marble), timing, and the marble uniform into the material (DESIGN.md
-/// §7/§8); re-syncs fractal params only if `animate_fractal()` is enabled
-/// (otherwise the static params `setup()` wrote stay untouched, matching
-/// what the marble's physics collides against).
+/// local player's marble), timing, and the live marble list into the
+/// material (DESIGN.md §7/§8); re-syncs fractal params only if
+/// `animate_fractal()` is enabled (otherwise the static params `setup()`
+/// wrote stay untouched, matching what the marbles' physics collides
+/// against).
 #[allow(clippy::too_many_arguments)]
 pub fn update_material(
     time: Res<Time>,
@@ -665,11 +713,16 @@ pub fn update_material(
         .unwrap_or((1.0, 1.0));
 
     // Every scene has a real marble now (`SceneKind::has_marble`): the
-    // camera always follows it.
-    let marble = marble_state.marble;
-    let target = marble.pos;
+    // camera always follows the local player's.
+    let target = marble_state.local_marble().pos;
     let (eye, right, up, forward) = orbit.eye_and_basis(target);
-    let marble_uniform = marble.pos.extend(marble.rad);
+
+    // Live marble list -> its storage buffer, every frame (multiplayer
+    // milestone 0 -- mirrors the params-buffer per-frame write pattern just
+    // above, same reasoning: a pure buffer write, no shader recompile).
+    if let Some(buffer) = storage_buffers.get_mut(&scene_state.marbles_buffer) {
+        buffer.set_data(pack_marbles(&marble_state.marbles));
+    }
 
     if let Some(mat) = materials.get_mut(&scene_state.material) {
         mat.scene = SceneUniforms {
@@ -677,7 +730,6 @@ pub fn update_material(
             cam_right: right.extend(0.0),
             cam_up: up.extend(0.0),
             cam_forward: forward.extend(1.5),
-            marble: marble_uniform,
             sun: beware_of_bumps::sun_dir().extend(0.0),
             sun_col: beware_of_bumps::SUN_COL.extend(0.0),
             bg_col: beware_of_bumps::BG.extend(0.0),

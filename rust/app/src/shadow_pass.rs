@@ -321,7 +321,7 @@ pub fn update_shadow_material(
         .unwrap_or(1.0);
     let shadow_height = shadow_render_target.size.y as f32;
 
-    let marble = marble_state.marble;
+    let marble = marble_state.local_marble();
     let (eye, right, up, forward) = orbit.eye_and_basis(marble.pos);
 
     for mesh_material in &quads {
