@@ -84,6 +84,10 @@ mod js_bridge {
         pub fn take_error() -> String;
         #[wasm_bindgen(js_namespace = mmNet, js_name = takeReceived)]
         pub fn take_received() -> Vec<u8>;
+        #[wasm_bindgen(js_namespace = mmNet, js_name = copyToClipboard)]
+        pub fn copy_to_clipboard(text: &str);
+        #[wasm_bindgen(js_namespace = mmNet, js_name = takeClipboardStatus)]
+        pub fn take_clipboard_status() -> i32;
     }
 }
 
@@ -107,6 +111,10 @@ mod js_bridge {
     }
     pub fn take_received() -> Vec<u8> {
         Vec::new()
+    }
+    pub fn copy_to_clipboard(_text: &str) {}
+    pub fn take_clipboard_status() -> i32 {
+        0
     }
 }
 
@@ -188,6 +196,17 @@ pub struct NetSession {
     pub last_error: String,
 }
 
+impl NetSession {
+    /// The full, shareable invite URL, if one exists yet (hosting, with an
+    /// id already assigned) -- shared by [`sync_net_ui_text`] (displays it)
+    /// and [`handle_copy_button_click`] (copies it), so there's exactly one
+    /// place that assembles a link from `page_url_base` + the join suffix.
+    fn current_link(&self) -> Option<String> {
+        let suffix = self.hosted_join_suffix.as_ref()?;
+        Some(page_url_base().map_or_else(|| suffix.clone(), |base| format!("{base}{suffix}")))
+    }
+}
+
 /// `Startup` system: reads `?join=` (via the same `web_config::query_param`
 /// helper the `?scene=` work already built and proved out) to decide this
 /// client's [`Role`], then calls `net.js`'s `host()`/`join()` exactly once.
@@ -256,6 +275,35 @@ fn page_url_base() -> Option<String> {
 #[derive(Component)]
 pub(crate) struct NetStatusText;
 
+/// Marker for the "Copy Link" button itself (the `Button`-required `Node`,
+/// not its label) -- `pub(crate)` for the same reason as [`NetStatusText`].
+#[derive(Component)]
+pub(crate) struct CopyLinkButton;
+
+/// Marker for the button's `Text` child, so [`handle_copy_button_click`]/
+/// [`update_copy_feedback`] can update the label without also touching the
+/// button `Node` it's attached to.
+#[derive(Component)]
+pub(crate) struct CopyLinkButtonLabel;
+
+const COPY_BUTTON_IDLE_TEXT: &str = "Copy Link";
+
+/// How long "Copied!"/"Copy failed" stays on the button before it reverts
+/// to [`COPY_BUTTON_IDLE_TEXT`] -- long enough to actually read, short
+/// enough that a second click shortly after isn't confusingly stuck on
+/// stale feedback from the first.
+const COPY_FEEDBACK_SECONDS: f64 = 1.5;
+
+/// Tracks the transient "just clicked" feedback state so
+/// [`update_copy_feedback`] knows what the button should say right now and
+/// when to revert it back to [`COPY_BUTTON_IDLE_TEXT`] -- separate from
+/// [`NetSession`] since this is pure UI-feedback timing, nothing else in
+/// the app cares about it. `None` means the button is showing its idle
+/// label; `Some((shown_at, message))` means it's showing `message` until
+/// `shown_at + COPY_FEEDBACK_SECONDS`.
+#[derive(Resource, Default)]
+pub(crate) struct CopyFeedback(Option<(f64, String)>);
+
 /// `Startup` system: spawns the always-present networking status readout
 /// (top-right, so it doesn't collide with the debug overlays' top-left
 /// stack — `fps_overlay.rs`, `touch.rs`). Chained after `setup_networking`
@@ -280,6 +328,106 @@ pub fn spawn_net_ui(mut commands: Commands) {
             TextColor(Color::srgb(0.6, 0.85, 1.0)),
             NetStatusText,
         ));
+
+    // Separate node from the status text above (not a child of it): bevy_ui
+    // text is drawn straight to the canvas, not real DOM text, so there is
+    // nothing for the browser's normal copy/selection handling to grab --
+    // this button is the actual way to get the invite link onto the
+    // clipboard. Hidden (`Display::None`) until `update_copy_button_visibility`
+    // finds a real link to copy; clicking before then would just copy
+    // nothing useful, so there's no point showing it yet.
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(46.0),
+                right: Val::Px(6.0),
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.2, 0.4, 0.6, 0.85)),
+            Button,
+            CopyLinkButton,
+        ))
+        .with_child((
+            Text::new(COPY_BUTTON_IDLE_TEXT),
+            TextFont { font_size: 16.0, ..default() },
+            TextColor(Color::WHITE),
+            CopyLinkButtonLabel,
+        ));
+}
+
+/// `Update` system: shows the copy button only once there's an actual link
+/// to copy (hosting, with a broker-assigned id) — a joiner, or a host that
+/// hasn't received its id yet, has nothing useful to copy.
+pub fn update_copy_button_visibility(session: Res<NetSession>, mut node: Query<&mut Node, With<CopyLinkButton>>) {
+    let Ok(mut node) = node.single_mut() else { return };
+    node.display = if session.current_link().is_some() { Display::Flex } else { Display::None };
+}
+
+/// `Update` system: the actual copy action. `Interaction` is driven by
+/// mouse *and* touch alike (`bevy_ui::focus::ui_focus_system` reads
+/// `Res<Touches>` directly, not just `ButtonInput<MouseButton>`), so this
+/// needs no separate touch-handling path — the whole point of this button,
+/// since this app targets phones as much as desktop.
+///
+/// Calls `copy_to_clipboard` synchronously from inside this click-triggered
+/// system, in the same frame the `Interaction::Pressed` transition is
+/// observed — the browser Clipboard API only grants permission when
+/// invoked synchronously within a real user-gesture callstack, so this
+/// can't be deferred (e.g. queued and handled a frame later) without
+/// silently losing that permission.
+pub fn handle_copy_button_click(
+    session: Res<NetSession>,
+    mut feedback: ResMut<CopyFeedback>,
+    time: Res<Time>,
+    interactions: Query<&Interaction, (Changed<Interaction>, With<CopyLinkButton>)>,
+) {
+    let Ok(interaction) = interactions.single() else { return };
+    if *interaction != Interaction::Pressed {
+        return;
+    }
+    let Some(link) = session.current_link() else { return };
+    js_bridge::copy_to_clipboard(&link);
+    // Immediate feedback that the click registered, ahead of the async
+    // write actually resolving (typically near-instant, but the click and
+    // its result land on different frames regardless — see
+    // `update_copy_feedback`, which overwrites this once the real result
+    // arrives).
+    feedback.0 = Some((time.elapsed_secs_f64(), "Copying...".to_string()));
+}
+
+/// `Update` system: polls the async clipboard-write result
+/// (`takeClipboardStatus`) and drives the button label between its idle
+/// text and "Copied!"/"Copy failed" feedback, reverting automatically
+/// after `COPY_FEEDBACK_SECONDS` — separate from `handle_copy_button_click`
+/// since the result arrives on a later frame than the click that triggered
+/// it (the clipboard write is async even though *invoking* it must be
+/// synchronous — see that system's doc).
+pub fn update_copy_feedback(
+    time: Res<Time>,
+    mut feedback: ResMut<CopyFeedback>,
+    mut label: Query<&mut Text, With<CopyLinkButtonLabel>>,
+) {
+    let now = time.elapsed_secs_f64();
+    match js_bridge::take_clipboard_status() {
+        1 => feedback.0 = Some((now, "Copied!".to_string())),
+        2 => feedback.0 = Some((now, "Copy failed".to_string())),
+        _ => {}
+    }
+
+    let Ok(mut label) = label.single_mut() else { return };
+    match &feedback.0 {
+        Some((shown_at, message)) if now - shown_at < COPY_FEEDBACK_SECONDS => {
+            label.0 = message.clone();
+        }
+        Some(_) => {
+            feedback.0 = None;
+            label.0 = COPY_BUTTON_IDLE_TEXT.to_string();
+        }
+        None => {}
+    }
 }
 
 /// `Update` system: renders [`NetSession`]'s current state into
@@ -289,11 +437,8 @@ pub fn sync_net_ui_text(session: Res<NetSession>, mut text: Query<&mut Text, Wit
     let Ok(mut text) = text.single_mut() else { return };
     text.0 = match session.status {
         NetStatus::Idle => "connecting...".to_string(),
-        NetStatus::Hosting => match &session.hosted_join_suffix {
-            Some(suffix) => {
-                let link = page_url_base().map_or_else(|| suffix.clone(), |base| format!("{base}{suffix}"));
-                format!("Share this link to play together:\n{link}")
-            }
+        NetStatus::Hosting => match session.current_link() {
+            Some(link) => format!("Share this link to play together:\n{link}"),
             None => "starting host...".to_string(),
         },
         NetStatus::Connected => "Player connected!".to_string(),

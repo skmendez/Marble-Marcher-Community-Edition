@@ -21,6 +21,12 @@ window.mmNet = (function () {
   // 3 disconnected (was connected, now isn't), 4 error.
   let status = 0;
   let received = []; // array of Uint8Array, one per message, in arrival order
+  // 0 idle (no copy attempted / already consumed), 1 last copy succeeded,
+  // 2 last copy failed -- `navigator.clipboard.writeText` is Promise-based,
+  // so this can't just return a bool synchronously to the wasm caller; the
+  // Rust side polls `takeClipboardStatus` once a frame instead, same shape
+  // as `takeError`/`takeReceived`.
+  let clipboardStatus = 0;
 
   function setupConnection(c) {
     conn = c;
@@ -82,6 +88,32 @@ window.mmNet = (function () {
       if (conn && conn.open) {
         conn.send(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
       }
+    },
+    // `text` is the full invite link. Fire-and-forget from the wasm side --
+    // must be called synchronously from within a real click/tap's event
+    // handler (the Clipboard API only grants permission inside an actual
+    // user-gesture callstack; calling this after an `await`/async hop, or
+    // from a plain per-frame poll, would silently fail every time even
+    // though the code looks identical). The write itself is async, so the
+    // result is reported through `takeClipboardStatus`, not a return value.
+    copyToClipboard: function (text) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(
+          () => { clipboardStatus = 1; },
+          () => { clipboardStatus = 2; },
+        );
+      } else {
+        // No Clipboard API at all (non-secure context, or an embedded
+        // webview that doesn't expose it) -- report failure immediately
+        // rather than leaving the caller waiting on a status that will
+        // never arrive.
+        clipboardStatus = 2;
+      }
+    },
+    takeClipboardStatus: function () {
+      const s = clipboardStatus;
+      clipboardStatus = 0;
+      return s;
     },
     status: function () {
       return status;

@@ -30,7 +30,10 @@ use mrrm::{
     resize_coarse_render_target, setup_mrrm_pipeline, sync_coarse_quad_scale,
     update_coarse_material, CoarseMarcherMaterial,
 };
-use net::{poll_net_status, setup_networking, spawn_net_ui, sync_net_ui_text};
+use net::{
+    handle_copy_button_click, poll_net_status, setup_networking, spawn_net_ui, sync_net_ui_text,
+    update_copy_button_visibility, update_copy_feedback, CopyFeedback,
+};
 use physics_sys::{marble_physics_tick, MultiplayerSession};
 use render::{setup, sync_quad_scale, update_material, FineMarcherMaterial};
 use shadow_pass::{
@@ -92,6 +95,7 @@ fn main() {
         .init_resource::<CameraOrbit>()
         .init_resource::<TouchDebugInfo>()
         .init_resource::<MultiplayerSession>()
+        .init_resource::<CopyFeedback>()
         // `setup_mrrm_pipeline` (mrrm.rs) needs `setup`'s `SceneState` (the
         // scene tree + params buffer, to build the coarse shader/material)
         // and corrects `setup`'s placeholder `FineMarcherMaterial::coarse`
@@ -120,6 +124,9 @@ fn main() {
                 update_shadow_material,
                 draw_thrust_debug,
                 poll_net_status,
+                update_copy_button_visibility,
+                handle_copy_button_click,
+                update_copy_feedback,
                 sync_net_ui_text,
             )
                 .chain(),
