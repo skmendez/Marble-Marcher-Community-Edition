@@ -66,3 +66,9 @@ web = ["bevy/webgpu"]
 # version instead of resolving a second, incompatible copy.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = ["Window", "Location", "UrlSearchParams"] }
+# Multiplayer milestone 2 (`net.rs`): a handful of `extern "C"` bindings
+# into `rust/web/net.js`'s PeerJS wrapper (see that file's doc) -- pinned to
+# the same already-locked major/minor `web-sys`/`js-sys` resolve to
+# (transitively via `bevy_winit`), same reasoning as the `web-sys` entry
+# above, so Cargo unifies onto one copy instead of resolving two.
+wasm-bindgen = "0.2"

@@ -23,6 +23,18 @@
   </style>
 </head>
 <body>
+  <!-- Multiplayer milestone 2: PeerJS wraps browser WebRTC + a free public
+       signaling broker (0.peerjs.com by default) so two static-hosted
+       clients can establish a peer-to-peer data channel without this repo
+       running any server-side code of its own -- see net.js, which is the
+       only thing that talks to the `Peer`/`DataConnection` objects this
+       script defines; rust/app/src/net.rs only ever calls net.js's narrow
+       poll-based API. Loaded from a CDN (unpkg) rather than vendored, so
+       this is a real runtime dependency on that CDN and on 0.peerjs.com's
+       broker being reachable -- both are only needed to *establish* a
+       connection, not for gameplay traffic once connected. -->
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="./net.js"></script>
   <script type="module">
     import init from "./marble-marcher.js";
     init().catch((e) => {

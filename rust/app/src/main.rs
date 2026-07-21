@@ -11,6 +11,7 @@ mod debug_gizmos;
 mod debug_screenshot;
 mod fps_overlay;
 mod mrrm;
+mod net;
 mod physics_sys;
 mod render;
 mod shadow_pass;
@@ -29,7 +30,8 @@ use mrrm::{
     resize_coarse_render_target, setup_mrrm_pipeline, sync_coarse_quad_scale,
     update_coarse_material, CoarseMarcherMaterial,
 };
-use physics_sys::marble_physics_tick;
+use net::{poll_net_status, setup_networking, spawn_net_ui, sync_net_ui_text};
+use physics_sys::{marble_physics_tick, MultiplayerSession};
 use render::{setup, sync_quad_scale, update_material, FineMarcherMaterial};
 use shadow_pass::{
     resize_shadow_render_target, setup_shadow_pipeline, sync_shadow_quad_scale,
@@ -89,6 +91,7 @@ fn main() {
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<CameraOrbit>()
         .init_resource::<TouchDebugInfo>()
+        .init_resource::<MultiplayerSession>()
         // `setup_mrrm_pipeline` (mrrm.rs) needs `setup`'s `SceneState` (the
         // scene tree + params buffer, to build the coarse shader/material)
         // and corrects `setup`'s placeholder `FineMarcherMaterial::coarse`
@@ -99,7 +102,7 @@ fn main() {
         // placeholder `FineMarcherMaterial::shadow` handle in turn.
         .add_systems(
             Startup,
-            (setup, setup_mrrm_pipeline, setup_shadow_pipeline).chain(),
+            (setup, setup_mrrm_pipeline, setup_shadow_pipeline, setup_networking, spawn_net_ui).chain(),
         )
         .add_systems(FixedUpdate, marble_physics_tick)
         .add_systems(
@@ -116,6 +119,8 @@ fn main() {
                 update_coarse_material,
                 update_shadow_material,
                 draw_thrust_debug,
+                poll_net_status,
+                sync_net_ui_text,
             )
                 .chain(),
         )

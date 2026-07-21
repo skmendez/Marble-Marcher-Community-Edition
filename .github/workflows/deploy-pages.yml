@@ -64,6 +64,7 @@ jobs:
         run: |
           mkdir -p dist
           cp rust/web/index.html dist/
+          cp rust/web/net.js dist/
           wasm-bindgen --no-typescript --target web \
             --out-dir dist --out-name marble-marcher \
             rust/target/wasm32-unknown-unknown/release/marble-marcher-bevy.wasm

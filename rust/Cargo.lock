@@ -2349,6 +2349,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "marble-csg",
+ "wasm-bindgen",
  "web-sys",
 ]
 
