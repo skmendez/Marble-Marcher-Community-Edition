@@ -53,7 +53,6 @@
 //! two even though both are derived from the same underlying average.
 
 use std::collections::VecDeque;
-use std::time::Duration;
 
 use bevy::prelude::*;
 
@@ -78,13 +77,9 @@ impl Plugin for FpsOverlayPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FrameTimeWindow>()
             .init_resource::<DebugTwistAccum>()
-            .init_resource::<PhaseTimings>()
             .add_systems(Startup, spawn_fps_overlay)
             .add_systems(Update, (record_frame_time, update_fps_text).chain())
-            .add_systems(
-                Update,
-                (update_orbit_debug_text, update_marbles_debug_text, update_phase_timings_text),
-            );
+            .add_systems(Update, (update_orbit_debug_text, update_marbles_debug_text));
     }
 }
 
@@ -139,51 +134,6 @@ fn record_frame_time(time: Res<Time>, mut window: ResMut<FrameTimeWindow>) {
     }
 }
 
-/// **What this measures, and what it doesn't**: wall-clock CPU time spent
-/// inside each named `Update`/`FixedUpdate` system that prepares a frame --
-/// the physics tick, and each render pass's per-frame uniform computation
-/// (`update_material`/`update_coarse_material`/`update_shadow_material`).
-/// This is *not* GPU execution time, and not even full CPU-side command
-/// encoding/submission time (that happens later, in Bevy's Render sub-app,
-/// out of easy reach from an ordinary `Update`-schedule system without much
-/// deeper render-graph instrumentation than this overlay's existing
-/// "genuinely useful, cheap to build" bar justifies). `fps_overlay.rs`'s
-/// module doc already covers why real GPU timestamps aren't available at
-/// all on this project's actual deploy target (WebGPU) --
-/// `RenderDiagnosticsPlugin` only supports them on native Vulkan/DX12.
-///
-/// So: if every phase here reads small and roughly flat, that's real
-/// evidence the bottleneck is GPU-side (shader execution), not something
-/// this readout can see directly -- in that case the actual diagnostic tool
-/// is the `?mrrm=0`/`?shadowlod=0` query-param toggles (`mrrm.rs`/
-/// `shadow_pass.rs`) compared against the FPS line's *total* frame time,
-/// which genuinely does reflect real end-to-end GPU cost (turn a pass off,
-/// watch whether frame time actually drops). This readout's job is
-/// narrower but still real: catching a CPU-side regression (an expensive
-/// system, an accidental per-frame allocation storm, multiplayer rollback
-/// resimulation cost) that *would* show up here directly.
-#[derive(Resource, Default)]
-pub struct PhaseTimings {
-    phases: Vec<(&'static str, FrameTimeWindow)>,
-}
-
-impl PhaseTimings {
-    /// Records one call's elapsed time for `phase`, creating its rolling
-    /// window on first use. Insertion order (not alphabetical/hash order)
-    /// is what the readout displays in, so call this the first time in
-    /// whatever order should read top-to-bottom.
-    pub fn record(&mut self, phase: &'static str, elapsed: Duration) {
-        match self.phases.iter_mut().find(|(name, _)| *name == phase) {
-            Some((_, window)) => window.push(elapsed.as_secs_f64()),
-            None => {
-                let mut window = FrameTimeWindow::default();
-                window.push(elapsed.as_secs_f64());
-                self.phases.push((phase, window));
-            }
-        }
-    }
-}
-
 /// Marker for the `Text` entity showing the live FPS number.
 #[derive(Component)]
 struct FpsText;
@@ -207,12 +157,6 @@ struct OrbitDebugText;
 /// state, not just the local player's.
 #[derive(Component)]
 struct MarblesDebugText;
-
-/// Marker for the `Text` entity showing [`PhaseTimings`]'s per-phase
-/// CPU breakdown -- see that resource's doc for exactly what this does and
-/// doesn't measure.
-#[derive(Component)]
-struct PhaseTimingsText;
 
 fn spawn_fps_overlay(mut commands: Commands) {
     commands
@@ -258,34 +202,7 @@ fn spawn_fps_overlay(mut commands: Commands) {
                 TextColor(Color::srgb(1.0, 0.75, 0.4)),
                 MarblesDebugText,
             ));
-            parent.spawn((
-                Text::new("phases: --"),
-                TextFont {
-                    font_size: 12.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.75, 0.75, 0.75)),
-                PhaseTimingsText,
-            ));
         });
-}
-
-fn update_phase_timings_text(
-    timings: Res<PhaseTimings>,
-    mut text: Query<&mut Text, With<PhaseTimingsText>>,
-) {
-    let Ok(mut text) = text.single_mut() else {
-        return;
-    };
-    if timings.phases.is_empty() {
-        return;
-    }
-    let parts: Vec<String> = timings
-        .phases
-        .iter()
-        .filter_map(|(name, window)| window.averaged().map(|(_, ms)| format!("{name}={ms:.2}ms")))
-        .collect();
-    text.0 = format!("cpu phases: {}", parts.join(" "));
 }
 
 fn update_orbit_debug_text(

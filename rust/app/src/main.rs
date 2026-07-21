@@ -35,7 +35,7 @@ use net::{
     update_copy_button_visibility, update_copy_feedback, CopyFeedback,
 };
 use physics_sys::{marble_physics_tick, MultiplayerSession};
-use render::{finalize_marble_cubemap, setup, sync_quad_scale, update_material, FineMarcherMaterial};
+use render::{setup, sync_quad_scale, update_material, FineMarcherMaterial};
 use shadow_pass::{
     resize_shadow_render_target, setup_shadow_pipeline, sync_shadow_quad_scale,
     update_shadow_material, ShadowMarcherMaterial,
@@ -119,7 +119,6 @@ fn main() {
                 sync_shadow_quad_scale,
                 orbit_camera_input,
                 touch_camera_input,
-                finalize_marble_cubemap,
                 update_material,
                 update_coarse_material,
                 update_shadow_material,

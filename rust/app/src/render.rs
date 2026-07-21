@@ -26,9 +26,7 @@
 use bevy::asset::weak_handle;
 use bevy::image::Image;
 use bevy::prelude::*;
-use bevy::render::render_resource::{
-    AsBindGroup, ShaderRef, TextureViewDescriptor, TextureViewDimension,
-};
+use bevy::render::render_resource::{AsBindGroup, ShaderRef};
 use bevy::render::storage::ShaderStorageBuffer;
 use bevy::sprite::Material2d;
 use bevy::ui::IsDefaultUiCamera;
@@ -302,63 +300,12 @@ pub struct FineMarcherMaterial {
     pub shadow: Handle<Image>,
     #[storage(4, read_only)]
     pub marbles: Handle<ShaderStorageBuffer>,
-    /// The marble's cubemap texture (`MarbleCubemap`'s doc) -- unlike
-    /// `coarse`/`shadow` this genuinely needs a paired `#[sampler]`: the
-    /// shader samples it with `textureSample` (a filtered, direction-vector
-    /// lookup), not `textureLoad`, so a real sampler binding is required,
-    /// not optional (`marble_csg::codegen::MARBLE_TEXTURE_BINDING`'s doc).
-    #[texture(5, dimension = "cube")]
-    #[sampler(6)]
-    pub marble_texture: Handle<Image>,
 }
 
 impl Material2d for FineMarcherMaterial {
     fn fragment_shader() -> ShaderRef {
         MARCHER_SHADER_HANDLE.into()
     }
-}
-
-/// The marble's cubemap texture: loaded from `assets/marble_cubemap.png`, a
-/// vertical strip of 6 square faces in `+X, -X, +Y, -Y, +Z, -Z` order --
-/// exactly wgpu/WebGPU's own cube-array layer order, so treating the 6
-/// stacked regions as sequential array layers (below) needs no manual face
-/// remapping.
-///
-/// `AssetServer::load` returns a usable-immediately `Handle<Image>`, but the
-/// actual pixel data doesn't exist until it finishes loading asynchronously
-/// (a local file read natively, an HTTP fetch on wasm) -- so `setup` can't
-/// reinterpret it into a cube view in the same frame it starts the load.
-/// `finalize_marble_cubemap` (`Update`) does that the first frame the data
-/// actually exists, gated by `done` so the reinterpret (which assumes a
-/// still-plain-2D source -- see `Image::reinterpret_stacked_2d_as_array`)
-/// never runs twice.
-#[derive(Resource)]
-pub(crate) struct MarbleCubemap {
-    handle: Handle<Image>,
-    done: bool,
-}
-
-/// `Update` system: the other half of `MarbleCubemap`'s doc -- once the PNG's
-/// pixel data actually exists, reinterpret its 6 stacked 256x256 regions as
-/// cube-map array layers and mark the image's view as `Cube`-dimensioned
-/// (same technique Bevy's own skybox example uses for a single
-/// vertical-strip source image). Bevy's asset change-detection re-extracts
-/// and re-uploads the GPU-side texture once this mutation lands, so the
-/// fine pass's already-bound `marble_texture` handle picks up the real
-/// cubemap view with no further wiring needed.
-pub fn finalize_marble_cubemap(mut cubemap: ResMut<MarbleCubemap>, mut images: ResMut<Assets<Image>>) {
-    if cubemap.done {
-        return;
-    }
-    let Some(image) = images.get_mut(&cubemap.handle) else {
-        return;
-    };
-    image.reinterpret_stacked_2d_as_array(6);
-    image.texture_view_descriptor = Some(TextureViewDescriptor {
-        dimension: Some(TextureViewDimension::Cube),
-        ..default()
-    });
-    cubemap.done = true;
 }
 
 /// Default depth/color for the two static display fractals ([`SceneKind::MengerSponge`]/
@@ -467,7 +414,6 @@ pub fn setup(
     mut shaders: ResMut<Assets<Shader>>,
     mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
     mut camera_orbit: ResMut<CameraOrbit>,
-    asset_server: Res<AssetServer>,
 ) {
     let kind = SceneKind::from_config();
     let mut params = Params::new();
@@ -622,22 +568,14 @@ pub fn setup(
     // run after this one) correct them to the real render targets once
     // those `Image`s exist. Every Startup system finishes before the first
     // frame is ever rendered, so these placeholders are never actually read
-    // by the GPU. `marble_texture`, unlike those two, is a real asset load
-    // (`MarbleCubemap`'s doc) -- the handle is usable immediately even
-    // before the PNG finishes loading (Bevy falls back to a default
-    // placeholder texture on an unresolved handle), and `finalize_marble_cubemap`
-    // (`Update`) corrects its view to a real cube map once the pixel data
-    // exists.
-    let marble_cubemap_handle: Handle<Image> = asset_server.load("marble_cubemap.png");
+    // by the GPU.
     let material = materials.add(FineMarcherMaterial {
         scene: SceneUniforms::default(),
         params: params_buffer.clone(),
         coarse: Handle::default(),
         shadow: Handle::default(),
         marbles: marbles_buffer.clone(),
-        marble_texture: marble_cubemap_handle.clone(),
     });
-    commands.insert_resource(MarbleCubemap { handle: marble_cubemap_handle, done: false });
 
     // Renders straight to the primary window (no adaptive-resolution
     // render-to-texture indirection -- removed after it turned out to cause
@@ -713,26 +651,7 @@ fn animate_fractal() -> bool {
 /// wrote stay untouched, matching what the marbles' physics collides
 /// against).
 #[allow(clippy::too_many_arguments)]
-/// Thin timing wrapper -- see `fps_overlay::PhaseTimings`'s doc for exactly
-/// what this measures (CPU-side uniform computation, not GPU execution).
 pub fn update_material(
-    time: Res<Time>,
-    orbit: Res<CameraOrbit>,
-    marble_state: Res<MarbleState>,
-    windows: Query<&Window, With<PrimaryWindow>>,
-    shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
-    scene_state: ResMut<SceneState>,
-    materials: ResMut<Assets<FineMarcherMaterial>>,
-    storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
-    mut timings: ResMut<crate::fps_overlay::PhaseTimings>,
-) {
-    let start = web_time::Instant::now();
-    update_material_impl(time, orbit, marble_state, windows, shadow_render_target, scene_state, materials, storage_buffers);
-    timings.record("fine", start.elapsed());
-}
-
-#[allow(clippy::too_many_arguments)] // SystemParam count, unchanged from before the timing wrapper split
-fn update_material_impl(
     time: Res<Time>,
     orbit: Res<CameraOrbit>,
     marble_state: Res<MarbleState>,

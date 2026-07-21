@@ -70,27 +70,21 @@ const COARSE_LAYER: usize = 2;
 /// for -- see `march_scene`'s doc in `marble_csg::codegen`).
 const COARSE_SCALE_DIVISOR: u32 = 8;
 
-/// `?mrrm=0` (web) / `MM_MRRM=0` (native) disables the fine pass's use of
-/// this module's coarse guess (falls back to always starting its march at
-/// `t=0`, i.e. exactly the pre-MRRM behavior) -- a per-frame *shader*
-/// toggle (`SceneUniforms::misc.w`, written by `render::update_material`)
-/// rather than an entity/system-level one that would stop this module's
-/// camera/pass from running at all: every frame's cameras/passes are
-/// identical whether MRRM is on or off, so an `?mrrm=0` vs `?mrrm=1`
-/// A/B screenshot comparison at a fixed camera state only ever differs in
-/// this one shader value, not in *what ran* -- which is what makes that
-/// comparison trustworthy as a regression check. Matches
-/// `render::SceneKind::from_config`'s query-param-then-env-var layering
-/// (`web_config::query_param`) -- unlike the original env-var-only version
-/// of this toggle, this now actually has an effect on the deployed web
-/// build, not just native. Cached in a `OnceLock` rather than re-parsing
-/// the URL every frame (this is read once per frame by `update_material`).
+/// `MM_MRRM=0` disables the fine pass's use of this module's coarse guess
+/// (falls back to always starting its march at `t=0`, i.e. exactly the
+/// pre-MRRM behavior) -- a per-frame *shader* toggle (`SceneUniforms::misc.w`,
+/// written by `render::update_material`) rather than an entity/system-level
+/// one that would stop this module's camera/pass from running at all: every
+/// frame's cameras/passes are identical whether MRRM is on or off, so an
+/// `MM_MRRM=0` vs `MM_MRRM=1` A/B screenshot comparison at a fixed camera
+/// state only ever differs in this one shader value, not in *what ran* --
+/// which is what makes that comparison trustworthy as a regression check.
+/// Matches this codebase's other `MM_*` testing-hook convention
+/// (`render.rs`'s `MM_SCENE`). `std::env::var` always errors on
+/// wasm32-unknown-unknown, so this has no effect (MRRM always on) in the
+/// deployed web build.
 pub fn mrrm_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let value = crate::web_config::query_param("mrrm").or_else(|| std::env::var("MM_MRRM").ok());
-        value.as_deref() != Some("0")
-    })
+    std::env::var("MM_MRRM").as_deref() != Ok("0")
 }
 
 /// Rounds the window's current physical pixel size down by
@@ -381,28 +375,7 @@ pub fn sync_coarse_quad_scale(
 /// starting-`t` guess in `render.rs`'s `fragment` accounts for, so it
 /// doesn't need this aspect drift piled on top.
 #[allow(clippy::too_many_arguments)]
-/// Thin timing wrapper -- see `fps_overlay::PhaseTimings`'s doc for exactly
-/// what this measures (CPU-side uniform computation, not GPU execution).
 pub fn update_coarse_material(
-    time: Res<Time>,
-    orbit: Res<CameraOrbit>,
-    marble_state: Res<MarbleState>,
-    scene_state: Res<SceneState>,
-    windows: Query<&Window, With<PrimaryWindow>>,
-    coarse_render_target: Res<CoarseRenderTarget>,
-    quads: Query<&MeshMaterial2d<CoarseMarcherMaterial>, With<CoarseQuad>>,
-    materials: ResMut<Assets<CoarseMarcherMaterial>>,
-    mut timings: ResMut<crate::fps_overlay::PhaseTimings>,
-) {
-    let start = web_time::Instant::now();
-    update_coarse_material_impl(
-        time, orbit, marble_state, scene_state, windows, coarse_render_target, quads, materials,
-    );
-    timings.record("coarse", start.elapsed());
-}
-
-#[allow(clippy::too_many_arguments)] // SystemParam count, unchanged from before the timing wrapper split
-fn update_coarse_material_impl(
     time: Res<Time>,
     orbit: Res<CameraOrbit>,
     marble_state: Res<MarbleState>,

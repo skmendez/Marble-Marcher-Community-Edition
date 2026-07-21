@@ -8,13 +8,17 @@
 //! camera-relative thrust, no kill plane). Defaults to `Flying` (see
 //! `GravityMode`'s doc for why).
 //!
-//! WASD sign convention: setting `dy = -1` for S moves the marble *toward*
-//! the camera's eye position; W (`dy = +1`) moves it away, deeper along the
-//! view direction. This is a deliberate user-requested swap of W/S (and,
-//! in `camera.rs`, Q/E) from an earlier convention where W was "toward" —
-//! verified empirically (not just derived on paper) by logging `marble.pos`
-//! before/after holding each key against a live build and checking its
-//! displacement's dot product against the camera's `forward` vector.
+//! WASD sign convention: setting `dy = -1` for W moves the marble *toward*
+//! the camera's eye position; S (`dy = +1`) moves it away, deeper along the
+//! view direction. Verified empirically (not just derived on paper) by
+//! logging `marble.pos` before/after holding each key against a live build
+//! and checking its displacement's dot product against the camera's
+//! `forward` vector — an earlier version of this comment claimed the
+//! opposite ("W rolls the marble away from the orbiting camera... S rolls
+//! it back toward the camera"), derived purely algebraically from
+//! `CameraOrbit`'s basis and never actually checked against a running
+//! build; that derivation had a sign error, which is exactly why the touch
+//! pinch gesture built on top of it (below) felt backwards to begin with.
 //! Setting `dx = +1` for D yields `+(cos(yaw), 0, -sin(yaw))`, which is
 //! exactly `CameraOrbit`'s `right` vector at zero pitch — D rolls the
 //! marble in the camera's screen-right direction (unaffected by the above
@@ -24,7 +28,7 @@
 //!
 //! Touch: a 2-finger pinch feeds an additional `dy` (on top of WASD's) via
 //! `touch::read_two_finger_gesture` — pinching in pulls the marble toward
-//! the camera (S-equivalent), pinching out pushes it away (W-equivalent).
+//! the camera (W-equivalent), pinching out pushes it away (S-equivalent).
 //! Read directly here (not via an `Update`-schedule intermediary) for the
 //! same reason WASD is: `Touches`, like `ButtonInput<KeyCode>`, is input
 //! state readable from any schedule, not something that needs per-frame
@@ -33,12 +37,8 @@
 //! the mouse-driven `orbit_camera_input`), since it drives `CameraOrbit`,
 //! not the marble.
 
-use web_time::Instant;
-
 use bevy::input::touch::Touches;
 use bevy::prelude::*;
-
-use crate::fps_overlay::PhaseTimings;
 
 use marble_csg::physics::{step_marbles, GravityMode, Marble, PhysicsConfig, PlayerInput};
 use marble_csg::rollback::{InputTransport, RollbackSim, Tick};
@@ -139,27 +139,7 @@ const ROLLBACK_WINDOW_TICKS: u64 = 16;
 /// a thing this milestone needs). A no-op for scenes without a real marble
 /// (`SceneKind::has_marble` — the static display fractals, not the tuned
 /// demo level).
-/// Thin timing wrapper over [`marble_physics_tick_impl`] -- records this
-/// call's wall-clock cost into [`PhaseTimings`] regardless of which of
-/// `_impl`'s several early-return paths actually fires, without needing to
-/// touch each one individually.
-#[allow(clippy::too_many_arguments)] // one more param than `_impl`, for `PhaseTimings`
 pub fn marble_physics_tick(
-    keys: Res<ButtonInput<KeyCode>>,
-    touches: Res<Touches>,
-    orbit: Res<CameraOrbit>,
-    scene: Res<SceneState>,
-    net: Res<NetSession>,
-    mp: ResMut<MultiplayerSession>,
-    marble_state: ResMut<MarbleState>,
-    mut timings: ResMut<PhaseTimings>,
-) {
-    let start = Instant::now();
-    marble_physics_tick_impl(keys, touches, orbit, scene, net, mp, marble_state);
-    timings.record("physics", start.elapsed());
-}
-
-fn marble_physics_tick_impl(
     keys: Res<ButtonInput<KeyCode>>,
     touches: Res<Touches>,
     orbit: Res<CameraOrbit>,
@@ -202,10 +182,10 @@ fn marble_physics_tick_impl(
     let mut dx = 0.0f32;
     let mut dy = 0.0f32;
     if keys.pressed(KeyCode::KeyW) {
-        dy += 1.0;
+        dy -= 1.0;
     }
     if keys.pressed(KeyCode::KeyS) {
-        dy -= 1.0;
+        dy += 1.0;
     }
     if keys.pressed(KeyCode::KeyA) {
         dx -= 1.0;
