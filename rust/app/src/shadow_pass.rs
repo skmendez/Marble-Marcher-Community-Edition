@@ -323,7 +323,7 @@ pub fn update_shadow_material(
     materials: ResMut<Assets<ShadowMarcherMaterial>>,
     mut timings: ResMut<crate::fps_overlay::PhaseTimings>,
 ) {
-    let start = std::time::Instant::now();
+    let start = web_time::Instant::now();
     update_shadow_material_impl(
         time, orbit, marble_state, scene_state, windows, shadow_render_target, quads, materials,
     );

@@ -68,6 +68,14 @@ cargo build -p marble-marcher-bevy --target wasm32-unknown-unknown --features we
 wasm-bindgen --no-typescript --target web \
   --out-dir rust/web --out-name marble-marcher \
   rust/target/wasm32-unknown-unknown/debug/marble-marcher-bevy.wasm
+cp -r rust/app/assets rust/web/assets   # image assets (e.g. the marble's
+                                         # cubemap texture) -- Bevy's
+                                         # AssetPlugin fetches these via HTTP
+                                         # relative to the served page on
+                                         # wasm, they are not bundled into
+                                         # the wasm binary by cargo; native
+                                         # builds find `rust/app/assets`
+                                         # directly and don't need this copy
 ```
 
 Then serve `rust/web/` (it has a hand-written `index.html` loader) and open

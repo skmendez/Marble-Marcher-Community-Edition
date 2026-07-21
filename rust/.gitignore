@@ -10,3 +10,10 @@ target-*/
 web/*.js
 web/*.wasm
 !web/net.js
+
+# Local-dev copy of the real assets (`rust/app/assets/`, the source of
+# truth -- native builds read it directly). `rust/README.md`'s web-build
+# instructions copy it into `rust/web/assets/` for local HTTP serving; the
+# deploy workflow does the same into `dist/assets/` at build time. Neither
+# copy should ever be committed.
+web/assets/

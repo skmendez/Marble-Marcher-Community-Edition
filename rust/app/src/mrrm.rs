@@ -394,7 +394,7 @@ pub fn update_coarse_material(
     materials: ResMut<Assets<CoarseMarcherMaterial>>,
     mut timings: ResMut<crate::fps_overlay::PhaseTimings>,
 ) {
-    let start = std::time::Instant::now();
+    let start = web_time::Instant::now();
     update_coarse_material_impl(
         time, orbit, marble_state, scene_state, windows, coarse_render_target, quads, materials,
     );

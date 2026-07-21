@@ -7,6 +7,14 @@ description = "Ray-marched CSG renderer port of Marble Marcher CE's fractal fram
 
 [dependencies]
 marble-csg = { path = "../csg" }
+# `std::time::Instant::now()` panics on wasm32-unknown-unknown ("time not
+# implemented on this platform" -- that target's std has no OS clock, only
+# the "unsupported" stub backend). `web-time` is a drop-in replacement with
+# the identical `Instant`/`Duration` API: on wasm32 it reads
+# `Performance.now()` via web_sys instead, and on every other target it's a
+# transparent passthrough to real `std::time`, so this is safe to use
+# unconditionally rather than needing a target-gated dependency.
+web-time = "1"
 bevy = { version = "0.16", default-features = false, features = [
     "std",
     "bevy_asset",

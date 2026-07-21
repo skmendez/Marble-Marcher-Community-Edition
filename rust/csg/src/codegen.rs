@@ -397,6 +397,19 @@ const MARBLE_BUFFER_BINDING: &str = "\
 @group(2) @binding(4) var<storage, read> marbles: array<vec4<f32>>;
 ";
 
+/// The marble's cubemap texture (`render.rs`'s `MarbleCubemap`, loaded from
+/// `assets/marble_cubemap.png`): a real `texture_cube`, so unlike
+/// `coarse_tex`/`shadow_tex` this genuinely needs a paired `sampler` for
+/// `textureSample`'s hardware-filtered, direction-vector lookup (a cube
+/// face's nearest-texel `textureLoad` equivalent isn't directly expressible
+/// the way it is for a 2D texture -- filtering across face seams is exactly
+/// what the sampler buys here). Fine pass only, same reasoning as
+/// `MARBLE_BUFFER_BINDING`: the coarse/shadow passes skip all shading.
+const MARBLE_TEXTURE_BINDING: &str = "\
+@group(2) @binding(5) var marble_cubemap: texture_cube<f32>;
+@group(2) @binding(6) var marble_cubemap_sampler: sampler;
+";
+
 /// The over-relaxed march loop + its supporting constants, shared verbatim
 /// (DESIGN.md-style "no duplicated logic") between the coarse pass
 /// (`COARSE_MARCHER`) and the fine pass (`MARCHER`) -- both call
@@ -736,20 +749,6 @@ fn shadow(ro: vec3<f32>, rd: vec3<f32>, pixel_angle: f32) -> f32 {
 /// [`generate_shader`]. Kept deliberately simple (v1 — DESIGN.md §5); will
 /// grow toward MMCE's quality (fog, glow, GI) later.
 const MARCHER: &str = "\
-// A small fixed palette so multiple marbles read as visibly distinct
-// bodies (not player *identity* -- just enough to tell them apart while
-// verifying/playing) -- cycles via modulo for player counts beyond the
-// palette size.
-fn marble_color(idx: u32) -> vec3<f32> {
-    let palette = array<vec3<f32>, 4>(
-        vec3<f32>(0.95, 0.08, 0.05),
-        vec3<f32>(0.10, 0.55, 0.95),
-        vec3<f32>(0.15, 0.85, 0.25),
-        vec3<f32>(0.95, 0.75, 0.05),
-    );
-    return palette[idx % 4u];
-}
-
 fn sphere_hit(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, r: f32) -> f32 {
     let oc = ro - center;
     let b = dot(oc, rd);
@@ -763,6 +762,52 @@ fn sphere_hit(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, r: f32) -> f32 {
         return -1.0;
     }
     return t;
+}
+
+// Outline width as a fraction of each marble's own radius (not an absolute
+// world-space distance) -- scenes vary hugely in marble scale (the Demo
+// level's beware_of_bumps::MARBLE_RAD is 0.02, the Menger scenes' marbles
+// are 0.15), so a fixed absolute width would read as a hairline in one and
+// a thick band in another. 0.12 chosen by visual inspection as a clean,
+// clearly-visible ring at typical on-screen marble sizes without swallowing
+// the marble itself.
+const OUTLINE_WIDTH_FRACTION: f32 = 0.12;
+const OUTLINE_COLOR: vec3<f32> = vec3<f32>(0.1176, 0.0314, 0.3451); // #1E0858
+
+// Per-marble color variation (\"coloring index\" = marble_idx % 4u, cycling
+// for player counts beyond 4): each entry is (hue_shift in turns, sat_mul,
+// val_mul), applied in HSV so a shift reads as a consistent recoloring
+// rather than an arbitrary RGB blend. Values supplied directly by design,
+// not derived here.
+const TINTS: array<vec3<f32>, 4> = array<vec3<f32>, 4>(
+    vec3<f32>( 0.0,        1.00, 1.00),  // 0: original
+    vec3<f32>(-8.0/360.0,  1.15, 0.93),  // 1: tangerine
+    vec3<f32>(10.0/360.0,  0.40, 1.12),  // 2: cream
+    vec3<f32>(-55.0/360.0, 0.85, 1.02),  // 3: sakura
+);
+
+fn rgb2hsv(c: vec3<f32>) -> vec3<f32> {
+    let K = vec4<f32>(0.0, -1.0/3.0, 2.0/3.0, -1.0);
+    let p = mix(vec4<f32>(c.bg, K.wz), vec4<f32>(c.gb, K.xy), step(c.b, c.g));
+    let q = mix(vec4<f32>(p.xyw, c.r), vec4<f32>(c.r, p.yzx), step(p.x, c.r));
+    let d = q.x - min(q.w, q.y);
+    let e = 1e-10;
+    return vec3<f32>(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+fn hsv2rgb(c: vec3<f32>) -> vec3<f32> {
+    let K = vec4<f32>(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+    let p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, vec3<f32>(0.0), vec3<f32>(1.0)), c.y);
+}
+
+fn apply_tint(color: vec3<f32>, index: u32) -> vec3<f32> {
+    let t = TINTS[index];
+    var hsv = rgb2hsv(color);
+    hsv.x = fract(hsv.x + t.x);
+    hsv.y = clamp(hsv.y * t.y, 0.0, 1.0);
+    hsv.z = clamp(hsv.z * t.z, 0.0, 1.0);
+    return hsv2rgb(hsv);
 }
 
 // Depth-aware 4-tap resample of the half-resolution shadow/AO pass's cached
@@ -852,8 +897,21 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     // doc). `arrayLength` gives the live count with no separate uniform
     // field to keep in sync. Inactive slots (`w <= 0.0`) are skipped, same
     // \"hidden\" convention the old single-marble uniform used.
+    //
+    // `outline_t`/`outline_idx` track the nearest hit against each marble's
+    // *inflated* (radius + OUTLINE_WIDTH) sphere, independently of the real
+    // hit above -- a ray can hit the inflated sphere while missing the real
+    // one (exactly the thin annulus just outside a marble's own silhouette,
+    // where the outline actually shows -- see the outline branch below for
+    // why this is enough to draw a clean ring with no extra geometry).
+    // Tracked across *all* marbles the same way the real hit is, not just
+    // the one that won the real-hit search above, so a marble whose real
+    // surface isn't the nearest thing on screen can still show its own
+    // outline in front of it.
     var marble_t = -1.0;
     var marble_idx = 0u;
+    var outline_t = -1.0;
+    var outline_idx = 0u;
     let marble_count = arrayLength(&marbles);
     for (var mi = 0u; mi < marble_count; mi++) {
         let m = marbles[mi];
@@ -862,6 +920,11 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
             if (mt > 0.0 && (marble_t < 0.0 || mt < marble_t)) {
                 marble_t = mt;
                 marble_idx = mi;
+            }
+            let ot = sphere_hit(ro, rd, m.xyz, m.w + m.w * OUTLINE_WIDTH_FRACTION);
+            if (ot > 0.0 && (outline_t < 0.0 || ot < outline_t)) {
+                outline_t = ot;
+                outline_idx = mi;
             }
         }
     }
@@ -929,24 +992,51 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         let mn = normalize(mp - hit_marble.xyz);
         let refl = reflect(rd, mn);
         let fresnel = pow(1.0 - max(dot(-rd, mn), 0.0), 5.0);
-        // A distinct, saturated base color (not just a sky-reflecting mirror)
-        // so the marble reads clearly against the scene even at the small
-        // apparent size a realistic marble_rad gives it. Earlier version
-        // *mixed* in a bright pale sky color even at low fresnel, which
-        // desaturated the base color toward a washed-out pink (verified by
-        // rendering a close-up: shape/position/tangency were all correct,
-        // only the color read wrong) -- an additive, fresnel-gated rim
-        // highlight keeps the base color dominant everywhere except a thin
-        // bright rim at grazing angles. `marble_color(marble_idx)` (not a
-        // single fixed color): multiple marbles need to read as visibly
-        // distinct bodies, not indistinguishable clones.
-        let base_col = marble_color(marble_idx);
+        // The marble's own cubemap texture (`render.rs`'s `MarbleCubemap`),
+        // sampled directly by the (world-space, unrotated) surface normal --
+        // `mn` points from the marble's center straight out through the hit
+        // point, exactly the direction vector `textureSample` needs to pick
+        // a cube face and texel. No per-marble spin/orientation state exists
+        // yet (`Marble` tracks only `pos`/`vel`/`rad`), so the texture stays
+        // fixed relative to world axes as the marble moves rather than
+        // visually rolling with it -- a deliberate simplification, not a
+        // bug, matching what was actually asked for (\"use this as the
+        // marble's texture\"), not a fuller rolling-orientation feature.
+        // `apply_tint(.., marble_idx % 4u)` recolors it per marble (HSV
+        // hue/sat/val shift, `TINTS`'s doc) so multiple marbles still read
+        // as distinct bodies, same distinguishing purpose the earlier fixed
+        // 4-color palette served, now layered on top of the real texture
+        // instead of replacing it -- the outline branch below applies the
+        // exact same tint index to `OUTLINE_COLOR`, so a marble's ring and
+        // body always read as one consistent color family.
+        let base_col = apply_tint(
+            textureSample(marble_cubemap, marble_cubemap_sampler, mn).rgb,
+            marble_idx % 4u,
+        );
         let ambient = 0.3;
         let diffuse = max(dot(mn, scene.sun.xyz), 0.0);
         let shaded = base_col * (ambient + (1.0 - ambient) * diffuse);
         let rim = pow(fresnel, 2.0) * 0.4 * sky(refl);
         let marble_col = shaded + rim;
         return vec4<f32>(tonemap(marble_col), 1.0);
+    }
+
+    // Solid outline ring (`OUTLINE_WIDTH_FRACTION`'s doc): only relevant
+    // where the real marble didn't already win above -- a ray that hits a
+    // marble's *inflated* sphere but misses its real one is, by
+    // construction, in the thin annulus just outside that marble's own
+    // on-screen silhouette (the inflated sphere's silhouette is only
+    // slightly larger), which is exactly where an outline ring belongs; a
+    // ray that also hits the real marble is handled entirely by the branch
+    // above instead, regardless of what this test says, since the real
+    // surface is always in front of its own outline shell from the
+    // camera's side. Same terrain-occlusion check `marble_hit` already
+    // uses (`!hit_frac || outline_t < t`), so the ring doesn't draw through
+    // solid geometry the marble is embedded in.
+    let outline_visible = outline_t > 0.0 && (!hit_frac || outline_t < t);
+    if (outline_visible) {
+        let col = apply_tint(OUTLINE_COLOR, outline_idx % 4u);
+        return vec4<f32>(tonemap(col), 1.0);
     }
 
     if (hit_frac) {
@@ -1062,6 +1152,8 @@ pub fn generate_shader(obj: &Object) -> String {
     s.push_str(SHADOW_TEXTURE_BINDING);
     s.push('\n');
     s.push_str(MARBLE_BUFFER_BINDING);
+    s.push('\n');
+    s.push_str(MARBLE_TEXTURE_BINDING);
     s.push('\n');
     s.push_str(&generate_scene_functions(obj));
     s.push_str("\n\n");

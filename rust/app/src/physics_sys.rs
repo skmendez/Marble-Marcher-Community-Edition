@@ -33,7 +33,7 @@
 //! the mouse-driven `orbit_camera_input`), since it drives `CameraOrbit`,
 //! not the marble.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use bevy::input::touch::Touches;
 use bevy::prelude::*;
