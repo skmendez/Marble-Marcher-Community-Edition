@@ -43,10 +43,11 @@ use marble_csg::scenes::{
     set_fractal_params, set_menger_params, ClassicHandles, MengerHandles,
     MengerOscillatingSphereHandles, MENGER_BITE_MIN_RADIUS,
 };
+use marble_csg::scene_sync::SceneBundle;
 use marble_csg::{Object, Params, ScalarParam};
 
 use crate::camera::CameraOrbit;
-use crate::physics_sys::{MarbleState, MultiplayerSession};
+use crate::physics_sys::{MarbleState, MultiplayerSession, PendingSceneSync};
 
 /// Which scene to build, selected via
 /// `MM_SCENE=demo|classic_only|menger_sponge|menger_sphere|menger_oscillating_sphere`
@@ -109,9 +110,29 @@ impl SceneKind {
         match value.as_deref() {
             Some("demo") => Self::Demo,
             Some("classic_only") => Self::ClassicOnly,
+            Some("menger_sponge") => Self::MengerSponge,
             Some("menger_sphere") => Self::MengerSphere,
             Some("menger_oscillating_sphere") => Self::MengerOscillatingSphere,
             _ => Self::MengerSponge,
+        }
+    }
+
+    /// The `?scene=`/`MM_SCENE` string that round-trips back to `self`
+    /// through [`Self::from_config`] -- used by `net.rs` to stamp the
+    /// host's actual current scene onto the shareable join link (`&scene=`
+    /// alongside `?join=`), so a joiner lands on the same scene the host is
+    /// running instead of silently falling back to their own URL's
+    /// (usually absent) `?scene=` guess. `MengerSponge` gets an explicit
+    /// value here even though it's also `from_config`'s fallback -- a
+    /// join link should always say what it means, not lean on a default
+    /// happening to agree on both ends.
+    pub fn query_value(self) -> &'static str {
+        match self {
+            Self::Demo => "demo",
+            Self::ClassicOnly => "classic_only",
+            Self::MengerSponge => "menger_sponge",
+            Self::MengerSphere => "menger_sphere",
+            Self::MengerOscillatingSphere => "menger_oscillating_sphere",
         }
     }
 
@@ -774,6 +795,51 @@ pub fn setup(
         kill_y: spawn.kill_y,
         local_player_index: 0,
     });
+}
+
+/// `Update` system: applies the host's most recently received scene-sync
+/// bundle, if `physics_sys::marble_physics_tick_impl`'s `FixedUpdate` polling
+/// stashed one this frame (`PendingSceneSync`'s doc) -- decodes it, replaces
+/// `SceneState`'s tree/params/animations wholesale, and pushes the two
+/// GPU-visible consequences of that (the generated shader, the params
+/// storage buffer) so rendering picks up the new scene with no further
+/// special-casing, exactly as if it had been built by `setup` in the first
+/// place. Runs before `update_material` in the `Update` chain (`main.rs`) so
+/// this frame's material sync already sees the new `bounding_sphere`, not a
+/// stale one.
+///
+/// A no-op decode failure (`SceneBundle::from_bytes` returning `None`) is
+/// swallowed with a `warn!` rather than a panic -- same defensive posture as
+/// every other "this arrived over the network from another peer" decode in
+/// this codebase (`net.rs`'s `decode_messages`): a malformed bundle can't
+/// happen between two clients running the same build, but silently ignoring
+/// one is a safer failure mode than trusting corrupt geometry.
+pub fn apply_pending_scene_sync(
+    mut pending_scene: ResMut<PendingSceneSync>,
+    mut scene_state: ResMut<SceneState>,
+    mut mp: ResMut<MultiplayerSession>,
+    mut shaders: ResMut<Assets<Shader>>,
+    mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
+) {
+    let Some(bytes) = pending_scene.0.take() else { return };
+    let Some(bundle) = SceneBundle::from_bytes(&bytes) else {
+        warn!("multiplayer: received an undecodable scene-sync bundle -- ignoring it");
+        return;
+    };
+    let SceneBundle { object, params, animations } = bundle;
+
+    let wgsl = generate_shader(&object);
+    shaders.insert(MARCHER_SHADER_HANDLE.id(), Shader::from_wgsl(wgsl, "generated://marcher.wgsl"));
+    if let Some(buffer) = storage_buffers.get_mut(&scene_state.params_buffer) {
+        buffer.set_data(params.slots().to_vec());
+    }
+    scene_state.bounding_sphere = pack_bounding_sphere(&object, &params);
+    scene_state.object = object;
+    scene_state.params = params;
+    scene_state.animations = animations;
+
+    mp.mark_scene_synced();
+    info!("multiplayer: applied the host's authoritative scene sync");
 }
 
 /// Keeps the fullscreen quad's world size equal to the window's pixel size

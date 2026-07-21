@@ -187,7 +187,7 @@ impl Expr {
         }
     }
 
-    fn decode_at(bytes: &[u8], pos: usize) -> Option<(Expr, usize)> {
+    pub(crate) fn decode_at(bytes: &[u8], pos: usize) -> Option<(Expr, usize)> {
         let tag = *bytes.get(pos)?;
         let mut pos = pos + 1;
         let next = |pos: &mut usize| -> Option<Expr> {

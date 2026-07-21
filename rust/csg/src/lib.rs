@@ -31,6 +31,7 @@ pub mod fold;
 pub mod object;
 pub mod physics;
 pub mod rollback;
+pub mod scene_sync;
 pub mod scenes;
 
 pub use fold::Fold;
@@ -60,6 +61,20 @@ impl Axis {
             Axis::Z => 2,
         }
     }
+
+    fn encode(self, out: &mut Vec<u8>) {
+        out.push(self.index() as u8);
+    }
+
+    fn decode_at(bytes: &[u8], pos: usize) -> Option<(Axis, usize)> {
+        let axis = match *bytes.get(pos)? {
+            0 => Axis::X,
+            1 => Axis::Y,
+            2 => Axis::Z,
+            _ => return None,
+        };
+        Some((axis, pos + 1))
+    }
 }
 
 /// Typed handles into the shared parameter slot table.
@@ -71,6 +86,50 @@ pub struct Vec3Param(u16);
 pub struct Mat2Param(u16);
 #[derive(Clone, Copy, Debug)]
 pub struct IntParam(u16);
+
+impl ScalarParam {
+    fn encode(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.0.to_le_bytes());
+    }
+
+    fn decode_at(bytes: &[u8], pos: usize) -> Option<(ScalarParam, usize)> {
+        let end = pos + 2;
+        Some((ScalarParam(u16::from_le_bytes(bytes.get(pos..end)?.try_into().ok()?)), end))
+    }
+}
+
+impl Vec3Param {
+    fn encode(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.0.to_le_bytes());
+    }
+
+    fn decode_at(bytes: &[u8], pos: usize) -> Option<(Vec3Param, usize)> {
+        let end = pos + 2;
+        Some((Vec3Param(u16::from_le_bytes(bytes.get(pos..end)?.try_into().ok()?)), end))
+    }
+}
+
+impl Mat2Param {
+    fn encode(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.0.to_le_bytes());
+    }
+
+    fn decode_at(bytes: &[u8], pos: usize) -> Option<(Mat2Param, usize)> {
+        let end = pos + 2;
+        Some((Mat2Param(u16::from_le_bytes(bytes.get(pos..end)?.try_into().ok()?)), end))
+    }
+}
+
+impl IntParam {
+    fn encode(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.0.to_le_bytes());
+    }
+
+    fn decode_at(bytes: &[u8], pos: usize) -> Option<(IntParam, usize)> {
+        let end = pos + 2;
+        Some((IntParam(u16::from_le_bytes(bytes.get(pos..end)?.try_into().ok()?)), end))
+    }
+}
 
 /// The parameter slot table: one `Vec4` per parameter, uploaded verbatim as a
 /// storage buffer. Ints are stored as floats (converted back in WGSL); a
@@ -142,6 +201,36 @@ impl Params {
     pub fn int(&self, h: IntParam) -> i32 {
         self.slots[h.0 as usize].x as i32
     }
+
+    /// Serializes the whole slot table as a flat, length-prefixed `f32`
+    /// array — multiplayer's join-time scene sync
+    /// (`rollback::SceneBundle`) sends this alongside the `Object`/`Fold`
+    /// tree that indexes into it, since a `*Param` handle is only ever
+    /// meaningful together with the slots it indexes.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.slots.len() as u32).to_le_bytes());
+        for v in &self.slots {
+            out.extend_from_slice(&v.x.to_le_bytes());
+            out.extend_from_slice(&v.y.to_le_bytes());
+            out.extend_from_slice(&v.z.to_le_bytes());
+            out.extend_from_slice(&v.w.to_le_bytes());
+        }
+    }
+
+    fn decode_at(bytes: &[u8], pos: usize) -> Option<(Params, usize)> {
+        let mut pos = pos;
+        let count = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
+        pos += 4;
+        let mut slots = Vec::with_capacity(count);
+        for _ in 0..count {
+            let end = pos + 16;
+            let chunk = bytes.get(pos..end)?;
+            let f = |lo: usize| f32::from_le_bytes(chunk[lo..lo + 4].try_into().unwrap());
+            slots.push(Vec4::new(f(0), f(4), f(8), f(12)));
+            pos = end;
+        }
+        Some((Params { slots }, pos))
+    }
 }
 
 fn pack_mat2(m: Mat2) -> Vec4 {
@@ -178,6 +267,34 @@ impl ScalarValue {
             ScalarValue::Param(h) => format!("params[{}].x", h.0),
         }
     }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            ScalarValue::Const(v) => {
+                out.push(0);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            ScalarValue::Param(h) => {
+                out.push(1);
+                h.encode(out);
+            }
+        }
+    }
+
+    fn decode_at(bytes: &[u8], pos: usize) -> Option<(ScalarValue, usize)> {
+        match *bytes.get(pos)? {
+            0 => {
+                let end = pos + 1 + 4;
+                let v = f32::from_le_bytes(bytes.get(pos + 1..end)?.try_into().ok()?);
+                Some((ScalarValue::Const(v), end))
+            }
+            1 => {
+                let (h, end) = ScalarParam::decode_at(bytes, pos + 1)?;
+                Some((ScalarValue::Param(h), end))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -203,6 +320,37 @@ impl Vec3Value {
                 wgsl_f32(v.z)
             ),
             Vec3Value::Param(h) => format!("params[{}].xyz", h.0),
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Vec3Value::Const(v) => {
+                out.push(0);
+                out.extend_from_slice(&v.x.to_le_bytes());
+                out.extend_from_slice(&v.y.to_le_bytes());
+                out.extend_from_slice(&v.z.to_le_bytes());
+            }
+            Vec3Value::Param(h) => {
+                out.push(1);
+                h.encode(out);
+            }
+        }
+    }
+
+    fn decode_at(bytes: &[u8], pos: usize) -> Option<(Vec3Value, usize)> {
+        match *bytes.get(pos)? {
+            0 => {
+                let end = pos + 1 + 12;
+                let chunk = bytes.get(pos + 1..end)?;
+                let f = |lo: usize| f32::from_le_bytes(chunk[lo..lo + 4].try_into().unwrap());
+                Some((Vec3Value::Const(Vec3::new(f(0), f(4), f(8))), end))
+            }
+            1 => {
+                let (h, end) = Vec3Param::decode_at(bytes, pos + 1)?;
+                Some((Vec3Value::Param(h), end))
+            }
+            _ => None,
         }
     }
 }
@@ -236,6 +384,39 @@ impl Mat2Value {
             ),
         }
     }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Mat2Value::Const(m) => {
+                out.push(0);
+                let packed = pack_mat2(*m);
+                out.extend_from_slice(&packed.x.to_le_bytes());
+                out.extend_from_slice(&packed.y.to_le_bytes());
+                out.extend_from_slice(&packed.z.to_le_bytes());
+                out.extend_from_slice(&packed.w.to_le_bytes());
+            }
+            Mat2Value::Param(h) => {
+                out.push(1);
+                h.encode(out);
+            }
+        }
+    }
+
+    fn decode_at(bytes: &[u8], pos: usize) -> Option<(Mat2Value, usize)> {
+        match *bytes.get(pos)? {
+            0 => {
+                let end = pos + 1 + 16;
+                let chunk = bytes.get(pos + 1..end)?;
+                let f = |lo: usize| f32::from_le_bytes(chunk[lo..lo + 4].try_into().unwrap());
+                Some((Mat2Value::Const(unpack_mat2(Vec4::new(f(0), f(4), f(8), f(12)))), end))
+            }
+            1 => {
+                let (h, end) = Mat2Param::decode_at(bytes, pos + 1)?;
+                Some((Mat2Value::Param(h), end))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -256,6 +437,34 @@ impl IntValue {
         match self {
             IntValue::Const(v) => format!("{v}"),
             IntValue::Param(h) => format!("i32(params[{}].x)", h.0),
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            IntValue::Const(v) => {
+                out.push(0);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            IntValue::Param(h) => {
+                out.push(1);
+                h.encode(out);
+            }
+        }
+    }
+
+    fn decode_at(bytes: &[u8], pos: usize) -> Option<(IntValue, usize)> {
+        match *bytes.get(pos)? {
+            0 => {
+                let end = pos + 1 + 4;
+                let v = i32::from_le_bytes(bytes.get(pos + 1..end)?.try_into().ok()?);
+                Some((IntValue::Const(v), end))
+            }
+            1 => {
+                let (h, end) = IntParam::decode_at(bytes, pos + 1)?;
+                Some((IntValue::Param(h), end))
+            }
+            _ => None,
         }
     }
 }

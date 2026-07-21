@@ -305,6 +305,117 @@ impl Fold {
             Fold::OrbitInit(_) | Fold::OrbitMax(_) => Some((c, r)),
         }
     }
+
+    /// Serializes to a compact, tag-prefixed byte encoding, one tag byte
+    /// per node then its fields/operands back to back — same hand-rolled,
+    /// self-delimiting convention as [`crate::expr::Expr::encode`] (see its
+    /// doc), extended here to a tree with more than one field per node.
+    /// Used by [`crate::scene_sync::SceneBundle`] for multiplayer's join-time
+    /// scene sync.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Fold::Abs => out.push(0),
+            Fold::Menger => out.push(1),
+            Fold::Rotate { axis, mat } => {
+                out.push(2);
+                axis.encode(out);
+                mat.encode(out);
+            }
+            Fold::ScaleTranslate { scale, shift } => {
+                out.push(3);
+                scale.encode(out);
+                shift.encode(out);
+            }
+            Fold::Plane { normal, offset } => {
+                out.push(4);
+                normal.encode(out);
+                offset.encode(out);
+            }
+            Fold::Modulo { axis, modulus } => {
+                out.push(5);
+                axis.encode(out);
+                modulus.encode(out);
+            }
+            Fold::Series(folds) => {
+                out.push(6);
+                out.extend_from_slice(&(folds.len() as u32).to_le_bytes());
+                for f in folds {
+                    f.encode(out);
+                }
+            }
+            Fold::Repeat { count, inner } => {
+                out.push(7);
+                count.encode(out);
+                inner.encode(out);
+            }
+            Fold::OrbitInit(v) => {
+                out.push(8);
+                v.encode(out);
+            }
+            Fold::OrbitMax(v) => {
+                out.push(9);
+                v.encode(out);
+            }
+        }
+    }
+
+    /// Inverse of [`Self::encode`] — see [`crate::expr::Expr::decode_at`]
+    /// for the recursion shape this mirrors (`None` on any malformed/
+    /// truncated input, `pos` is where the caller should resume reading).
+    pub(crate) fn decode_at(bytes: &[u8], pos: usize) -> Option<(Fold, usize)> {
+        let tag = *bytes.get(pos)?;
+        let pos = pos + 1;
+        let fold = match tag {
+            0 => (Fold::Abs, pos),
+            1 => (Fold::Menger, pos),
+            2 => {
+                let (axis, pos) = Axis::decode_at(bytes, pos)?;
+                let (mat, pos) = Mat2Value::decode_at(bytes, pos)?;
+                (Fold::Rotate { axis, mat }, pos)
+            }
+            3 => {
+                let (scale, pos) = ScalarValue::decode_at(bytes, pos)?;
+                let (shift, pos) = Vec3Value::decode_at(bytes, pos)?;
+                (Fold::ScaleTranslate { scale, shift }, pos)
+            }
+            4 => {
+                let (normal, pos) = Vec3Value::decode_at(bytes, pos)?;
+                let (offset, pos) = ScalarValue::decode_at(bytes, pos)?;
+                (Fold::Plane { normal, offset }, pos)
+            }
+            5 => {
+                let (axis, pos) = Axis::decode_at(bytes, pos)?;
+                let (modulus, pos) = ScalarValue::decode_at(bytes, pos)?;
+                (Fold::Modulo { axis, modulus }, pos)
+            }
+            6 => {
+                let count = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
+                let mut pos = pos + 4;
+                let mut folds = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let (f, next) = Fold::decode_at(bytes, pos)?;
+                    folds.push(f);
+                    pos = next;
+                }
+                (Fold::Series(folds), pos)
+            }
+            7 => {
+                let (count, pos) = IntValue::decode_at(bytes, pos)?;
+                let (inner, pos) = Fold::decode_at(bytes, pos)?;
+                (Fold::Repeat { count, inner: Box::new(inner) }, pos)
+            }
+            8 => {
+                let (v, pos) = Vec3Value::decode_at(bytes, pos)?;
+                (Fold::OrbitInit(v), pos)
+            }
+            9 => {
+                let (v, pos) = Vec3Value::decode_at(bytes, pos)?;
+                (Fold::OrbitMax(v), pos)
+            }
+            _ => return None,
+        };
+        Some(fold)
+    }
 }
 
 #[cfg(test)]

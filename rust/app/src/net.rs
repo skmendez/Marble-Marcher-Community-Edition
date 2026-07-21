@@ -101,6 +101,7 @@ const TAG_INPUT: u8 = 0;
 const TAG_CHECKSUM: u8 = 1;
 const TAG_RESYNC_REQUEST: u8 = 2;
 const TAG_RESYNC_PAYLOAD: u8 = 3;
+const TAG_SCENE_SYNC: u8 = 4;
 
 /// One message on the wire, tag-prefixed so [`WebRtcTransport`] can share
 /// a single channel between the original per-tick input exchange and the
@@ -134,6 +135,18 @@ enum NetMessage {
         tick: Tick,
         marbles: Vec<Marble>,
     },
+    /// The host's whole CSG scene tree + params + animation table
+    /// (`marble_csg::scene_sync::SceneBundle::to_bytes`), sent once at
+    /// connect (join or reconnect) alongside `ResyncPayload` so the joiner
+    /// renders/simulates against the host's actual scene instead of
+    /// guessing one from its own `?scene=` (`physics_sys.rs`'s doc on the
+    /// join flow). Opaque here — `net.rs` only ever carries these bytes,
+    /// it doesn't decode them (`SceneBundle` is `marble_csg`'s concern, not
+    /// the transport's), length-prefixed as a `u32` same as
+    /// `ResyncPayload`'s marbles.
+    SceneSync {
+        bytes: Vec<u8>,
+    },
 }
 
 fn encode_message(msg: &NetMessage) -> Vec<u8> {
@@ -165,6 +178,13 @@ fn encode_message(msg: &NetMessage) -> Vec<u8> {
             for m in marbles {
                 out.extend_from_slice(&pack_marble(m));
             }
+            out
+        }
+        NetMessage::SceneSync { bytes } => {
+            let mut out = Vec::with_capacity(1 + 4 + bytes.len());
+            out.push(TAG_SCENE_SYNC);
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
             out
         }
     }
@@ -208,10 +228,17 @@ fn decode_messages(bytes: &[u8]) -> Vec<NetMessage> {
                 i += count * MARBLE_LEN;
                 out.push(NetMessage::ResyncPayload { tick, marbles });
             }
+            TAG_SCENE_SYNC => {
+                let len = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
+                i += 4;
+                let payload = bytes[i..i + len].to_vec();
+                i += len;
+                out.push(NetMessage::SceneSync { bytes: payload });
+            }
             // An unrecognized tag means the stream is malformed -- can't
             // happen in practice (both peers always run the exact same
             // build, so every tag either side ever writes is one of the
-            // four above), but stopping rather than guessing how many
+            // five above), but stopping rather than guessing how many
             // bytes to skip past garbage is the safe failure mode.
             _ => break,
         }
@@ -396,7 +423,13 @@ pub fn poll_net_status(mut session: ResMut<NetSession>) {
     if session.role == Role::Host && session.hosted_join_suffix.is_none() {
         let id = js_bridge::hosted_id();
         if !id.is_empty() {
-            session.hosted_join_suffix = Some(format!("?join={id}"));
+            // Stamp this host's actual current scene onto the link too --
+            // `?join=` alone told a joiner nothing about which scene to
+            // load, so they'd resolve `?scene=` from their own (usually
+            // absent) URL and silently land on the default scene instead
+            // of the host's (`SceneKind::query_value`'s doc).
+            let scene = crate::render::SceneKind::from_config().query_value();
+            session.hosted_join_suffix = Some(format!("?join={id}&scene={scene}"));
         }
     }
     let err = js_bridge::take_error();
@@ -619,6 +652,7 @@ pub struct WebRtcTransport {
     pending_checksums: Vec<(Tick, u64)>,
     pending_resync_requests: Vec<Tick>,
     pending_resync_payloads: Vec<(Tick, Vec<Marble>)>,
+    pending_scene_syncs: Vec<Vec<u8>>,
 }
 
 impl WebRtcTransport {
@@ -629,6 +663,7 @@ impl WebRtcTransport {
             pending_checksums: Vec::new(),
             pending_resync_requests: Vec::new(),
             pending_resync_payloads: Vec::new(),
+            pending_scene_syncs: Vec::new(),
         }
     }
 
@@ -647,8 +682,21 @@ impl WebRtcTransport {
                 NetMessage::Checksum { tick, hash } => self.pending_checksums.push((tick, hash)),
                 NetMessage::ResyncRequest { tick } => self.pending_resync_requests.push(tick),
                 NetMessage::ResyncPayload { tick, marbles } => self.pending_resync_payloads.push((tick, marbles)),
+                NetMessage::SceneSync { bytes } => self.pending_scene_syncs.push(bytes),
             }
         }
+    }
+
+    pub fn send_scene_sync(&mut self, bytes: Vec<u8>) {
+        js_bridge::send(&encode_message(&NetMessage::SceneSync { bytes }));
+    }
+
+    /// Drains every scene-sync bundle the peer has sent since the last call
+    /// (only ever populated on the non-host side, same as
+    /// [`Self::poll_resync_payloads`] -- host-authoritative throughout).
+    pub fn poll_scene_syncs(&mut self) -> Vec<Vec<u8>> {
+        self.drain_and_demux();
+        std::mem::take(&mut self.pending_scene_syncs)
     }
 
     pub fn send_checksum(&mut self, tick: Tick, hash: u64) {
@@ -739,6 +787,7 @@ mod tests {
             NetMessage::Checksum { tick: 100, hash: 0xdead_beef_1234_5678 },
             NetMessage::ResyncRequest { tick: 7 },
             NetMessage::ResyncPayload { tick: 55, marbles: vec![sample_marble(1.0), sample_marble(2.0)] },
+            NetMessage::SceneSync { bytes: vec![1, 2, 3, 4, 5] },
         ];
         for msg in cases {
             let decoded = decode_messages(&encode_message(&msg));
@@ -767,6 +816,7 @@ mod tests {
                         assert_eq!(a.rad, b.rad);
                     }
                 }
+                (NetMessage::SceneSync { bytes: b1 }, NetMessage::SceneSync { bytes: b2 }) => assert_eq!(b1, b2),
                 _ => panic!("decoded message kind doesn't match the encoded kind"),
             }
         }
@@ -789,18 +839,20 @@ mod tests {
         bytes.extend(encode_message(&NetMessage::Checksum { tick: 2, hash: 999 }));
         bytes.extend(encode_message(&NetMessage::ResyncRequest { tick: 3 }));
         bytes.extend(encode_message(&NetMessage::ResyncPayload { tick: 4, marbles: vec![sample_marble(0.0)] }));
+        bytes.extend(encode_message(&NetMessage::SceneSync { bytes: vec![9, 8, 7] }));
         bytes.extend(encode_message(&NetMessage::Input {
             tick: 5,
             input: PlayerInput { dx: 0.5, dy: 0.5, orientation: Quat::IDENTITY },
         }));
 
         let decoded = decode_messages(&bytes);
-        assert_eq!(decoded.len(), 5);
+        assert_eq!(decoded.len(), 6);
         assert!(matches!(decoded[0], NetMessage::Input { tick: 1, .. }));
         assert!(matches!(decoded[1], NetMessage::Checksum { tick: 2, hash: 999 }));
         assert!(matches!(decoded[2], NetMessage::ResyncRequest { tick: 3 }));
         assert!(matches!(decoded[3], NetMessage::ResyncPayload { tick: 4, .. }));
-        assert!(matches!(decoded[4], NetMessage::Input { tick: 5, .. }));
+        assert!(matches!(&decoded[4], NetMessage::SceneSync { bytes } if bytes == &[9, 8, 7]));
+        assert!(matches!(decoded[5], NetMessage::Input { tick: 5, .. }));
     }
 
     /// [`WebRtcTransport`]'s demultiplexing: a fabricated byte stream
@@ -826,6 +878,7 @@ mod tests {
             marbles: vec![sample_marble(3.0), sample_marble(4.0), sample_marble(5.0)],
         }));
         bytes.extend(encode_message(&NetMessage::ResyncRequest { tick: 13 }));
+        bytes.extend(encode_message(&NetMessage::SceneSync { bytes: vec![42; 37] }));
         bytes.extend(encode_message(&NetMessage::Checksum { tick: 14, hash: 2 }));
 
         let decoded = decode_messages(&bytes);
@@ -838,9 +891,17 @@ mod tests {
                 _ => None,
             })
             .unwrap();
+        let scene_sync_len = decoded
+            .iter()
+            .find_map(|m| match m {
+                NetMessage::SceneSync { bytes } => Some(bytes.len()),
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(checksum_count, 2);
         assert_eq!(input_count, 1);
         assert_eq!(payload_marble_count, 3);
+        assert_eq!(scene_sync_len, 37);
         assert!(decoded.iter().any(|m| matches!(m, NetMessage::ResyncRequest { tick: 13 })));
     }
 }

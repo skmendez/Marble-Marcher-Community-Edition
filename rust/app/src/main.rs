@@ -34,8 +34,8 @@ use net::{
     handle_copy_button_click, poll_net_status, setup_networking, spawn_net_ui, sync_net_ui_text,
     update_copy_button_visibility, update_copy_feedback, CopyFeedback,
 };
-use physics_sys::marble_physics_tick;
-use render::{finalize_marble_cubemap, setup, sync_quad_scale, update_material, FineMarcherMaterial};
+use physics_sys::{marble_physics_tick, PendingSceneSync};
+use render::{apply_pending_scene_sync, finalize_marble_cubemap, setup, sync_quad_scale, update_material, FineMarcherMaterial};
 use shadow_pass::{
     resize_shadow_render_target, setup_shadow_pipeline, sync_shadow_quad_scale,
     update_shadow_material, ShadowMarcherMaterial,
@@ -95,6 +95,7 @@ fn main() {
         .init_resource::<CameraOrbit>()
         .init_resource::<TouchDebugInfo>()
         .init_resource::<CopyFeedback>()
+        .init_resource::<PendingSceneSync>()
         // `setup` (below) inserts `SceneState`/`MarbleState`/
         // `MultiplayerSession` directly rather than `init_resource`-ing any
         // of them here -- none has a scene-independent `Default` to speak
@@ -119,6 +120,7 @@ fn main() {
         .add_systems(
             Update,
             (
+                apply_pending_scene_sync,
                 resize_coarse_render_target,
                 resize_shadow_render_target,
                 sync_quad_scale,

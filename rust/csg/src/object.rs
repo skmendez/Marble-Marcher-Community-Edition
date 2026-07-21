@@ -128,6 +128,104 @@ impl Object {
             Object::Difference(left, _right) => left.bounding_sphere(params),
         }
     }
+
+    /// Serializes to a compact, tag-prefixed byte encoding — same
+    /// hand-rolled, self-delimiting, recursive convention as
+    /// [`crate::expr::Expr::encode`]/[`Fold::encode`] (see the former's
+    /// doc for why). Used by [`crate::scene_sync::SceneBundle`] for
+    /// multiplayer's join-time scene sync: the host serializes its live
+    /// scene tree once at connect and sends it to the joiner, instead of
+    /// the joiner building its own scene from a locally-hardcoded
+    /// `SceneKind` constructor that could disagree with whatever the host
+    /// actually has loaded.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Object::Sphere { radius } => {
+                out.push(0);
+                radius.encode(out);
+            }
+            Object::Cuboid { half_extent } => {
+                out.push(1);
+                half_extent.encode(out);
+            }
+            Object::Fractal { fold, base } => {
+                out.push(2);
+                fold.encode(out);
+                base.encode(out);
+            }
+            Object::Union(left, right) => {
+                out.push(3);
+                left.encode(out);
+                right.encode(out);
+            }
+            Object::Intersect(left, right) => {
+                out.push(4);
+                left.encode(out);
+                right.encode(out);
+            }
+            Object::Difference(left, right) => {
+                out.push(5);
+                left.encode(out);
+                right.encode(out);
+            }
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode(&mut out);
+        out
+    }
+
+    /// Inverse of [`Self::encode`]/[`Self::to_bytes`] — `None` on any
+    /// malformed/truncated input, or if `bytes` has leftover data after a
+    /// complete tree decodes (same reasoning as
+    /// [`crate::expr::Expr::from_bytes`]).
+    pub fn from_bytes(bytes: &[u8]) -> Option<Object> {
+        let (object, consumed) = Self::decode_at(bytes, 0)?;
+        if consumed == bytes.len() {
+            Some(object)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn decode_at(bytes: &[u8], pos: usize) -> Option<(Object, usize)> {
+        let tag = *bytes.get(pos)?;
+        let pos = pos + 1;
+        let result = match tag {
+            0 => {
+                let (radius, pos) = ScalarValue::decode_at(bytes, pos)?;
+                (Object::Sphere { radius }, pos)
+            }
+            1 => {
+                let (half_extent, pos) = Vec3Value::decode_at(bytes, pos)?;
+                (Object::Cuboid { half_extent }, pos)
+            }
+            2 => {
+                let (fold, pos) = Fold::decode_at(bytes, pos)?;
+                let (base, pos) = Object::decode_at(bytes, pos)?;
+                (Object::Fractal { fold, base: Box::new(base) }, pos)
+            }
+            3 => {
+                let (left, pos) = Object::decode_at(bytes, pos)?;
+                let (right, pos) = Object::decode_at(bytes, pos)?;
+                (Object::Union(Box::new(left), Box::new(right)), pos)
+            }
+            4 => {
+                let (left, pos) = Object::decode_at(bytes, pos)?;
+                let (right, pos) = Object::decode_at(bytes, pos)?;
+                (Object::Intersect(Box::new(left), Box::new(right)), pos)
+            }
+            5 => {
+                let (left, pos) = Object::decode_at(bytes, pos)?;
+                let (right, pos) = Object::decode_at(bytes, pos)?;
+                (Object::Difference(Box::new(left), Box::new(right)), pos)
+            }
+            _ => return None,
+        };
+        Some(result)
+    }
 }
 
 /// Smallest sphere enclosing two given spheres.
