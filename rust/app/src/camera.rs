@@ -236,10 +236,10 @@ pub fn orbit_camera_input(
 
     let mut roll_dir = 0.0f32;
     if keys.pressed(KeyCode::KeyQ) {
-        roll_dir -= 1.0;
+        roll_dir += 1.0;
     }
     if keys.pressed(KeyCode::KeyE) {
-        roll_dir += 1.0;
+        roll_dir -= 1.0;
     }
     if roll_dir != 0.0 {
         let delta = roll_dir * KEYBOARD_ROLL_RATE * time.delta_secs();

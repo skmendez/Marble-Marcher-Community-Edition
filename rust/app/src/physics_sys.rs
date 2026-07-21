@@ -8,17 +8,13 @@
 //! camera-relative thrust, no kill plane). Defaults to `Flying` (see
 //! `GravityMode`'s doc for why).
 //!
-//! WASD sign convention: setting `dy = -1` for W moves the marble *toward*
-//! the camera's eye position; S (`dy = +1`) moves it away, deeper along the
-//! view direction. Verified empirically (not just derived on paper) by
-//! logging `marble.pos` before/after holding each key against a live build
-//! and checking its displacement's dot product against the camera's
-//! `forward` vector — an earlier version of this comment claimed the
-//! opposite ("W rolls the marble away from the orbiting camera... S rolls
-//! it back toward the camera"), derived purely algebraically from
-//! `CameraOrbit`'s basis and never actually checked against a running
-//! build; that derivation had a sign error, which is exactly why the touch
-//! pinch gesture built on top of it (below) felt backwards to begin with.
+//! WASD sign convention: setting `dy = -1` for S moves the marble *toward*
+//! the camera's eye position; W (`dy = +1`) moves it away, deeper along the
+//! view direction. This is a deliberate user-requested swap of W/S (and,
+//! in `camera.rs`, Q/E) from an earlier convention where W was "toward" —
+//! verified empirically (not just derived on paper) by logging `marble.pos`
+//! before/after holding each key against a live build and checking its
+//! displacement's dot product against the camera's `forward` vector.
 //! Setting `dx = +1` for D yields `+(cos(yaw), 0, -sin(yaw))`, which is
 //! exactly `CameraOrbit`'s `right` vector at zero pitch — D rolls the
 //! marble in the camera's screen-right direction (unaffected by the above
@@ -28,7 +24,7 @@
 //!
 //! Touch: a 2-finger pinch feeds an additional `dy` (on top of WASD's) via
 //! `touch::read_two_finger_gesture` — pinching in pulls the marble toward
-//! the camera (W-equivalent), pinching out pushes it away (S-equivalent).
+//! the camera (S-equivalent), pinching out pushes it away (W-equivalent).
 //! Read directly here (not via an `Update`-schedule intermediary) for the
 //! same reason WASD is: `Touches`, like `ButtonInput<KeyCode>`, is input
 //! state readable from any schedule, not something that needs per-frame
@@ -206,10 +202,10 @@ fn marble_physics_tick_impl(
     let mut dx = 0.0f32;
     let mut dy = 0.0f32;
     if keys.pressed(KeyCode::KeyW) {
-        dy -= 1.0;
+        dy += 1.0;
     }
     if keys.pressed(KeyCode::KeyS) {
-        dy += 1.0;
+        dy -= 1.0;
     }
     if keys.pressed(KeyCode::KeyA) {
         dx -= 1.0;
