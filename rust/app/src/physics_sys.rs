@@ -51,7 +51,7 @@ use marble_csg::physics::{GravityMode, Marble, PhysicsConfig, PlayerInput};
 use marble_csg::rollback::{InputTransport, RollbackSim};
 
 use crate::camera::CameraOrbit;
-use crate::net::{NetSession, NetStatus, WebRtcTransport};
+use crate::net::{NetSession, NetStatus, Role, WebRtcTransport};
 use crate::render::SceneState;
 use crate::touch::read_two_finger_gesture;
 
@@ -124,6 +124,16 @@ impl MarbleState {
 /// correct than a lazy-init design's reconnect story, though still not a
 /// full resync from a peer's own state if the two have actually diverged
 /// during the gap.
+///
+/// **Rollback resiliency** (periodic state checksums + resync-on-mismatch,
+/// same idea Photon Quantum/Factorio-style lockstep engines ship): while
+/// connected, [`marble_physics_tick`] also periodically exchanges a
+/// checksum of each side's state at whatever tick is currently eligible
+/// for comparison (`RollbackSim::latest_checksum_tick`) and, on a
+/// mismatch, has the non-host side pull a full authoritative correction
+/// from the host (`RollbackSim::hard_reset_to`) — this is the "actually
+/// diverged" case the paragraph above calls out as unaddressed by the
+/// plain reconnect story, now handled.
 #[derive(Resource)]
 pub struct MultiplayerSession {
     pub sim: RollbackSim,
@@ -131,6 +141,13 @@ pub struct MultiplayerSession {
     /// — absent, this system never polls for or sends anything over the
     /// network.
     transport: Option<WebRtcTransport>,
+    /// Set once a checksum mismatch has triggered a `ResyncRequest`, until
+    /// the matching `ResyncPayload` actually lands and `hard_reset_to`
+    /// runs -- without this, a mismatch that's still visible on
+    /// subsequent ticks (the request/response round trip takes at least
+    /// one network hop each way) would otherwise re-request every single
+    /// tick in between.
+    resync_pending: bool,
 }
 
 impl MultiplayerSession {
@@ -151,6 +168,84 @@ impl MultiplayerSession {
                 ROLLBACK_WINDOW_TICKS,
             ),
             transport: None,
+            resync_pending: false,
+        }
+    }
+}
+
+/// How often (in ticks) each connected peer publishes a checksum of its
+/// own state at whatever tick is currently eligible for comparison
+/// (`RollbackSim::latest_checksum_tick`) — 60 ticks is one second's worth
+/// at this app's fixed 60Hz tick rate: frequent enough to notice a real
+/// divergence within a second or so of it happening, infrequent enough
+/// not to spend meaningful channel bandwidth on it every tick. A starting
+/// point, not a tuned/load-bearing constant (this feature's own plan says
+/// as much) — easy to revisit once real cross-machine play has been
+/// exercised enough to have an opinion.
+const CHECKSUM_INTERVAL_TICKS: u64 = 60;
+
+/// Runs the checksum/resync side channel for one tick, alongside (but
+/// independent of) the per-tick input exchange in
+/// [`marble_physics_tick_impl`]: periodically publishes this side's own
+/// checksum for whatever tick just became eligible, compares any checksum
+/// the peer sent back against this side's own cached value for that same
+/// tick, and drives the request/response halves of a resync once a
+/// mismatch is actually detected.
+///
+/// Host-authoritative throughout (`net::Role`'s doc, same convention the
+/// join flow already establishes): only the non-host side ever requests a
+/// correction, and only the host side ever answers one. The host still
+/// *compares* checksums like anyone else (so a mismatch is visible in its
+/// own logs), it just never acts on one — its own state is authoritative
+/// by definition, so there's nothing for it to correct itself against.
+fn exchange_checksums_and_resync(
+    sim: &mut RollbackSim,
+    transport: &mut WebRtcTransport,
+    role: Role,
+    resync_pending: &mut bool,
+) {
+    // Answer any resync request unconditionally with this side's own live
+    // state -- only ever actually arrives on the host side in practice
+    // (a non-host peer never sends one to anyone but the host), but there's
+    // no reason to gate this on `role` too: an unexpected request just gets
+    // an honest answer either way.
+    for _requested_tick in transport.poll_resync_requests() {
+        transport.send_resync_payload(sim.current_tick(), sim.marbles().to_vec());
+    }
+
+    // Accept the most recent resync payload the host has sent, if any --
+    // unconditionally overwriting local state. This is the one thing that
+    // actually corrects a detected divergence.
+    if let Some((tick, marbles)) = transport.poll_resync_payloads().into_iter().next_back() {
+        info!("multiplayer: applying full-state resync from host at tick {tick}");
+        sim.hard_reset_to(tick, marbles);
+        *resync_pending = false;
+    }
+
+    // Compare the peer's checksums against this side's own cached value
+    // for the same tick. `checksum_at` returning `None` means that tick's
+    // no longer in this side's own cache (arrived unusually late) --
+    // inconclusive, not a mismatch, so it's skipped rather than guessed at.
+    for (tick, peer_hash) in transport.poll_checksums() {
+        if let Some(local_hash) = sim.checksum_at(tick) {
+            if local_hash != peer_hash && role == Role::Joiner && !*resync_pending {
+                warn!(
+                    "multiplayer: checksum mismatch at tick {tick} (local {local_hash:#x} vs peer {peer_hash:#x}) \
+                     -- requesting a full resync from the host"
+                );
+                transport.send_resync_request(tick);
+                *resync_pending = true;
+            }
+        }
+    }
+
+    // Periodically publish this side's own checksum for whatever tick is
+    // currently eligible for comparison.
+    if sim.current_tick().is_multiple_of(CHECKSUM_INTERVAL_TICKS) {
+        if let Some(tick) = sim.latest_checksum_tick() {
+            if let Some(hash) = sim.checksum_at(tick) {
+                transport.send_checksum(tick, hash);
+            }
         }
     }
 }
@@ -204,11 +299,14 @@ fn marble_physics_tick_impl(
     if !scene.kind.has_marble() {
         return;
     }
-    // A real `&mut SceneState` (not `ResMut`'s `Deref`/`DerefMut`, which go
-    // through method calls the borrow checker can't see through) so
-    // `&scene.object`/`&mut scene.params`/`&scene.animations` below can be
-    // borrowed as the disjoint fields they actually are, in one call.
+    // A real `&mut SceneState`/`&mut MultiplayerSession` (not `ResMut`'s
+    // `Deref`/`DerefMut`, which go through method calls the borrow checker
+    // can't see through) so their individual fields below can be borrowed
+    // as the disjoint fields they actually are, in one call --
+    // `exchange_checksums_and_resync` needs `&mut mp.sim` and
+    // `mp.transport.as_mut()` simultaneously, same reasoning as `scene`.
     let scene = &mut *scene;
+    let mp = &mut *mp;
 
     if keys.just_pressed(KeyCode::KeyG) {
         marble_state.cfg.mode = match marble_state.cfg.mode {
@@ -299,6 +397,20 @@ fn marble_physics_tick_impl(
         mp.transport = Some(WebRtcTransport::new(net.role));
     }
 
+    // Debug/test-only: `F9`, while connected, deliberately nudges this
+    // client's own live position out from under the local simulation --
+    // manufactures exactly the kind of cross-peer divergence rollback
+    // resiliency's checksum comparison exists to catch, so a live
+    // verification pass can force one and confirm the other side actually
+    // detects and recovers from it. Compiled out of release builds
+    // entirely (`RollbackSim::debug_perturb_position`'s doc).
+    #[cfg(debug_assertions)]
+    if keys.just_pressed(KeyCode::F9) && mp.transport.is_some() {
+        let idx = marble_state.local_player_index;
+        mp.sim.debug_perturb_position(idx, Vec3::new(5.0, 0.0, 0.0));
+        warn!("multiplayer: DEBUG forced a local position perturbation (F9) for checksum-resync verification");
+    }
+
     let local_idx = marble_state.local_player_index;
     let tick = mp.sim.current_tick() + 1;
 
@@ -347,4 +459,15 @@ fn marble_physics_tick_impl(
     }
     mp.sim.advance(&scene.object, &mut scene.params, &scene.animations, &marble_state.cfg, kill_y, &starts);
     marble_state.marbles = mp.sim.marbles().to_vec();
+
+    if net.status == NetStatus::Connected {
+        if let Some(transport) = mp.transport.as_mut() {
+            exchange_checksums_and_resync(&mut mp.sim, transport, net.role, &mut mp.resync_pending);
+            // `exchange_checksums_and_resync` may have just replaced
+            // `mp.sim`'s live state wholesale (`hard_reset_to`) -- refresh
+            // the read-only mirror so it can't go a whole extra frame
+            // showing stale, pre-resync marble state.
+            marble_state.marbles = mp.sim.marbles().to_vec();
+        }
+    }
 }

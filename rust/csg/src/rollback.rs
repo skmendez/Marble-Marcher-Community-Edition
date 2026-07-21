@@ -129,7 +129,27 @@ pub struct RollbackSim {
     /// exactly the property this whole module exists to guarantee, so
     /// silently violating it would be worse than failing loudly.
     window: u64,
+    /// Checksums of every tick that has become eligible for cross-peer
+    /// comparison (`tick <= current_tick - window` — the same boundary
+    /// [`Self::oldest_available`] computes for [`Self::receive_inputs`]),
+    /// cached the instant each one is reached rather than recomputed on
+    /// demand: `snapshots` itself is pruned to `window + 1` entries, far
+    /// tighter than a consumer's own checksum-exchange interval is likely
+    /// to be, so the snapshot a given eligible tick needs may already be
+    /// gone by the time something asks for its checksum. Retention here is
+    /// independent of `window` (see [`CHECKSUM_CACHE_TICKS`]).
+    checksum_cache: BTreeMap<Tick, u64>,
 }
+
+/// How many past eligible-tick checksums [`RollbackSim`] retains, kept
+/// generously larger than `window` on purpose: unlike `snapshots` (which
+/// only needs to outlive a rewind), this only needs to outlive however
+/// long a caller's own periodic cross-peer checksum-exchange interval
+/// turns out to be, a number this module has no reason to know (that's
+/// `physics_sys.rs`'s `CHECKSUM_INTERVAL_TICKS`, one layer up) — 300 ticks
+/// (5 seconds at this app's 60Hz) comfortably outlives a "once a second"
+/// starting-point cadence with room to spare.
+const CHECKSUM_CACHE_TICKS: u64 = 300;
 
 /// A confirmed input arrived for a tick this [`RollbackSim`] can no longer
 /// rewind to (older than `current_tick - window`) — the caller's rollback
@@ -140,6 +160,36 @@ pub struct RollbackSim {
 pub struct WindowExceeded {
     pub requested_tick: Tick,
     pub oldest_available: Tick,
+}
+
+/// A cheap, deterministic hash of a whole simulation's marble state —
+/// position and velocity only (`rad`/`last_thrust` never change as a
+/// function of simulated ticks the way `pos`/`vel` do, so they carry no
+/// information relevant to detecting a diverged simulation). Never
+/// compares or hashes a raw `f32` directly — `to_bits()` first, always —
+/// since this function's entire purpose is catching subtle bit-level
+/// simulation divergence between two peers, which is exactly the kind of
+/// bug floating-point comparison quirks (`NaN`, signed zero) could
+/// otherwise mask or manufacture. Folded through FNV-1a: simple, fast,
+/// good-enough avalanche for a lockstep desync check (this is a state
+/// fingerprint to compare across two peers who are supposed to agree
+/// exactly, not a cryptographic or collision-resistant hash), and — same
+/// reasoning as `net.rs`'s hand-rolled wire codecs — one small, auditable
+/// function is preferable here to a hashing crate dependency for this one
+/// use.
+pub fn state_checksum(marbles: &[Marble]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for marble in marbles {
+        for component in [marble.pos.x, marble.pos.y, marble.pos.z, marble.vel.x, marble.vel.y, marble.vel.z] {
+            for byte in component.to_bits().to_le_bytes() {
+                hash = (hash ^ byte as u64).wrapping_mul(FNV_PRIME);
+            }
+        }
+    }
+    hash
 }
 
 impl RollbackSim {
@@ -159,6 +209,7 @@ impl RollbackSim {
             inputs: vec![BTreeMap::new(); num_players],
             default_input,
             window,
+            checksum_cache: BTreeMap::new(),
         }
     }
 
@@ -229,6 +280,7 @@ impl RollbackSim {
         self.snapshots.insert(tick, self.marbles.clone());
         self.current_tick = tick;
         self.prune();
+        self.cache_newly_eligible_checksum();
         events
     }
 
@@ -266,7 +318,7 @@ impl RollbackSim {
         kill_y: f32,
         starts: &[Vec3],
     ) -> Result<(), WindowExceeded> {
-        let oldest_available = self.current_tick.saturating_sub(self.window);
+        let oldest_available = self.oldest_available();
         let mut earliest_mismatch: Option<Tick> = None;
         let mut window_exceeded: Option<WindowExceeded> = None;
 
@@ -375,6 +427,103 @@ impl RollbackSim {
         }
     }
 
+    /// The oldest tick still safe to rewind/correct — anything before this
+    /// has already been pruned. Shared by [`Self::receive_inputs`] (a
+    /// confirmed arrival older than this is [`WindowExceeded`]) and, for
+    /// exactly the same underlying reason, by checksum eligibility
+    /// ([`Self::latest_checksum_tick`]): a tick still inside the window
+    /// could yet be resimulated by a late-but-in-window correction, so
+    /// comparing its checksum across peers would produce a false-positive
+    /// "mismatch" from perfectly ordinary prediction-then-correction, not
+    /// real divergence. One computation, reused for both purposes rather
+    /// than risking two independently-written copies drifting apart.
+    fn oldest_available(&self) -> Tick {
+        self.current_tick.saturating_sub(self.window)
+    }
+
+    /// Computes and caches the checksum for whichever tick just became
+    /// eligible for cross-peer comparison (`current_tick - window`) —
+    /// called only from [`Self::advance`], the sole place `current_tick`
+    /// ever moves forward, so the tick this caches is always freshly and
+    /// *permanently* finalized: nothing can ever resimulate a tick at or
+    /// before `current_tick - window` again (a late arrival for one would
+    /// report [`WindowExceeded`] instead), so the value cached here is
+    /// exactly the final, fully-resolved state's checksum — never a stale
+    /// pre-correction one, even if a resim touched this exact tick on its
+    /// way to becoming eligible.
+    ///
+    /// Deliberately uses `checked_sub`, not [`Self::oldest_available`]'s
+    /// saturating version: at `current_tick < window` nothing has become
+    /// newly eligible yet (tick 0 shouldn't be (re-)cached on every one of
+    /// the first `window` ticks), whereas `receive_inputs`'s
+    /// `oldest_available` genuinely wants a saturating floor of `0` so
+    /// "anything before tick 0" is correctly never rejected as too old.
+    ///
+    /// The snapshot for `tick` can legitimately be missing, not just at
+    /// startup but also for the first `window` ticks right after
+    /// [`Self::hard_reset_to`]: that call reseeds history starting fresh
+    /// at its own `tick`, so `current_tick - window` can point *before*
+    /// that reseed's own genesis until enough ticks have passed since —
+    /// there is nothing wrong to report here, simply nothing eligible to
+    /// cache yet from this reseeded epoch.
+    fn cache_newly_eligible_checksum(&mut self) {
+        let Some(tick) = self.current_tick.checked_sub(self.window) else { return };
+        let Some(snapshot) = self.snapshots.get(&tick) else { return };
+        self.checksum_cache.insert(tick, state_checksum(snapshot));
+        let oldest_to_keep = tick.saturating_sub(CHECKSUM_CACHE_TICKS);
+        self.checksum_cache.retain(|&t, _| t >= oldest_to_keep);
+    }
+
+    /// The most recent tick currently eligible for cross-peer checksum
+    /// comparison (`current_tick - window`), or `None` if no tick has
+    /// crossed that boundary yet (session just started). A caller
+    /// periodically sending its own checksum should send this tick's —
+    /// see [`Self::checksum_at`] to get the actual hash.
+    pub fn latest_checksum_tick(&self) -> Option<Tick> {
+        self.current_tick.checked_sub(self.window)
+    }
+
+    /// The cached checksum for `tick`, if it's both eligible (was, at some
+    /// point, outside the rewind window) and still within the retained
+    /// checksum cache. `None` for a tick that's still in-window (comparing
+    /// it would be a false positive — see [`Self::oldest_available`]'s
+    /// doc), or one old enough to have been evicted from the cache
+    /// ([`CHECKSUM_CACHE_TICKS`]) — a caller should treat either case as
+    /// "can't compare, not a mismatch", not guess.
+    pub fn checksum_at(&self, tick: Tick) -> Option<u64> {
+        self.checksum_cache.get(&tick).copied()
+    }
+
+    /// Replaces this session's entire live state with `marbles` — the
+    /// authoritative correction after a detected checksum mismatch
+    /// (`net.rs`'s `ResyncPayload`) — and reseeds the snapshot/prediction
+    /// window fresh starting at `tick`, discarding every confirmed input
+    /// and snapshot this side had before it. A clean restart of the window
+    /// is the correct move here, not an attempt to reconcile old history:
+    /// once a mismatch is confirmed, nothing this side thought it knew
+    /// about any tick up to and including `tick` can be trusted anyway
+    /// (that's the entire premise of the mismatch), including its own
+    /// logged "confirmed" inputs — keeping those around would risk a
+    /// resim immediately replaying right back into the same divergence
+    /// this call exists to fix, if the divergence's root cause turns out
+    /// to be in this side's simulation logic rather than in what input it
+    /// thought it had received.
+    pub fn hard_reset_to(&mut self, tick: Tick, marbles: Vec<Marble>) {
+        assert_eq!(
+            marbles.len(),
+            self.marbles.len(),
+            "a resync must not change how many players this session has"
+        );
+        self.current_tick = tick;
+        self.snapshots.clear();
+        self.snapshots.insert(tick, marbles.clone());
+        self.marbles = marbles;
+        for log in &mut self.inputs {
+            log.clear();
+        }
+        self.checksum_cache.clear();
+    }
+
     pub fn num_players(&self) -> usize {
         self.marbles.len()
     }
@@ -452,6 +601,15 @@ impl RollbackSim {
             inputs: vec![self.inputs[keep].clone()],
             default_input: self.default_input,
             window: self.window,
+            // Not carried over: every cached entry was computed over the
+            // *old*, wider marble set, a different shape than anything
+            // this narrowed session will ever checksum again. Harmless
+            // either way in practice (narrowing only ever happens solo,
+            // strictly before a peer connects and checksum exchange could
+            // start — `physics_sys.rs`'s doc), but starting empty is more
+            // obviously correct than carrying over checksums for a shape
+            // this session no longer has.
+            checksum_cache: BTreeMap::new(),
         }
     }
 
@@ -467,6 +625,23 @@ impl RollbackSim {
     /// this by re-deriving `marbles[player]` from a stale snapshot.
     pub fn respawn(&mut self, player: PlayerIndex, start: Vec3) {
         self.marbles[player].respawn(start);
+    }
+
+    /// Debug/test-only: nudges `player`'s live position in place, entirely
+    /// outside any `PlayerInput`-driven simulation step — lets a manual or
+    /// CDP-driven verification pass deliberately force one peer's state to
+    /// diverge from the other's, to check that checksum comparison
+    /// actually detects it and [`Self::hard_reset_to`] actually recovers
+    /// it (this is the "forced-mismatch scenario" this feature's own
+    /// verification plan calls for; there's no other way to safely
+    /// manufacture a real cross-peer divergence on demand). `cfg`-gated
+    /// out of release builds entirely — this must never be reachable from
+    /// any real gameplay path, and this way it simply isn't compiled into
+    /// the shipped wasm at all (`cargo build --release` disables
+    /// `debug_assertions`).
+    #[cfg(debug_assertions)]
+    pub fn debug_perturb_position(&mut self, player: PlayerIndex, delta: Vec3) {
+        self.marbles[player].pos += delta;
     }
 }
 
@@ -1322,6 +1497,24 @@ mod tests {
         assert_eq!(sim.marbles()[0].vel, Vec3::ZERO);
     }
 
+    /// [`RollbackSim::debug_perturb_position`]'s mechanical contract: a
+    /// direct, immediate position nudge, nothing fancier -- this is the
+    /// hook live CDP verification uses to manufacture a real cross-peer
+    /// divergence on demand, so it just needs to reliably do the one
+    /// simple thing it claims to. `cfg`-gated the same way the method
+    /// itself is: a `--release` test run (`debug_assertions` off) doesn't
+    /// have this method to call at all.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_perturb_position_is_a_direct_position_nudge() {
+        let (_, _, marbles, _) = two_player_setup();
+        let other_player_pos_before = marbles[1].pos;
+        let mut sim = RollbackSim::new(marbles.clone(), input(0.0, 0.0), 16);
+        sim.debug_perturb_position(0, Vec3::new(5.0, 0.0, 0.0));
+        assert_eq!(sim.marbles()[0].pos, marbles[0].pos + Vec3::new(5.0, 0.0, 0.0));
+        assert_eq!(sim.marbles()[1].pos, other_player_pos_before, "perturbing player 0 must not touch player 1");
+    }
+
     /// The animation half of continuity: since [`Expr::eval`] is a pure
     /// function of `Tick` alone (`crate::expr`'s module doc), and joining
     /// never resets the tick (this test module's `add_player_at_*` test
@@ -1353,5 +1546,267 @@ mod tests {
             sim.advance(&object, &mut params, &animations, &cfg, -1e6, &starts);
             assert_eq!(params.scalar(radius), anim.eval(tick), "tick {tick} animation value diverged post-join");
         }
+    }
+
+    /// [`state_checksum`] must be a pure function of position/velocity —
+    /// identical state hashes identically twice, and perturbing either
+    /// position or velocity on any one marble must change the result.
+    /// Doesn't prove the hash is collision-free (FNV-1a isn't
+    /// cryptographic — this module doesn't need it to be, see
+    /// `state_checksum`'s doc), just that it's actually sensitive to the
+    /// state it's supposed to be fingerprinting.
+    #[test]
+    fn state_checksum_is_deterministic_and_sensitive_to_position_and_velocity() {
+        let (_, _, marbles, _) = two_player_setup();
+        let hash = state_checksum(&marbles);
+        assert_eq!(hash, state_checksum(&marbles), "checksum must be deterministic");
+
+        let mut moved = marbles.clone();
+        moved[0].pos.x += 0.001;
+        assert_ne!(state_checksum(&moved), hash, "checksum must change when a position changes");
+
+        let mut sped_up = marbles.clone();
+        sped_up[1].vel.y += 0.001;
+        assert_ne!(state_checksum(&sped_up), hash, "checksum must change when a velocity changes");
+    }
+
+    /// The core property [`RollbackSim::checksum_at`] exists to guarantee:
+    /// once a tick becomes eligible (falls outside the rewind window), its
+    /// cached checksum matches what a full-knowledge straight-through
+    /// replay would have produced for that exact tick — not a stale value
+    /// left over from whatever was first *predicted* for it before player
+    /// 0's real, deliberately-delayed input actually arrived and forced a
+    /// resim. Mirrors
+    /// `rollback_replay_with_an_animated_param_matches_full_knowledge_replay`'s
+    /// shape (same delayed-confirmation setup), but checks every eligible
+    /// tick's checksum along the way instead of just the final live state.
+    #[test]
+    fn checksum_of_an_eligible_tick_matches_the_full_knowledge_replay() {
+        let (object, mut params, marbles, starts) = two_player_setup();
+        let cfg = PhysicsConfig::default();
+        const TICKS: Tick = 200;
+        const DELAY: Tick = 4;
+        const WINDOW: Tick = 16;
+
+        let mut straight = marbles.clone();
+        let mut straight_history: BTreeMap<Tick, Vec<Marble>> = BTreeMap::new();
+        for tick in 1..=TICKS {
+            let inputs = vec![scripted_input(0, tick), scripted_input(1, tick)];
+            step_marbles(&mut straight, &inputs, &object, &params, &cfg, -1e6, &starts);
+            straight_history.insert(tick, straight.clone());
+        }
+
+        let mut sim = RollbackSim::new(marbles, input(0.0, 0.0), WINDOW);
+        for tick in 1..=TICKS {
+            sim.receive_inputs(
+                &[(1, tick, scripted_input(1, tick))],
+                &object,
+                &mut params,
+                &[],
+                &cfg,
+                -1e6,
+                &starts,
+            )
+            .expect("within window");
+            sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+            if tick >= DELAY {
+                let confirm_tick = tick - DELAY + 1;
+                sim.receive_inputs(
+                    &[(0, confirm_tick, scripted_input(0, confirm_tick))],
+                    &object,
+                    &mut params,
+                    &[],
+                    &cfg,
+                    -1e6,
+                    &starts,
+                )
+                .expect("within window");
+            }
+        }
+        for confirm_tick in (TICKS - DELAY + 2)..=TICKS {
+            sim.receive_inputs(
+                &[(0, confirm_tick, scripted_input(0, confirm_tick))],
+                &object,
+                &mut params,
+                &[],
+                &cfg,
+                -1e6,
+                &starts,
+            )
+            .expect("within window");
+        }
+
+        let last_eligible = sim.latest_checksum_tick().expect("should have eligible ticks by now");
+        let mut checked_any = false;
+        for tick in 1..=last_eligible {
+            if let Some(hash) = sim.checksum_at(tick) {
+                checked_any = true;
+                assert_eq!(
+                    hash,
+                    state_checksum(&straight_history[&tick]),
+                    "tick {tick}'s cached checksum doesn't match the full-knowledge replay"
+                );
+            }
+        }
+        assert!(checked_any, "expected at least one cached checksum to have been produced");
+    }
+
+    /// [`RollbackSim::hard_reset_to`]'s mechanical contract in isolation
+    /// (no mismatch scenario yet — that's the next test): live state and
+    /// `current_tick` are fully replaced, and the reseeded window supports
+    /// simulating onward immediately, including a same-tick-as-the-reset
+    /// rewind/resim, with no special-casing needed anywhere else in this
+    /// module.
+    #[test]
+    fn hard_reset_to_replaces_live_state_and_reseeds_a_working_window() {
+        let (object, mut params, marbles, starts) = two_player_setup();
+        let cfg = PhysicsConfig::default();
+        let mut sim = RollbackSim::new(marbles, input(0.0, 0.0), 16);
+        for tick in 1..=30u64 {
+            sim.receive_inputs(
+                &[(0, tick, scripted_input(0, tick)), (1, tick, scripted_input(1, tick))],
+                &object,
+                &mut params,
+                &[],
+                &cfg,
+                -1e6,
+                &starts,
+            )
+            .unwrap();
+            sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+        }
+
+        let authoritative_tick = 500;
+        let authoritative_marbles = vec![
+            Marble::spawn(Vec3::new(9.0, 9.0, 9.0), beware_of_bumps::MARBLE_RAD),
+            Marble::spawn(Vec3::new(-9.0, -9.0, -9.0), beware_of_bumps::MARBLE_RAD),
+        ];
+        sim.hard_reset_to(authoritative_tick, authoritative_marbles.clone());
+
+        assert_eq!(sim.current_tick(), authoritative_tick);
+        assert_eq!(sim.marbles()[0].pos, authoritative_marbles[0].pos);
+        assert_eq!(sim.marbles()[1].pos, authoritative_marbles[1].pos);
+        assert_eq!(sim.marbles()[0].vel, Vec3::ZERO);
+
+        // Simulating onward works immediately: a plain advance...
+        sim.receive_inputs(
+            &[(0, authoritative_tick + 1, scripted_input(0, authoritative_tick + 1))],
+            &object,
+            &mut params,
+            &[],
+            &cfg,
+            -1e6,
+            &starts,
+        )
+        .unwrap();
+        sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+        assert_eq!(sim.current_tick(), authoritative_tick + 1);
+        sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+        assert_eq!(sim.current_tick(), authoritative_tick + 2);
+
+        // ...and a late correction landing right after the reset must
+        // still trigger a valid rewind/resim against the *reseeded*
+        // snapshot chain, not panic against pre-reset history.
+        sim.receive_inputs(
+            &[(0, authoritative_tick + 2, scripted_input(0, authoritative_tick + 2 + 1000))],
+            &object,
+            &mut params,
+            &[],
+            &cfg,
+            -1e6,
+            &starts,
+        )
+        .unwrap();
+        assert_eq!(sim.current_tick(), authoritative_tick + 2);
+    }
+
+    /// The end-to-end scenario the whole feature exists for: two
+    /// independent `RollbackSim`s, fed identical confirmed inputs and
+    /// therefore expected to agree exactly, where one has its live state
+    /// deliberately corrupted mid-session (standing in for "a real
+    /// simulation bug made these two peers silently diverge") — checksum
+    /// comparison must detect the resulting mismatch, and
+    /// `hard_reset_to`'ing the corrupted side to the authoritative side's
+    /// state must restore exact agreement, with both sides continuing to
+    /// agree afterward.
+    #[test]
+    fn a_deliberately_corrupted_peer_is_detected_by_checksum_and_recovered_by_hard_reset() {
+        let (object, mut params, marbles, starts) = two_player_setup();
+        let cfg = PhysicsConfig::default();
+        const WINDOW: Tick = 16;
+        let mut authoritative = RollbackSim::new(marbles.clone(), input(0.0, 0.0), WINDOW);
+        let mut corrupted = RollbackSim::new(marbles, input(0.0, 0.0), WINDOW);
+
+        let feed = |sim: &mut RollbackSim, params: &mut Params, tick: Tick| {
+            sim.receive_inputs(
+                &[(0, tick, scripted_input(0, tick)), (1, tick, scripted_input(1, tick))],
+                &object,
+                params,
+                &[],
+                &cfg,
+                -1e6,
+                &starts,
+            )
+            .unwrap();
+            sim.advance(&object, params, &[], &cfg, -1e6, &starts);
+        };
+
+        // Both sides agree for a while, exactly like two real peers
+        // exchanging identical confirmed input over a healthy connection.
+        for tick in 1..=40u64 {
+            feed(&mut authoritative, &mut params, tick);
+            feed(&mut corrupted, &mut params, tick);
+        }
+        let agree_tick = authoritative.latest_checksum_tick().unwrap();
+        assert_eq!(
+            authoritative.checksum_at(agree_tick),
+            corrupted.checksum_at(agree_tick),
+            "sanity check: both sides must actually agree before the injected corruption"
+        );
+
+        // Simulate "a real bug corrupted this peer's simulation" by
+        // directly nudging its live marble state -- a test-only
+        // privilege, only available because this test lives inside the
+        // same module as `RollbackSim`'s private fields (no production
+        // code path can or should do this).
+        corrupted.marbles[0].pos.x += 2.5;
+
+        // Continue feeding both sides identical input -- the corruption
+        // propagates forward through `corrupted`'s own physics from here
+        // on, exactly like a real silent divergence would.
+        for tick in 41..=(40 + WINDOW + 10) {
+            feed(&mut authoritative, &mut params, tick);
+            feed(&mut corrupted, &mut params, tick);
+        }
+
+        let mismatch_tick = authoritative.latest_checksum_tick().unwrap();
+        assert_eq!(authoritative.current_tick(), corrupted.current_tick());
+        let authoritative_hash = authoritative.checksum_at(mismatch_tick).expect("must be cached by now");
+        let corrupted_hash = corrupted.checksum_at(mismatch_tick).expect("must be cached by now");
+        assert_ne!(
+            authoritative_hash, corrupted_hash,
+            "the injected corruption must be detectable as a checksum mismatch"
+        );
+
+        // The non-authoritative side resyncs to the authoritative side's
+        // live state.
+        corrupted.hard_reset_to(authoritative.current_tick(), authoritative.marbles().to_vec());
+        assert_eq!(corrupted.marbles()[0].pos, authoritative.marbles()[0].pos);
+        assert_eq!(corrupted.marbles()[1].pos, authoritative.marbles()[1].pos);
+
+        // And, having recovered, the two sides stay in agreement under
+        // continued identical input -- the reset didn't just patch the
+        // symptom for one tick, it left both sides in a state that keeps
+        // agreeing going forward.
+        for tick in (corrupted.current_tick() + 1)..=(corrupted.current_tick() + WINDOW + 10) {
+            feed(&mut authoritative, &mut params, tick);
+            feed(&mut corrupted, &mut params, tick);
+        }
+        let recovered_tick = authoritative.latest_checksum_tick().unwrap();
+        assert_eq!(
+            authoritative.checksum_at(recovered_tick),
+            corrupted.checksum_at(recovered_tick),
+            "both sides must agree again after the resync"
+        );
     }
 }

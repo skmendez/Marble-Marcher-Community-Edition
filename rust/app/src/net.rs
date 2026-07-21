@@ -27,16 +27,16 @@
 
 use bevy::prelude::*;
 
-use marble_csg::physics::PlayerInput;
+use marble_csg::physics::{Marble, PlayerInput};
 use marble_csg::rollback::{InputTransport, PlayerIndex, Tick};
 
 use crate::web_config::query_param;
 
 /// Wire size of one packed [`PlayerInput`] record: `tick: u64` (8) +
 /// `dx`/`dy: f32` (4 each) + `orientation: Quat` as 4×`f32` (16) = 32
-/// bytes. Fixed-size and never varies, so `net.js`'s `takeReceived` can
-/// just concatenate messages with no length-prefixing — the receiver
-/// always knows to chunk by exactly this many bytes.
+/// bytes. Fixed-size, and always immediately preceded by [`TAG_INPUT`] on
+/// the wire (see [`NetMessage`]) — this constant is just this one
+/// variant's own body length, not the whole message's.
 const RECORD_LEN: usize = 32;
 
 fn pack(tick: Tick, input: PlayerInput) -> [u8; RECORD_LEN] {
@@ -62,6 +62,161 @@ fn unpack(bytes: &[u8]) -> (Tick, PlayerInput) {
     let z = f32::from_le_bytes(bytes[24..28].try_into().unwrap());
     let w = f32::from_le_bytes(bytes[28..32].try_into().unwrap());
     (tick, PlayerInput { dx, dy, orientation: Quat::from_xyzw(x, y, z, w) })
+}
+
+/// One packed [`Marble`] record inside a [`NetMessage::ResyncPayload`]:
+/// `pos`/`vel` (3×`f32` each) + `rad` (`f32`) = 28 bytes. `last_thrust` is
+/// deliberately not carried over the wire — `step_marbles` overwrites it
+/// unconditionally on the very next tick regardless of what it held
+/// before (`physics.rs`'s own field doc: it's `v` before that tick's
+/// force-scale multiply, always freshly computed), so it holds no state a
+/// resync actually needs to restore; the receiving side just zeroes it,
+/// same as [`Marble::spawn`] already does.
+const MARBLE_LEN: usize = 12 + 12 + 4;
+
+fn pack_marble(m: &Marble) -> [u8; MARBLE_LEN] {
+    let mut out = [0u8; MARBLE_LEN];
+    out[0..4].copy_from_slice(&m.pos.x.to_le_bytes());
+    out[4..8].copy_from_slice(&m.pos.y.to_le_bytes());
+    out[8..12].copy_from_slice(&m.pos.z.to_le_bytes());
+    out[12..16].copy_from_slice(&m.vel.x.to_le_bytes());
+    out[16..20].copy_from_slice(&m.vel.y.to_le_bytes());
+    out[20..24].copy_from_slice(&m.vel.z.to_le_bytes());
+    out[24..28].copy_from_slice(&m.rad.to_le_bytes());
+    out
+}
+
+fn unpack_marble(bytes: &[u8]) -> Marble {
+    debug_assert_eq!(bytes.len(), MARBLE_LEN);
+    let f = |lo: usize, hi: usize| f32::from_le_bytes(bytes[lo..hi].try_into().unwrap());
+    Marble {
+        pos: Vec3::new(f(0, 4), f(4, 8), f(8, 12)),
+        vel: Vec3::new(f(12, 16), f(16, 20), f(20, 24)),
+        rad: f(24, 28),
+        last_thrust: Vec3::ZERO,
+    }
+}
+
+const TAG_INPUT: u8 = 0;
+const TAG_CHECKSUM: u8 = 1;
+const TAG_RESYNC_REQUEST: u8 = 2;
+const TAG_RESYNC_PAYLOAD: u8 = 3;
+
+/// One message on the wire, tag-prefixed so [`WebRtcTransport`] can share
+/// a single channel between the original per-tick input exchange and the
+/// later-added checksum/resync-on-mismatch flow (rollback resiliency).
+/// `Input` is exactly [`pack`]/[`unpack`]'s existing 32-byte record with a
+/// 1-byte tag in front; the other three variants are new.
+enum NetMessage {
+    Input {
+        tick: Tick,
+        input: PlayerInput,
+    },
+    /// A peer's checksum of its own state at `tick` — only ever sent for
+    /// a tick outside that peer's own rewind window
+    /// (`RollbackSim::latest_checksum_tick`'s doc on why an in-window tick
+    /// would be a false positive).
+    Checksum {
+        tick: Tick,
+        hash: u64,
+    },
+    /// Sent by the non-host side on a detected checksum mismatch — "send
+    /// me your authoritative state as of `tick`". Host-authoritative
+    /// throughout (`Role`'s doc): only ever sent host-ward, never the
+    /// reverse.
+    ResyncRequest {
+        tick: Tick,
+    },
+    /// The host's answer to a [`Self::ResyncRequest`]: its own live state.
+    /// The one genuinely variable-length message on the wire —
+    /// length-prefixed by `marbles.len()` as a `u32`.
+    ResyncPayload {
+        tick: Tick,
+        marbles: Vec<Marble>,
+    },
+}
+
+fn encode_message(msg: &NetMessage) -> Vec<u8> {
+    match msg {
+        NetMessage::Input { tick, input } => {
+            let mut out = Vec::with_capacity(1 + RECORD_LEN);
+            out.push(TAG_INPUT);
+            out.extend_from_slice(&pack(*tick, *input));
+            out
+        }
+        NetMessage::Checksum { tick, hash } => {
+            let mut out = Vec::with_capacity(1 + 8 + 8);
+            out.push(TAG_CHECKSUM);
+            out.extend_from_slice(&tick.to_le_bytes());
+            out.extend_from_slice(&hash.to_le_bytes());
+            out
+        }
+        NetMessage::ResyncRequest { tick } => {
+            let mut out = Vec::with_capacity(1 + 8);
+            out.push(TAG_RESYNC_REQUEST);
+            out.extend_from_slice(&tick.to_le_bytes());
+            out
+        }
+        NetMessage::ResyncPayload { tick, marbles } => {
+            let mut out = Vec::with_capacity(1 + 8 + 4 + marbles.len() * MARBLE_LEN);
+            out.push(TAG_RESYNC_PAYLOAD);
+            out.extend_from_slice(&tick.to_le_bytes());
+            out.extend_from_slice(&(marbles.len() as u32).to_le_bytes());
+            for m in marbles {
+                out.extend_from_slice(&pack_marble(m));
+            }
+            out
+        }
+    }
+}
+
+/// Decodes every complete message packed back-to-back in `bytes` — exactly
+/// what `net.js`'s `takeReceived` hands back: zero or more whole `send()`
+/// calls' worth of bytes, concatenated in arrival order with no gaps
+/// (module doc). Each variant's own encoding carries enough information (a
+/// fixed size, or a length prefix for `ResyncPayload`) to know exactly
+/// where it ends, so no *additional* outer framing is needed even though
+/// messages now vary in length between kinds.
+fn decode_messages(bytes: &[u8]) -> Vec<NetMessage> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let tag = bytes[i];
+        i += 1;
+        match tag {
+            TAG_INPUT => {
+                let (tick, input) = unpack(&bytes[i..i + RECORD_LEN]);
+                i += RECORD_LEN;
+                out.push(NetMessage::Input { tick, input });
+            }
+            TAG_CHECKSUM => {
+                let tick = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+                let hash = u64::from_le_bytes(bytes[i + 8..i + 16].try_into().unwrap());
+                i += 16;
+                out.push(NetMessage::Checksum { tick, hash });
+            }
+            TAG_RESYNC_REQUEST => {
+                let tick = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+                i += 8;
+                out.push(NetMessage::ResyncRequest { tick });
+            }
+            TAG_RESYNC_PAYLOAD => {
+                let tick = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+                let count = u32::from_le_bytes(bytes[i + 8..i + 12].try_into().unwrap()) as usize;
+                i += 12;
+                let marbles = bytes[i..i + count * MARBLE_LEN].chunks_exact(MARBLE_LEN).map(unpack_marble).collect();
+                i += count * MARBLE_LEN;
+                out.push(NetMessage::ResyncPayload { tick, marbles });
+            }
+            // An unrecognized tag means the stream is malformed -- can't
+            // happen in practice (both peers always run the exact same
+            // build, so every tag either side ever writes is one of the
+            // four above), but stopping rather than guessing how many
+            // bytes to skip past garbage is the safe failure mode.
+            _ => break,
+        }
+    }
+    out
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -447,38 +602,97 @@ pub fn sync_net_ui_text(session: Res<NetSession>, mut text: Query<&mut Text, Wit
     };
 }
 
-/// [`InputTransport`] over the live WebRTC data channel — see the module
-/// doc for the wire format. `remote` is fixed for the whole session
+/// [`InputTransport`] over the live WebRTC data channel, extended to also
+/// carry the checksum/resync side channel (rollback resiliency) — see the
+/// module doc for the wire format. `remote` is fixed for the whole session
 /// (exactly one other player, always the same index — [`Role::remote_index`]).
 pub struct WebRtcTransport {
     remote: PlayerIndex,
+    /// Demultiplexed per-kind inboxes, filled by [`Self::drain_and_demux`]
+    /// and drained by each kind's own `poll_*` method — separate from
+    /// `net.js`'s own single `received` queue so that `poll_received`
+    /// (the [`InputTransport`] trait method) and the three new `poll_*`
+    /// methods below can each be called independently, in any order, any
+    /// number of times per tick, without one silently stealing messages
+    /// meant for another.
+    pending_inputs: Vec<(PlayerIndex, Tick, PlayerInput)>,
+    pending_checksums: Vec<(Tick, u64)>,
+    pending_resync_requests: Vec<Tick>,
+    pending_resync_payloads: Vec<(Tick, Vec<Marble>)>,
 }
 
 impl WebRtcTransport {
     pub fn new(role: Role) -> Self {
-        Self { remote: role.remote_index() }
+        Self {
+            remote: role.remote_index(),
+            pending_inputs: Vec::new(),
+            pending_checksums: Vec::new(),
+            pending_resync_requests: Vec::new(),
+            pending_resync_payloads: Vec::new(),
+        }
+    }
+
+    /// Drains whatever `net.js` has received since the last poll (of
+    /// *any* kind) and sorts each decoded message into its own buffer —
+    /// the one place that actually calls `js_bridge::take_received`, so
+    /// every `poll_*` method (including [`InputTransport::poll_received`])
+    /// can call this unconditionally: whichever runs first each tick does
+    /// the real draining, the rest just find `net.js`'s own queue already
+    /// empty.
+    fn drain_and_demux(&mut self) {
+        let bytes = js_bridge::take_received();
+        for msg in decode_messages(&bytes) {
+            match msg {
+                NetMessage::Input { tick, input } => self.pending_inputs.push((self.remote, tick, input)),
+                NetMessage::Checksum { tick, hash } => self.pending_checksums.push((tick, hash)),
+                NetMessage::ResyncRequest { tick } => self.pending_resync_requests.push(tick),
+                NetMessage::ResyncPayload { tick, marbles } => self.pending_resync_payloads.push((tick, marbles)),
+            }
+        }
+    }
+
+    pub fn send_checksum(&mut self, tick: Tick, hash: u64) {
+        js_bridge::send(&encode_message(&NetMessage::Checksum { tick, hash }));
+    }
+
+    pub fn send_resync_request(&mut self, tick: Tick) {
+        js_bridge::send(&encode_message(&NetMessage::ResyncRequest { tick }));
+    }
+
+    pub fn send_resync_payload(&mut self, tick: Tick, marbles: Vec<Marble>) {
+        js_bridge::send(&encode_message(&NetMessage::ResyncPayload { tick, marbles }));
+    }
+
+    /// Drains every checksum the peer has sent since the last call.
+    pub fn poll_checksums(&mut self) -> Vec<(Tick, u64)> {
+        self.drain_and_demux();
+        std::mem::take(&mut self.pending_checksums)
+    }
+
+    /// Drains every resync request the peer has sent since the last call
+    /// (only ever populated on the host side — a non-host peer never
+    /// receives one, `Role`'s host-authoritative convention).
+    pub fn poll_resync_requests(&mut self) -> Vec<Tick> {
+        self.drain_and_demux();
+        std::mem::take(&mut self.pending_resync_requests)
+    }
+
+    /// Drains every resync payload the peer has sent since the last call
+    /// (only ever populated on the non-host side).
+    pub fn poll_resync_payloads(&mut self) -> Vec<(Tick, Vec<Marble>)> {
+        self.drain_and_demux();
+        std::mem::take(&mut self.pending_resync_payloads)
     }
 }
 
 impl InputTransport for WebRtcTransport {
     fn send_input(&mut self, tick: Tick, input: PlayerInput) {
-        js_bridge::send(&pack(tick, input));
+        js_bridge::send(&encode_message(&NetMessage::Input { tick, input }));
     }
 
     fn poll_received(&mut self) -> Vec<(PlayerIndex, Tick, PlayerInput)> {
-        let bytes = js_bridge::take_received();
-        // `net.js`'s `takeReceived` only ever concatenates whole
-        // `RECORD_LEN`-byte records (this module is the only thing that
-        // ever calls `send`, always with exactly one `pack`ed record) —
-        // `chunks_exact` silently dropping a trailing partial chunk is
-        // therefore not a real failure mode, just defensive.
-        bytes
-            .chunks_exact(RECORD_LEN)
-            .map(|chunk| {
-                let (tick, input) = unpack(chunk);
-                (self.remote, tick, input)
-            })
-            .collect()
+        self.drain_and_demux();
+        std::mem::take(&mut self.pending_inputs)
     }
 }
 
@@ -507,5 +721,126 @@ mod tests {
         assert_eq!(Role::Host.remote_index(), 1);
         assert_eq!(Role::Joiner.local_index(), 1);
         assert_eq!(Role::Joiner.remote_index(), 0);
+    }
+
+    fn sample_marble(x: f32) -> Marble {
+        Marble { pos: Vec3::new(x, x + 1.0, x + 2.0), vel: Vec3::new(-x, x * 0.5, 0.25), rad: 0.3, last_thrust: Vec3::ZERO }
+    }
+
+    /// Each [`NetMessage`] kind round-trips through [`encode_message`]/
+    /// [`decode_messages`] exactly — the tagged-protocol analogue of
+    /// `pack_unpack_roundtrips_exactly` for the three new message kinds
+    /// (`Input`'s own body encoding is already covered by that test).
+    #[test]
+    fn encode_decode_roundtrips_each_message_kind() {
+        let input = PlayerInput { dx: 0.42, dy: -0.17, orientation: Quat::from_xyzw(0.1, 0.2, 0.3, 0.9).normalize() };
+        let cases = vec![
+            NetMessage::Input { tick: 42, input },
+            NetMessage::Checksum { tick: 100, hash: 0xdead_beef_1234_5678 },
+            NetMessage::ResyncRequest { tick: 7 },
+            NetMessage::ResyncPayload { tick: 55, marbles: vec![sample_marble(1.0), sample_marble(2.0)] },
+        ];
+        for msg in cases {
+            let decoded = decode_messages(&encode_message(&msg));
+            assert_eq!(decoded.len(), 1, "one encoded message must decode back to exactly one message");
+            match (&msg, &decoded[0]) {
+                (NetMessage::Input { tick: t1, input: i1 }, NetMessage::Input { tick: t2, input: i2 }) => {
+                    assert_eq!(t1, t2);
+                    assert_eq!(i1.dx, i2.dx);
+                    assert_eq!(i1.dy, i2.dy);
+                    assert_eq!(i1.orientation, i2.orientation);
+                }
+                (NetMessage::Checksum { tick: t1, hash: h1 }, NetMessage::Checksum { tick: t2, hash: h2 }) => {
+                    assert_eq!(t1, t2);
+                    assert_eq!(h1, h2);
+                }
+                (NetMessage::ResyncRequest { tick: t1 }, NetMessage::ResyncRequest { tick: t2 }) => assert_eq!(t1, t2),
+                (
+                    NetMessage::ResyncPayload { tick: t1, marbles: m1 },
+                    NetMessage::ResyncPayload { tick: t2, marbles: m2 },
+                ) => {
+                    assert_eq!(t1, t2);
+                    assert_eq!(m1.len(), m2.len());
+                    for (a, b) in m1.iter().zip(m2.iter()) {
+                        assert_eq!(a.pos, b.pos);
+                        assert_eq!(a.vel, b.vel);
+                        assert_eq!(a.rad, b.rad);
+                    }
+                }
+                _ => panic!("decoded message kind doesn't match the encoded kind"),
+            }
+        }
+    }
+
+    /// Several different message kinds, encoded back-to-back with no
+    /// external framing between them, must decode back into exactly the
+    /// same sequence in order — this is the property that makes the
+    /// tagged protocol safe to share `net.js`'s single flat-concatenated
+    /// `takeReceived` buffer with no length-prefixing at the transport
+    /// level (module doc): every message's own encoding says exactly how
+    /// many bytes it occupies.
+    #[test]
+    fn decode_messages_parses_several_concatenated_messages_of_different_kinds_in_order() {
+        let mut bytes = Vec::new();
+        bytes.extend(encode_message(&NetMessage::Input {
+            tick: 1,
+            input: PlayerInput { dx: 0.0, dy: 0.0, orientation: Quat::IDENTITY },
+        }));
+        bytes.extend(encode_message(&NetMessage::Checksum { tick: 2, hash: 999 }));
+        bytes.extend(encode_message(&NetMessage::ResyncRequest { tick: 3 }));
+        bytes.extend(encode_message(&NetMessage::ResyncPayload { tick: 4, marbles: vec![sample_marble(0.0)] }));
+        bytes.extend(encode_message(&NetMessage::Input {
+            tick: 5,
+            input: PlayerInput { dx: 0.5, dy: 0.5, orientation: Quat::IDENTITY },
+        }));
+
+        let decoded = decode_messages(&bytes);
+        assert_eq!(decoded.len(), 5);
+        assert!(matches!(decoded[0], NetMessage::Input { tick: 1, .. }));
+        assert!(matches!(decoded[1], NetMessage::Checksum { tick: 2, hash: 999 }));
+        assert!(matches!(decoded[2], NetMessage::ResyncRequest { tick: 3 }));
+        assert!(matches!(decoded[3], NetMessage::ResyncPayload { tick: 4, .. }));
+        assert!(matches!(decoded[4], NetMessage::Input { tick: 5, .. }));
+    }
+
+    /// [`WebRtcTransport`]'s demultiplexing: a fabricated byte stream
+    /// carrying every message kind at once, run through the same decode
+    /// path `poll_*` uses internally, must sort each message into its own
+    /// bucket without losing or misattributing any of them. Exercised at
+    /// the `decode_messages` level rather than truly through
+    /// `WebRtcTransport` itself, since the latter's `send`/`take_received`
+    /// go through the wasm-only `js_bridge` (a no-op stub on the native
+    /// target these tests run on) -- this still fully covers the
+    /// demultiplexing logic itself, just not the native-stub plumbing
+    /// around it.
+    #[test]
+    fn decode_messages_preserves_every_kind_when_all_are_mixed_together() {
+        let mut bytes = Vec::new();
+        bytes.extend(encode_message(&NetMessage::Checksum { tick: 10, hash: 1 }));
+        bytes.extend(encode_message(&NetMessage::Input {
+            tick: 11,
+            input: PlayerInput { dx: 1.0, dy: 0.0, orientation: Quat::IDENTITY },
+        }));
+        bytes.extend(encode_message(&NetMessage::ResyncPayload {
+            tick: 12,
+            marbles: vec![sample_marble(3.0), sample_marble(4.0), sample_marble(5.0)],
+        }));
+        bytes.extend(encode_message(&NetMessage::ResyncRequest { tick: 13 }));
+        bytes.extend(encode_message(&NetMessage::Checksum { tick: 14, hash: 2 }));
+
+        let decoded = decode_messages(&bytes);
+        let checksum_count = decoded.iter().filter(|m| matches!(m, NetMessage::Checksum { .. })).count();
+        let input_count = decoded.iter().filter(|m| matches!(m, NetMessage::Input { .. })).count();
+        let payload_marble_count = decoded
+            .iter()
+            .find_map(|m| match m {
+                NetMessage::ResyncPayload { marbles, .. } => Some(marbles.len()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(checksum_count, 2);
+        assert_eq!(input_count, 1);
+        assert_eq!(payload_marble_count, 3);
+        assert!(decoded.iter().any(|m| matches!(m, NetMessage::ResyncRequest { tick: 13 })));
     }
 }
