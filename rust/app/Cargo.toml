@@ -50,6 +50,15 @@ bevy = { version = "0.16", default-features = false, features = [
     # registration is needed in `main.rs` beyond enabling the feature here.
     "bevy_gizmos",
 ] }
+# Live per-phase CPU timing readout (`fps_overlay::PhaseTimings`):
+# `std::time::Instant::now()` panics unconditionally on
+# `wasm32-unknown-unknown` ("time not implemented on this platform" -- no OS
+# clock on that target) -- took production down the first time this shipped.
+# `web-time` is a drop-in replacement with an identical `Instant`/`Duration`
+# API that routes through `Performance.now()` via `web_sys` on wasm, and is
+# a transparent re-export of real `std::time` on every other target, so it
+# belongs in the regular (not wasm32-only) dependency block below.
+web-time = "1"
 
 [features]
 default = []

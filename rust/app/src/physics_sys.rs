@@ -37,8 +37,12 @@
 //! the mouse-driven `orbit_camera_input`), since it drives `CameraOrbit`,
 //! not the marble.
 
+use web_time::Instant;
+
 use bevy::input::touch::Touches;
 use bevy::prelude::*;
+
+use crate::fps_overlay::PhaseTimings;
 
 use marble_csg::physics::{step_marbles, GravityMode, Marble, PhysicsConfig, PlayerInput};
 use marble_csg::rollback::{InputTransport, RollbackSim, Tick};
@@ -139,7 +143,27 @@ const ROLLBACK_WINDOW_TICKS: u64 = 16;
 /// a thing this milestone needs). A no-op for scenes without a real marble
 /// (`SceneKind::has_marble` — the static display fractals, not the tuned
 /// demo level).
+/// Thin timing wrapper over [`marble_physics_tick_impl`] -- records this
+/// call's wall-clock cost into [`PhaseTimings`] regardless of which of
+/// `_impl`'s several early-return paths actually fires, without needing to
+/// touch each one individually.
+#[allow(clippy::too_many_arguments)] // one more param than `_impl`, for `PhaseTimings`
 pub fn marble_physics_tick(
+    keys: Res<ButtonInput<KeyCode>>,
+    touches: Res<Touches>,
+    orbit: Res<CameraOrbit>,
+    scene: Res<SceneState>,
+    net: Res<NetSession>,
+    mp: ResMut<MultiplayerSession>,
+    marble_state: ResMut<MarbleState>,
+    mut timings: ResMut<PhaseTimings>,
+) {
+    let start = Instant::now();
+    marble_physics_tick_impl(keys, touches, orbit, scene, net, mp, marble_state);
+    timings.record("physics", start.elapsed());
+}
+
+fn marble_physics_tick_impl(
     keys: Res<ButtonInput<KeyCode>>,
     touches: Res<Touches>,
     orbit: Res<CameraOrbit>,

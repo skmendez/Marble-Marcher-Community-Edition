@@ -794,8 +794,36 @@ fn animate_fractal() -> bool {
 /// `animate_fractal()` is enabled (otherwise the static params `setup()`
 /// wrote stay untouched, matching what the marbles' physics collides
 /// against).
+/// Thin timing wrapper -- see `fps_overlay::PhaseTimings`'s doc for exactly
+/// what this measures (CPU-side uniform computation, not GPU execution).
+/// Uses `web_time::Instant`, not `std::time::Instant`: the latter panics
+/// unconditionally on `wasm32-unknown-unknown` ("time not implemented on
+/// this platform" -- no OS clock on that target), which took production
+/// down the first time this readout shipped (`bcb4d50`/`d5785ed`)
+/// -- `web_time` is a drop-in replacement that routes through
+/// `Performance.now()` via `web_sys` on wasm, and is a transparent
+/// pass-through to real `std::time` everywhere else.
 #[allow(clippy::too_many_arguments)]
 pub fn update_material(
+    time: Res<Time>,
+    orbit: Res<CameraOrbit>,
+    marble_state: Res<MarbleState>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
+    scene_state: ResMut<SceneState>,
+    materials: ResMut<Assets<FineMarcherMaterial>>,
+    storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut timings: ResMut<crate::fps_overlay::PhaseTimings>,
+) {
+    let start = web_time::Instant::now();
+    update_material_impl(
+        time, orbit, marble_state, windows, shadow_render_target, scene_state, materials, storage_buffers,
+    );
+    timings.record("fine", start.elapsed());
+}
+
+#[allow(clippy::too_many_arguments)] // SystemParam count, unchanged from before the timing wrapper split
+fn update_material_impl(
     time: Res<Time>,
     orbit: Res<CameraOrbit>,
     marble_state: Res<MarbleState>,
