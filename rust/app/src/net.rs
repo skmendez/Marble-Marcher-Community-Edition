@@ -193,16 +193,20 @@ pub struct NetSession {
 /// client's [`Role`], then calls `net.js`'s `host()`/`join()` exactly once.
 /// Unconditional — every session hosts by default, per the module doc.
 pub fn setup_networking(mut commands: Commands) {
+    info!("setup_networking: running, query_param(\"join\") = {:?}", query_param("join"));
     let (role, hosted_join_suffix) = match query_param("join") {
         Some(host_id) => {
+            info!("setup_networking: joining {host_id}");
             js_bridge::join(&host_id);
             (Role::Joiner, None)
         }
         None => {
+            info!("setup_networking: hosting");
             js_bridge::host();
             (Role::Host, None)
         }
     };
+    info!("setup_networking: done, role = {:?}", role);
     commands.insert_resource(NetSession {
         role,
         status: NetStatus::Idle,
