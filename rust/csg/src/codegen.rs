@@ -1044,8 +1044,17 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     // solid geometry the marble is embedded in.
     let outline_visible = outline_t > 0.0 && (!hit_frac || outline_t < t);
     if (outline_visible) {
-        let col = apply_tint(OUTLINE_COLOR, outline_idx % 4u);
-        return vec4<f32>(tonemap(col), 1.0);
+        // Deliberately *not* run through `tonemap()`: that Reinhard+gamma
+        // curve is calibrated for lit HDR surface values (which is why the
+        // marble's own shaded color above goes through it), and applying it
+        // to an already-final flat display color pushes it lighter *and*
+        // shifts its hue (e.g. `OUTLINE_COLOR`'s #1E0858 comes out looking
+        // like a lighter, bluer purple) -- reported live: the outline read
+        // visibly lighter than the hex code even though the marble's own
+        // (lit, then tonemapped) dark colors looked right. Returning the
+        // tinted color directly is what actually displays the requested hex
+        // value (modulo the per-marble tint, which is the point).
+        return vec4<f32>(apply_tint(OUTLINE_COLOR, outline_idx % 4u), 1.0);
     }
 
     if (hit_frac) {
