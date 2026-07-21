@@ -20,8 +20,13 @@
 //!  - `physics`  (M5): marble/collider simulation against an `Object`
 //!  - `rollback` (multiplayer milestone 1): input buffering + snapshot/
 //!    rewind/resimulate rollback netcode around `physics::step_marbles`
+//!  - `expr`     (animated fractals): a small deterministic, serializable
+//!    expression tree for driving a `Param` from the shared `Tick` clock —
+//!    see its module doc for why this has to share `rollback`'s tick
+//!    domain, not just happen to use the same integer type
 
 pub mod codegen;
+pub mod expr;
 pub mod fold;
 pub mod object;
 pub mod physics;
@@ -32,6 +37,13 @@ pub use fold::Fold;
 pub use object::Object;
 
 use glam::{Mat2, Vec2, Vec3, Vec4};
+
+/// Rollback/animation's shared unit of time — one simulated physics tick,
+/// *not* wall-clock time. Defined here (not in `rollback`, despite that
+/// being where it was first introduced) because `expr` needs it too and
+/// `rollback` needs `expr::Expr`; re-exported from `rollback` unchanged so
+/// existing `marble_csg::rollback::Tick` references don't need updating.
+pub type Tick = u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Axis {

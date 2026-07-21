@@ -4,6 +4,7 @@
 
 use glam::{Mat2, Vec2, Vec3};
 
+use crate::expr::Expr;
 use crate::fold::Fold;
 use crate::object::Object;
 use crate::{
@@ -211,54 +212,92 @@ pub fn menger_sphere(params: &mut Params) -> (Object, MengerHandles) {
 }
 
 /// Parameter handles for [`menger_oscillating_sphere`]: [`menger_sponge`]'s
-/// own handles, plus the bite sphere's runtime-mutable radius.
-#[derive(Clone, Copy, Debug)]
+/// own handles, plus the bite sphere's runtime-mutable radius and the
+/// [`Expr`] that drives it from the shared tick clock.
+#[derive(Clone, Debug)]
 pub struct MengerOscillatingSphereHandles {
     pub menger: MengerHandles,
     pub radius: ScalarParam,
+    /// Drives `radius` as a pure function of `crate::Tick` — register
+    /// `(radius, radius_anim.clone())` into a scene's animation table (see
+    /// `crate::expr` module doc) so it's evaluated once per simulated tick,
+    /// live and through any rollback resimulation, instead of the old
+    /// per-frame wall-clock formula this replaces.
+    pub radius_anim: Expr,
 }
+
+/// [`menger_sponge`]'s overall bounding half-extent: its single outer
+/// `ScaleTranslate{scale: 0.33}` sets this to `1.0/0.33` (confirmed
+/// numerically: `object.de` crosses zero almost exactly at the corner point
+/// `(k,k,k)` for `k = MENGER_SPONGE_HALF_EXTENT`). [`MENGER_BITE_MIN_RADIUS`]
+/// and [`MENGER_BITE_MAX_RADIUS`] are both derived from this, independently
+/// of each other — the min radius is about the sponge's own pre-existing
+/// central hole and has nothing to do with how far the max radius reaches.
+const MENGER_SPONGE_HALF_EXTENT: f32 = 1.0 / 0.33;
 
 /// The smallest bite-sphere radius that removes *nothing visible* from
 /// [`menger_sponge`]: exactly the half-extent of the sponge's own
 /// already-empty central void (the "+"-shaped cell a Menger sponge always
-/// has removed at its exact center, one level in). A sphere this size sits
-/// entirely inside that pre-existing hole — verified numerically (not just
-/// derived): sampling `object.de` at this exact radius across thousands of
-/// directions from the origin, the closest any of them come to solid
-/// material is +0.42 (comfortably positive everywhere), and the nearest
-/// solid material in *any* direction from the origin is at distance 1.43,
-/// a real margin above this radius.
-///
-/// Derivation: [`menger_sponge`]'s single outer `ScaleTranslate{scale:
-/// 0.33}` sets the sponge's overall bounding half-extent to `1.0/0.33`
-/// (confirmed numerically too: `object.de` crosses zero almost exactly at
-/// the corner point `(k,k,k)` for `k = 1.0/0.33`). Each recursive
+/// has removed at its exact center, one level in) — each recursive
 /// iteration's own `ScaleTranslate{scale: 3.0}` is the classic Menger 3x
-/// subdivision, so the first-level removed central cube is 1/3 of the
-/// overall extent.
-pub const MENGER_BITE_MIN_RADIUS: f32 = MENGER_BITE_MAX_RADIUS / 3.0;
+/// subdivision, so the first-level removed central cube is 1/3 of
+/// [`MENGER_SPONGE_HALF_EXTENT`]. A sphere this size sits entirely inside
+/// that pre-existing hole — verified numerically (not just derived):
+/// sampling `object.de` at this exact radius across thousands of directions
+/// from the origin, the closest any of them come to solid material is +0.42
+/// (comfortably positive everywhere), and the nearest solid material in
+/// *any* direction from the origin is at distance 1.43, a real margin above
+/// this radius.
+pub const MENGER_BITE_MIN_RADIUS: f32 = MENGER_SPONGE_HALF_EXTENT / 3.0;
 
-/// The largest bite-sphere radius worth animating up to: its *diameter*
-/// equals the sponge's own full side length (`2.0 * (1.0/0.33)`), so the
-/// sphere touches the center of each outer face exactly (where a Menger
-/// sponge is already hollow — its face-center tunnels run all the way
-/// through) and carves away everything else, leaving only the 8 corner
-/// regions (which sit farther out, at `(1.0/0.33) * sqrt(3.0) ~= 5.25` from
-/// the center — well outside this sphere). This is exactly [`menger_sphere`]'s
-/// existing hand-tuned `radius: 3.0` bite, expressed in closed form instead
-/// of a magic number that happens to be close.
-pub const MENGER_BITE_MAX_RADIUS: f32 = 1.0 / 0.33;
+/// The largest bite-sphere radius worth animating up to: reaches each outer
+/// edge's midpoint instead of stopping at the face center. For a cube with
+/// half-extent `h` = [`MENGER_SPONGE_HALF_EXTENT`], the face center is `h`
+/// from the origin, an edge midpoint is `h * sqrt(2.0)`, and a corner is
+/// `h * sqrt(3.0)`; this uses the edge-midpoint distance, which carves
+/// further than the old face-reaching radius (removing the edge regions
+/// too, not just the face tunnels) while still stopping short of the
+/// corners (`h*sqrt(3.0) ~= 7.42` from the center — well outside this
+/// sphere, at `h*sqrt(2.0) ~= 4.28`).
+pub const MENGER_BITE_MAX_RADIUS: f32 = MENGER_SPONGE_HALF_EXTENT * std::f32::consts::SQRT_2;
+
+/// The bite sphere's oscillation period, in simulated [`crate::Tick`]s
+/// rather than wall-clock seconds — 12 seconds at the app's fixed 60Hz
+/// physics/animation tick rate (`Time::<Fixed>::from_hz(60.0)` in
+/// `main.rs`). Expressing the period in ticks (not seconds, with a
+/// separate conversion elsewhere) keeps [`menger_oscillating_sphere`]'s
+/// [`Expr`] a pure function of `Tick` with no implicit unit baked in
+/// anywhere else.
+const MENGER_OSCILLATING_SPHERE_PERIOD_TICKS: f32 = 12.0 * 60.0;
 
 /// [`menger_sponge`] with a bite sphere whose radius is a runtime
 /// [`ScalarValue::Param`] instead of a fixed constant — demonstrates
 /// animating a CSG *geometry* parameter live (not just a fractal fold's
 /// rotation/color/iteration-count, which `classic`/`menger_sponge` already
 /// show), oscillating between [`MENGER_BITE_MIN_RADIUS`] (removes nothing)
-/// and [`MENGER_BITE_MAX_RADIUS`] (only the corners survive).
+/// and [`MENGER_BITE_MAX_RADIUS`] (only the corners survive) once per
+/// [`MENGER_OSCILLATING_SPHERE_PERIOD_TICKS`], driven by
+/// [`MengerOscillatingSphereHandles::radius_anim`] instead of wall-clock
+/// time (see `crate::expr` module doc for why).
 pub fn menger_oscillating_sphere(params: &mut Params) -> (Object, MengerOscillatingSphereHandles) {
     let (sponge, menger) = menger_sponge(params);
     let radius = params.alloc_scalar(MENGER_BITE_MIN_RADIUS);
-    let handles = MengerOscillatingSphereHandles { menger, radius };
+
+    // radius = MIN + (MAX - MIN) * 0.5 * (1 - cos(tick * omega))
+    let omega = std::f32::consts::TAU / MENGER_OSCILLATING_SPHERE_PERIOD_TICKS;
+    let angle = Expr::Mul(Box::new(Expr::Tick), Box::new(Expr::Const(omega)));
+    let one_minus_cos = Expr::Sub(Box::new(Expr::Const(1.0)), Box::new(Expr::Cos(Box::new(angle))));
+    let span = Expr::Mul(
+        Box::new(Expr::Const((MENGER_BITE_MAX_RADIUS - MENGER_BITE_MIN_RADIUS) * 0.5)),
+        Box::new(one_minus_cos),
+    );
+    let radius_anim = Expr::Add(Box::new(Expr::Const(MENGER_BITE_MIN_RADIUS)), Box::new(span));
+
+    let handles = MengerOscillatingSphereHandles {
+        menger,
+        radius,
+        radius_anim,
+    };
     let object = Object::Difference(
         Box::new(sponge),
         Box::new(Object::Sphere {
@@ -510,6 +549,52 @@ mod tests {
             (d_bare - d_osc).abs() < 1e-5,
             "bite at MENGER_BITE_MAX_RADIUS reached a corner-region point it shouldn't have: \
              bare={d_bare} osc={d_osc} at k={k}"
+        );
+    }
+
+    #[test]
+    fn max_radius_is_the_edge_midpoint_not_the_face_center() {
+        // The requested geometry change: MAX_RADIUS should be the old
+        // face-reach distance times sqrt(2) -- exactly an edge midpoint's
+        // distance from the center, for a cube with half-extent = the old
+        // face-reach distance.
+        let face_reach = 1.0 / 0.33;
+        let edge_reach = face_reach * std::f32::consts::SQRT_2;
+        assert!(
+            (MENGER_BITE_MAX_RADIUS - edge_reach).abs() < 1e-6,
+            "MENGER_BITE_MAX_RADIUS={MENGER_BITE_MAX_RADIUS} != edge_reach={edge_reach}"
+        );
+        // ...and strictly less than the corner distance (face_reach * sqrt(3)),
+        // so the corners still survive being bitten at MAX_RADIUS.
+        assert!(MENGER_BITE_MAX_RADIUS < face_reach * 3.0_f32.sqrt());
+    }
+
+    #[test]
+    fn radius_anim_matches_the_scalar_bounds_at_key_ticks() {
+        // The Expr conversion must preserve the exact min/max bounds the
+        // scalar radius previously oscillated between (see the doc comment
+        // on menger_oscillating_sphere and MENGER_OSCILLATING_SPHERE_PERIOD_TICKS
+        // for why this is a pure function of Tick rather than wall time now).
+        let mut params = Params::new();
+        let (_object, handles) = menger_oscillating_sphere(&mut params);
+        let anim = &handles.radius_anim;
+
+        assert!(
+            (anim.eval(0) - MENGER_BITE_MIN_RADIUS).abs() < 1e-3,
+            "tick 0 should start at MIN_RADIUS, got {}",
+            anim.eval(0)
+        );
+        let half_period = (MENGER_OSCILLATING_SPHERE_PERIOD_TICKS / 2.0) as u64;
+        assert!(
+            (anim.eval(half_period) - MENGER_BITE_MAX_RADIUS).abs() < 1e-3,
+            "half period should reach MAX_RADIUS, got {}",
+            anim.eval(half_period)
+        );
+        let full_period = MENGER_OSCILLATING_SPHERE_PERIOD_TICKS as u64;
+        assert!(
+            (anim.eval(full_period) - MENGER_BITE_MIN_RADIUS).abs() < 1e-3,
+            "a full period should return to MIN_RADIUS, got {}",
+            anim.eval(full_period)
         );
     }
 }

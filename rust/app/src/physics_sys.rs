@@ -32,6 +32,13 @@
 //! separately in `touch::touch_camera_input` (`Update` schedule, alongside
 //! the mouse-driven `orbit_camera_input`), since it drives `CameraOrbit`,
 //! not the marble.
+//!
+//! **Always-on rollback**: every scene's marble physics runs through a
+//! [`RollbackSim`] from scene load, single-player included — see
+//! [`MultiplayerSession`]'s doc for why this one path (not "plain
+//! `step_marbles` while offline, `RollbackSim` only once connected")
+//! replaced an earlier design with exactly that split, and how connecting
+//! to a peer *grows* the existing session instead of discarding it.
 
 use web_time::Instant;
 
@@ -40,8 +47,8 @@ use bevy::prelude::*;
 
 use crate::fps_overlay::PhaseTimings;
 
-use marble_csg::physics::{step_marbles, GravityMode, Marble, PhysicsConfig, PlayerInput};
-use marble_csg::rollback::{InputTransport, RollbackSim, Tick};
+use marble_csg::physics::{GravityMode, Marble, PhysicsConfig, PlayerInput};
+use marble_csg::rollback::{InputTransport, RollbackSim};
 
 use crate::camera::CameraOrbit;
 use crate::net::{NetSession, NetStatus, WebRtcTransport};
@@ -56,20 +63,22 @@ use crate::touch::read_two_finger_gesture;
 /// Constructed per-scene in `render::setup` (there's no scene-independent
 /// `Default` to speak of).
 ///
-/// Multiplayer milestone 0: was a single `Marble` before this — `marbles`/
-/// `start_positions` are parallel `Vec`s (same index = same marble,
-/// [`step_marbles`]'s own convention) rather than a `HashMap` keyed by some
-/// player id, since stable index order is what determinism (a future
-/// rollback engine's whole point) depends on.
+/// `marbles`/`start_positions` are just a read-only mirror of
+/// [`MultiplayerSession::sim`]'s own live state, refreshed every tick —
+/// [`RollbackSim`] owns the authoritative copy (needed to snapshot/rewind),
+/// same reasoning as multiplayer milestone 2's original design, just no
+/// longer conditional on being connected.
 #[derive(Resource)]
 pub struct MarbleState {
     pub marbles: Vec<Marble>,
     pub cfg: PhysicsConfig,
     pub start_positions: Vec<Vec3>,
     pub kill_y: f32,
-    /// Which `marbles` index this client controls/watches -- always `0`
-    /// today (no networking exists yet), named for milestone 2's benefit
-    /// rather than assumed to always be zero everywhere it's read.
+    /// Which `marbles` index this client controls/watches -- `0` until a
+    /// connection assigns this client a [`crate::net::Role`] (always host,
+    /// i.e. `0`, for as long as nobody's connected), named for
+    /// multiplayer's benefit rather than assumed to always be zero
+    /// everywhere it's read.
     pub local_player_index: usize,
 }
 
@@ -81,45 +90,69 @@ impl MarbleState {
     }
 }
 
-/// Multiplayer milestone 2: the live 2-player [`RollbackSim`] + its
-/// [`WebRtcTransport`], once a peer actually connects — `None` until then,
-/// so single-player behavior (the direct `step_marbles` path below) is
-/// completely unaffected by any of this existing. Lives in its own
-/// resource rather than folded into [`MarbleState`] since `RollbackSim`
-/// owns its *own* copy of the marble list (needed to snapshot/rewind) —
-/// `MarbleState::marbles` becomes just a read-only mirror of
-/// `RollbackSim::marbles()`, refreshed every tick, once this exists.
+/// The live [`RollbackSim`] + its [`WebRtcTransport`] once connected —
+/// always live from scene load now (`render::setup` constructs this
+/// alongside `MarbleState`/`SceneState`), not lazily created at first
+/// connection. Single-player is just a `RollbackSim` session with one
+/// confirmed local player and no remote peers ever arriving: this system
+/// never confirms input for any player index but its own, so every other
+/// slot's input always falls back to `RollbackSim`'s own `default_input`
+/// (`RollbackSim::new`'s doc) — the same fallback mechanism naturally
+/// covers `Demo`'s decorative extra marbles too (`render::setup`'s doc),
+/// no separate "placeholder input for non-real players" code needed.
+///
+/// Because a session always exists, connecting to a peer *grows* it in
+/// place ([`RollbackSim::add_player_at`]) instead of discarding it and
+/// building a fresh one — `current_tick` and the local player's own live
+/// state both carry through the join with no discontinuity. This matters
+/// doubly now that `RollbackSim`'s own tick is also the clock
+/// `marble_csg::expr`-driven animated params run on (`SceneState::
+/// animations`): a discard-and-rebuild design would have visibly reset a
+/// running animation's phase the instant a second player joined, on top of
+/// the marble-position "teleport" that design already implied.
 ///
 /// Known, deliberately-unaddressed limitation (per the multiplayer plan:
 /// "graceful reconnect is a further refinement, not required"): once
 /// `NetSession::status` leaves `NetStatus::Connected` (peer disconnected),
-/// `marble_physics_tick` falls back to the plain local `step_marbles` path,
-/// still driving `MarbleState::marbles` (whatever 2-marble state the
-/// rollback session left behind) — the departed player's marble just sits
-/// wherever it last was, driven by zero input, exactly like milestone 0's
-/// original "placeholder marbles" behavior. If the *same* peer later
-/// reconnects, this resource (still holding the pre-disconnect
-/// `RollbackSim`) resumes from where it left off rather than resetting —
-/// since `MarbleState::marbles` kept moving locally during the gap while
-/// `RollbackSim`'s internal state didn't, resuming can produce a visible
-/// position "snap" back to the rollback session's last known state. Rare in
-/// practice (this milestone's join flow doesn't support reconnecting to a
-/// *different* link anyway) and explicitly out of scope to fully reconcile.
-#[derive(Resource, Default)]
+/// this system keeps driving `sim` exactly as before, just confirming a
+/// zero input for the departed player from then on (same idea as
+/// `default_input`, made explicit — see the "was connected, isn't now"
+/// branch below) instead of leaving them repeating whatever they were last
+/// doing forever. If the *same* peer later reconnects, `NetStatus` moving
+/// back to `Connected` resumes exchanging real input on the *same* `sim`
+/// (nothing was ever torn down) rather than rebuilding — simpler and more
+/// correct than a lazy-init design's reconnect story, though still not a
+/// full resync from a peer's own state if the two have actually diverged
+/// during the gap.
+#[derive(Resource)]
 pub struct MultiplayerSession {
-    live: Option<LiveSession>,
+    pub sim: RollbackSim,
+    /// `Some` only once actually connected to a remote peer at least once
+    /// — absent, this system never polls for or sends anything over the
+    /// network.
+    transport: Option<WebRtcTransport>,
 }
 
-struct LiveSession {
-    sim: RollbackSim,
-    transport: WebRtcTransport,
-    /// Rollback's own tick counter (`marble_csg::rollback::Tick`), *not*
-    /// wall-clock time or this app's `FixedUpdate` frame count directly —
-    /// happens to line up 1:1 with `FixedUpdate` calls in practice (this
-    /// system only ever increments it once per call), but keeping it as
-    /// its own field rather than reading it back out of `sim` every time
-    /// keeps "whose tick counter is authoritative" unambiguous.
-    tick: Tick,
+impl MultiplayerSession {
+    /// The always-on solo session every scene starts with —
+    /// `initial_marbles` must be `MarbleState::marbles` at the same moment
+    /// (matches `RollbackSim::new`'s own "must match tick 0's marble
+    /// state" contract). `default_input` is a fixed `Quat::IDENTITY`
+    /// orientation rather than tracking the live camera: it's only ever
+    /// actually used for a player index nothing has confirmed real input
+    /// for, and `step_marble` never reads `orientation` unless `dx`/`dy`
+    /// are nonzero, which they never are for a purely-predicted-forever
+    /// player -- see this type's doc.
+    pub fn new_solo(initial_marbles: Vec<Marble>) -> Self {
+        Self {
+            sim: RollbackSim::new(
+                initial_marbles,
+                PlayerInput { dx: 0.0, dy: 0.0, orientation: Quat::IDENTITY },
+                ROLLBACK_WINDOW_TICKS,
+            ),
+            transport: None,
+        }
+    }
 }
 
 /// Rewind window depth (in ticks, i.e. ~267ms at 60Hz) — deep enough to
@@ -132,13 +165,13 @@ const ROLLBACK_WINDOW_TICKS: u64 = 16;
 
 /// One 60 Hz physics tick (`FixedUpdate`): reads WASD + a 2-finger pinch
 /// (additive — see module doc) + the orbit camera's orientation, steps every
-/// marble against the live CSG scene tree (`step_marbles`, resolving
-/// marble-vs-marble collision along the way), lets `R` force an immediate
-/// manual respawn of the *local* marble, and `G` toggle [`GravityMode`] for
-/// everyone (there's only one shared `cfg` — per-player physics config isn't
-/// a thing this milestone needs). A no-op for scenes without a real marble
-/// (`SceneKind::has_marble` — the static display fractals, not the tuned
-/// demo level).
+/// marble against the live CSG scene tree through the always-on
+/// [`RollbackSim`] (resolving marble-vs-marble collision along the way),
+/// lets `R` force an immediate manual respawn of the *local* marble, and
+/// `G` toggle [`GravityMode`] for everyone (there's only one shared `cfg` —
+/// per-player physics config isn't a thing this milestone needs). A no-op
+/// for scenes without a real marble (`SceneKind::has_marble` — the static
+/// display fractals, not the tuned demo level).
 /// Thin timing wrapper over [`marble_physics_tick_impl`] -- records this
 /// call's wall-clock cost into [`PhaseTimings`] regardless of which of
 /// `_impl`'s several early-return paths actually fires, without needing to
@@ -148,7 +181,7 @@ pub fn marble_physics_tick(
     keys: Res<ButtonInput<KeyCode>>,
     touches: Res<Touches>,
     orbit: Res<CameraOrbit>,
-    scene: Res<SceneState>,
+    scene: ResMut<SceneState>,
     net: Res<NetSession>,
     mp: ResMut<MultiplayerSession>,
     marble_state: ResMut<MarbleState>,
@@ -163,7 +196,7 @@ fn marble_physics_tick_impl(
     keys: Res<ButtonInput<KeyCode>>,
     touches: Res<Touches>,
     orbit: Res<CameraOrbit>,
-    scene: Res<SceneState>,
+    mut scene: ResMut<SceneState>,
     net: Res<NetSession>,
     mut mp: ResMut<MultiplayerSession>,
     mut marble_state: ResMut<MarbleState>,
@@ -171,6 +204,11 @@ fn marble_physics_tick_impl(
     if !scene.kind.has_marble() {
         return;
     }
+    // A real `&mut SceneState` (not `ResMut`'s `Deref`/`DerefMut`, which go
+    // through method calls the borrow checker can't see through) so
+    // `&scene.object`/`&mut scene.params`/`&scene.animations` below can be
+    // borrowed as the disjoint fields they actually are, in one call.
+    let scene = &mut *scene;
 
     if keys.just_pressed(KeyCode::KeyG) {
         marble_state.cfg.mode = match marble_state.cfg.mode {
@@ -179,23 +217,16 @@ fn marble_physics_tick_impl(
         };
     }
 
-    // `R`-to-respawn is a direct, out-of-band mutation of marble state --
-    // fine for the offline path (nothing else needs to agree on it), but
-    // NOT safe to allow while a `RollbackSim` is live: it owns its own
-    // marble state independently and isn't aware of this mutation, so
-    // `marble_state.marbles` (a plain mirror once connected, see
-    // `MultiplayerSession`'s doc) would get silently overwritten back to
-    // the pre-respawn position on the very next tick, and the two peers'
-    // simulations would disagree about whether a respawn ever happened at
-    // all -- a real desync, not just a visual glitch. Disabled while
-    // networked rather than half-implemented; a real fix would need
-    // respawn to become an actual networked, deterministic input (a button
-    // bit on `PlayerInput`, replayable like everything else), which is
-    // future work.
-    if keys.just_pressed(KeyCode::KeyR) && mp.live.is_none() {
+    // `R`-to-respawn is a direct, out-of-band mutation no resim can ever
+    // replay (`RollbackSim::respawn`'s doc: it isn't a function of any
+    // `PlayerInput`) -- only safe while nothing could ever trigger a resim
+    // reaching back over the tick it happens on, i.e. only while not
+    // actually connected to a peer yet.
+    if keys.just_pressed(KeyCode::KeyR) && mp.transport.is_none() {
         let idx = marble_state.local_player_index;
         let start = marble_state.start_positions[idx];
-        marble_state.marbles[idx].respawn(start);
+        mp.sim.respawn(idx, start);
+        marble_state.marbles = mp.sim.marbles().to_vec();
         return;
     }
 
@@ -228,96 +259,92 @@ fn marble_physics_tick_impl(
     // itself uses (`orientation * Vec3::NEG_Z` / `orientation * Vec3::X`).
     let local_input = PlayerInput { dx, dy, orientation: orbit.orientation };
 
-    // Multiplayer milestone 2: once a peer is actually connected, drive
-    // the session through `RollbackSim` instead of calling `step_marbles`
-    // directly -- see `MultiplayerSession`'s doc for why this lazily
-    // (re)initializes a fresh 2-marble session the first tick we're
-    // connected, and for the known reconnect-snap limitation.
-    if net.status == NetStatus::Connected {
-        if mp.live.is_none() {
-            let rad = marble_state.marbles.first().map_or(0.15, |m| m.rad);
-            let starts: Vec<Vec3> = (0..2)
-                .map(|i| {
-                    marble_state
-                        .start_positions
-                        .get(i)
-                        .copied()
-                        .unwrap_or(Vec3::new(i as f32 * 0.4, 0.0, 0.0))
-                })
-                .collect();
-            let initial: Vec<Marble> = starts.iter().map(|s| Marble::spawn(*s, rad)).collect();
-            marble_state.marbles = initial.clone();
-            marble_state.start_positions = starts;
-            marble_state.local_player_index = net.role.local_index();
-            mp.live = Some(LiveSession {
-                sim: RollbackSim::new(
-                    initial,
-                    PlayerInput { dx: 0.0, dy: 0.0, orientation: Quat::IDENTITY },
-                    ROLLBACK_WINDOW_TICKS,
-                ),
-                transport: WebRtcTransport::new(net.role),
-                tick: 0,
-            });
+    // Newly connected this tick: grow the *existing* session instead of
+    // discarding it (`MultiplayerSession`'s doc).
+    if net.status == NetStatus::Connected && mp.transport.is_none() {
+        // Multiplayer is always exactly 2 *real* players (`net::Role`'s
+        // doc) -- narrow away any non-real extra marbles first (`Demo`'s
+        // decorative ones, `render::setup`'s doc); a no-op for every other
+        // scene, which always starts solo with exactly 1 marble already.
+        if mp.sim.num_players() > 1 {
+            mp.sim = mp.sim.narrow_to(marble_state.local_player_index);
+            marble_state.start_positions = vec![marble_state.start_positions[marble_state.local_player_index]];
+            marble_state.local_player_index = 0;
         }
 
-        let live = mp.live.as_mut().unwrap();
-        live.tick += 1;
-        let local_idx = net.role.local_index();
-
-        // We always know our own input the instant we produce it -- send
-        // it to the peer and confirm it locally in the same batch as
-        // whatever the peer has sent us that's arrived since last tick
-        // (one `receive_inputs` call, not two, per its own doc on why a
-        // combined batch matters for correctness, not just efficiency).
-        live.transport.send_input(live.tick, local_input);
-        let mut arrivals = vec![(local_idx, live.tick, local_input)];
-        arrivals.extend(live.transport.poll_received());
-
-        let kill_y = marble_state.kill_y;
-        let starts = marble_state.start_positions.clone();
-        if let Err(e) = live.sim.receive_inputs(
-            &arrivals,
-            &scene.object,
-            &scene.params,
-            &marble_state.cfg,
-            kill_y,
-            &starts,
-        ) {
-            // Network conditions outran the rewind window. Milestone 2's
-            // minimum bar (per the plan) is "don't crash or corrupt the
-            // simulation" -- log and keep going with whatever state the
-            // sim already has, rather than panicking. A real fix needs a
-            // full state resync from the peer, out of scope here.
-            warn!(
-                "multiplayer: rollback window exceeded (tick {}, oldest available {}) -- \
-                 possible desync until the next full resync",
-                e.requested_tick, e.oldest_available
-            );
-        }
-        live.sim.advance(&scene.object, &scene.params, &marble_state.cfg, kill_y, &starts);
-        marble_state.marbles = live.sim.marbles().to_vec();
-        return;
+        // The remote player's starting position has to be a value *both*
+        // sides independently compute identically, without knowing
+        // anything real about each other yet (no state-sync protocol
+        // exists -- see this fork's report on `net.rs`) -- deriving it
+        // from `start_positions.get(remote_index)` (an earlier version of
+        // this code) is wrong: for the joiner, `remote_index` is `0`, which
+        // *already has an entry* pre-connection (the joiner's own solo
+        // start, not the host's), so that lookup would silently reuse the
+        // joiner's own position for where it thinks the host is standing.
+        // Instead, both sides derive the same canonical `base` (this
+        // scene's spawn point, identical on both clients since it comes
+        // from the same `?scene=`) and offset purely by `remote_index`
+        // itself (not by "am I the host or the joiner"), so a fresh host
+        // inserting the joiner at `1` and a fresh joiner inserting the
+        // host at `0` agree exactly: the host's own real, unmodified
+        // position is `base` (offset 0), and that's exactly what the
+        // joiner's `remote_index = 0` guess also computes for it.
+        let remote_index = net.role.remote_index();
+        let base = marble_state.start_positions[marble_state.local_player_index];
+        let rad = mp.sim.marbles()[marble_state.local_player_index].rad;
+        let remote_start = base + Vec3::new(remote_index as f32 * 0.4, 0.0, 0.0);
+        mp.sim.add_player_at(remote_index, Marble::spawn(remote_start, rad));
+        marble_state.start_positions.insert(remote_index, remote_start);
+        marble_state.local_player_index = net.role.local_index();
+        mp.transport = Some(WebRtcTransport::new(net.role));
     }
 
-    // Offline path (unchanged from milestone 0/1): every marble gets *some*
-    // `PlayerInput` this tick, since `step_marbles` needs one per marble --
-    // the local player's is built from real input above; every other
-    // marble gets a placeholder zero-input one (they just sit under
-    // gravity/collision).
     let local_idx = marble_state.local_player_index;
-    let inputs: Vec<PlayerInput> = (0..marble_state.marbles.len())
-        .map(|i| if i == local_idx { local_input } else { PlayerInput { dx: 0.0, dy: 0.0, orientation: orbit.orientation } })
-        .collect();
+    let tick = mp.sim.current_tick() + 1;
+
+    // We always know our own input the instant we produce it -- confirm it
+    // immediately (never predicted), same as a real remote peer's own
+    // client does for theirs.
+    let mut arrivals = vec![(local_idx, tick, local_input)];
+    if net.status == NetStatus::Connected {
+        if let Some(transport) = mp.transport.as_mut() {
+            transport.send_input(tick, local_input);
+            arrivals.extend(transport.poll_received());
+        }
+    } else if mp.transport.is_some() {
+        // Was connected, isn't anymore -- the departed peer's marble sits
+        // under zero input from here on (`MultiplayerSession`'s doc),
+        // rather than silently repeating whatever they were last doing
+        // right up to the moment they dropped.
+        let remote_idx = net.role.remote_index();
+        arrivals.push((remote_idx, tick, PlayerInput { dx: 0.0, dy: 0.0, orientation: Quat::IDENTITY }));
+    }
 
     let kill_y = marble_state.kill_y;
-    let MarbleState { marbles, cfg, start_positions, .. } = &mut *marble_state;
-    let _events = step_marbles(
-        marbles,
-        &inputs,
+    let starts = marble_state.start_positions.clone();
+    // `receive_inputs`/`advance` re-evaluate `scene.animations` against
+    // each tick they (re)simulate internally (`RollbackSim`'s own doc) --
+    // this system never calls `apply_animations` itself.
+    if let Err(e) = mp.sim.receive_inputs(
+        &arrivals,
         &scene.object,
-        &scene.params,
-        cfg,
+        &mut scene.params,
+        &scene.animations,
+        &marble_state.cfg,
         kill_y,
-        start_positions,
-    );
+        &starts,
+    ) {
+        // Network conditions outran the rewind window. Milestone 2's
+        // minimum bar (per the plan) is "don't crash or corrupt the
+        // simulation" -- log and keep going with whatever state the
+        // sim already has, rather than panicking. A real fix needs a
+        // full state resync from the peer, out of scope here.
+        warn!(
+            "multiplayer: rollback window exceeded (tick {}, oldest available {}) -- \
+             possible desync until the next full resync",
+            e.requested_tick, e.oldest_available
+        );
+    }
+    mp.sim.advance(&scene.object, &mut scene.params, &scene.animations, &marble_state.cfg, kill_y, &starts);
+    marble_state.marbles = mp.sim.marbles().to_vec();
 }

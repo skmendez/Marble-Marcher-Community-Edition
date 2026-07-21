@@ -34,7 +34,7 @@ use net::{
     handle_copy_button_click, poll_net_status, setup_networking, spawn_net_ui, sync_net_ui_text,
     update_copy_button_visibility, update_copy_feedback, CopyFeedback,
 };
-use physics_sys::{marble_physics_tick, MultiplayerSession};
+use physics_sys::marble_physics_tick;
 use render::{finalize_marble_cubemap, setup, sync_quad_scale, update_material, FineMarcherMaterial};
 use shadow_pass::{
     resize_shadow_render_target, setup_shadow_pipeline, sync_shadow_quad_scale,
@@ -94,8 +94,15 @@ fn main() {
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<CameraOrbit>()
         .init_resource::<TouchDebugInfo>()
-        .init_resource::<MultiplayerSession>()
         .init_resource::<CopyFeedback>()
+        // `setup` (below) inserts `SceneState`/`MarbleState`/
+        // `MultiplayerSession` directly rather than `init_resource`-ing any
+        // of them here -- none has a scene-independent `Default` to speak
+        // of (`MultiplayerSession::new_solo` needs the scene's actual
+        // initial marble list, physics_sys.rs's doc), and `setup` is
+        // chained first among these `Startup` systems, so every one of
+        // them exists well before `FixedUpdate`'s `marble_physics_tick`
+        // ever runs.
         // `setup_mrrm_pipeline` (mrrm.rs) needs `setup`'s `SceneState` (the
         // scene tree + params buffer, to build the coarse shader/material)
         // and corrects `setup`'s placeholder `FineMarcherMaterial::coarse`

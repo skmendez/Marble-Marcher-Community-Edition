@@ -36,16 +36,17 @@ use bevy::ui::IsDefaultUiCamera;
 use bevy::window::PrimaryWindow;
 
 use marble_csg::codegen::generate_shader;
+use marble_csg::expr::Expr;
 use marble_csg::physics::{Marble, PhysicsConfig};
 use marble_csg::scenes::{
     beware_of_bumps, classic, demo_scene, menger_oscillating_sphere, menger_sphere, menger_sponge,
     set_fractal_params, set_menger_params, ClassicHandles, MengerHandles,
-    MengerOscillatingSphereHandles, MENGER_BITE_MAX_RADIUS, MENGER_BITE_MIN_RADIUS,
+    MengerOscillatingSphereHandles, MENGER_BITE_MIN_RADIUS,
 };
-use marble_csg::{Object, Params};
+use marble_csg::{Object, Params, ScalarParam};
 
 use crate::camera::CameraOrbit;
-use crate::physics_sys::MarbleState;
+use crate::physics_sys::{MarbleState, MultiplayerSession};
 
 /// Which scene to build, selected via
 /// `MM_SCENE=demo|classic_only|menger_sponge|menger_sphere|menger_oscillating_sphere`
@@ -73,10 +74,14 @@ pub enum SceneKind {
     MengerSponge,
     MengerSphere,
     /// [`menger_oscillating_sphere`] — same shape as `MengerSphere`, but the
-    /// bite sphere's radius is a runtime `Param` animated every frame
-    /// (`update_material`) between `MENGER_BITE_MIN_RADIUS` (removes
-    /// nothing) and `MENGER_BITE_MAX_RADIUS` (only the corners survive) —
-    /// a live demo of the CSG tree's existing runtime-uniform support
+    /// bite sphere's radius is a runtime `Param` driven by a
+    /// `marble_csg::expr::Expr`, evaluated once per physics tick against
+    /// the shared `Tick` clock (`physics_sys::MarbleState::offline_tick` or
+    /// `RollbackSim`'s own tick once networked — see `expr`'s module doc
+    /// for why wall-clock time isn't safe here), oscillating between
+    /// `MENGER_BITE_MIN_RADIUS` (removes nothing) and
+    /// `MENGER_BITE_MAX_RADIUS` (only the corners survive) — a live demo of
+    /// the CSG tree's existing runtime-uniform support
     /// (`marble_csg`'s `*Value::Param`/`Params`) animating actual geometry,
     /// not just a fractal fold's rotation/color/iteration-count.
     MengerOscillatingSphere,
@@ -173,8 +178,12 @@ pub enum SceneHandles {
     /// toggle on the static display fractals, symmetric to Classic's ang1.
     #[allow(dead_code)]
     Menger(MengerHandles),
-    /// [`SceneKind::MengerOscillatingSphere`]'s handles, read every frame by
-    /// [`update_material`] to animate the bite sphere's radius.
+    /// [`SceneKind::MengerOscillatingSphere`]'s handles -- the actual
+    /// animation lives in [`SceneState::animations`] now (populated from
+    /// [`MengerOscillatingSphereHandles::radius_anim`] once, in `setup`),
+    /// not read back out of here per frame; kept for parity with the other
+    /// variants and in case a future feature needs the raw handles again.
+    #[allow(dead_code)]
     MengerOscillatingSphere(MengerOscillatingSphereHandles),
 }
 
@@ -477,12 +486,6 @@ const MENGER_SPONGE_COLOR: Vec3 = Vec3::new(0.9, 0.65, 0.15);
 const MENGER_SPHERE_COLOR: Vec3 = Vec3::new(0.25, 0.65, 0.9);
 const MENGER_OSCILLATING_SPHERE_COLOR: Vec3 = Vec3::new(0.75, 0.25, 0.85);
 
-/// Full period (seconds) of [`SceneKind::MengerOscillatingSphere`]'s bite
-/// radius oscillation -- tuned by eye for a pace that reads clearly as
-/// "growing, then shrinking" rather than either a barely-visible drift or a
-/// dizzying flicker.
-const MENGER_OSCILLATING_SPHERE_PERIOD_SECS: f32 = 12.0;
-
 /// The CSG scene + its live parameter table, kept around so per-frame systems
 /// can animate params and (M5) run the marble's CPU distance/nearest-point
 /// collision queries against `object` without rebuilding the tree or
@@ -494,6 +497,16 @@ pub struct SceneState {
     /// `physics_sys::marble_physics_tick` against every scene's marble.
     pub object: Object,
     pub params: Params,
+    /// Every `(param, expr)` this scene wants re-evaluated once per
+    /// simulated tick (`crate::expr` module doc) -- written by
+    /// `physics_sys::marble_physics_tick_impl` (offline path directly,
+    /// connected path via `RollbackSim::advance`/`receive_inputs`), read
+    /// here only to decide whether to re-upload `params` to the GPU this
+    /// frame. Empty for every scene except
+    /// [`SceneKind::MengerOscillatingSphere`] today, but any future scene
+    /// that wants an animated param just needs to populate this instead of
+    /// adding another one-off `SceneHandles` match arm to `update_material`.
+    pub animations: Vec<(ScalarParam, Expr)>,
     pub handles: SceneHandles,
     pub material: Handle<FineMarcherMaterial>,
     pub params_buffer: Handle<ShaderStorageBuffer>,
@@ -606,6 +619,7 @@ pub fn setup(
         };
     }
 
+    let mut animations: Vec<(ScalarParam, Expr)> = Vec::new();
     let (object, handles) = match kind {
         SceneKind::Demo => {
             let (object, classic_handles) = demo_scene(&mut params);
@@ -653,11 +667,13 @@ pub fn setup(
                 MENGER_DEPTH,
                 MENGER_OSCILLATING_SPHERE_COLOR,
             );
-            // `update_material` overwrites this every frame; the initial
-            // value just needs to match what it computes at t=0
-            // (MENGER_BITE_MIN_RADIUS) so the very first rendered frame,
-            // before that system has run, isn't briefly wrong.
+            // The physics tick overwrites this every tick once it starts
+            // running; the initial value just needs to match what
+            // `radius_anim` evaluates to at tick 0 (MENGER_BITE_MIN_RADIUS)
+            // so the very first rendered frame, before any tick has run,
+            // isn't briefly wrong.
             params.set_scalar(osc_handles.radius, MENGER_BITE_MIN_RADIUS);
+            animations.push((osc_handles.radius, osc_handles.radius_anim.clone()));
             (object, SceneHandles::MengerOscillatingSphere(osc_handles))
         }
     };
@@ -741,12 +757,15 @@ pub fn setup(
         kind,
         object,
         params,
+        animations,
         handles,
         material,
         params_buffer,
         marbles_buffer,
         bounding_sphere,
     });
+
+    commands.insert_resource(MultiplayerSession::new_solo(marbles.clone()));
 
     commands.insert_resource(MarbleState {
         marbles,
@@ -858,22 +877,15 @@ fn update_material_impl(
         }
     }
 
-    // `MengerOscillatingSphere`'s bite-sphere radius: always animated (not
-    // gated behind `animate_fractal()` like `ang1` above) -- unlike Demo's
-    // level, this scene's marble spawns well outside the sponge entirely
-    // (`SceneKind::spawn_params`), so there's no strut for a moving fractal
-    // boundary to pull out from under it; the whole point of this scene is
-    // showing the CSG tree's runtime-uniform support animating live.
-    // Smoothly oscillates MENGER_BITE_MIN_RADIUS (removes nothing) up to
-    // MENGER_BITE_MAX_RADIUS (only the corners survive) and back, starting
-    // exactly at the minimum at t=0 (`cos(0) = 1`, matching `setup`'s
-    // initial value so the very first frame isn't already mid-cycle).
-    if let SceneHandles::MengerOscillatingSphere(handles) = &scene_state.handles {
-        let handles = *handles;
-        let omega = std::f32::consts::TAU / MENGER_OSCILLATING_SPHERE_PERIOD_SECS;
-        let radius = MENGER_BITE_MIN_RADIUS
-            + (MENGER_BITE_MAX_RADIUS - MENGER_BITE_MIN_RADIUS) * 0.5 * (1.0 - (t * omega).cos());
-        scene_state.params.set_scalar(handles.radius, radius);
+    // Scene-agnostic animated-param upload: `physics_sys::
+    // marble_physics_tick_impl` already wrote this tick's evaluated values
+    // straight into `scene_state.params` (offline path directly, connected
+    // path via `RollbackSim` -- see `SceneState::animations`'s doc for why
+    // evaluation doesn't happen here). This system just has to get the
+    // result onto the GPU every frame; skipped entirely for scenes with no
+    // animations (the common case) rather than uploading an unchanged
+    // buffer every frame for no reason.
+    if !scene_state.animations.is_empty() {
         if let Some(buffer) = storage_buffers.get_mut(&scene_state.params_buffer) {
             buffer.set_data(scene_state.params.slots().to_vec());
         }
