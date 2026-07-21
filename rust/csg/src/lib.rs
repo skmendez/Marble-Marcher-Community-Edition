@@ -13,16 +13,19 @@
 //! `GLSLConstant`; `*Value::Param` references a slot exactly like `GLSLUniform`.
 //!
 //! Module layout (see rust/MILESTONES.md for build-out order):
-//!  - `fold`    (M2): the `Fold` enum — space folds + orbit trap ops
-//!  - `object`  (M2): the `Object` enum — primitives, CSG combiners, `Fractal`
-//!  - `scenes`  (M2): prebuilt scenes (classic Marble Marcher fractal, etc.)
-//!  - `codegen` (M3): WGSL generation from an `Object` tree
-//!  - `physics` (M5): marble/collider simulation against an `Object`
+//!  - `fold`     (M2): the `Fold` enum — space folds + orbit trap ops
+//!  - `object`   (M2): the `Object` enum — primitives, CSG combiners, `Fractal`
+//!  - `scenes`   (M2): prebuilt scenes (classic Marble Marcher fractal, etc.)
+//!  - `codegen`  (M3): WGSL generation from an `Object` tree
+//!  - `physics`  (M5): marble/collider simulation against an `Object`
+//!  - `rollback` (multiplayer milestone 1): input buffering + snapshot/
+//!    rewind/resimulate rollback netcode around `physics::step_marbles`
 
 pub mod codegen;
 pub mod fold;
 pub mod object;
 pub mod physics;
+pub mod rollback;
 pub mod scenes;
 
 pub use fold::Fold;
