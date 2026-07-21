@@ -56,7 +56,8 @@ use crate::physics_sys::{MarbleState, MultiplayerSession, PendingSceneSync};
 /// no OS environment in a browser -- so `MM_SCENE` alone only ever had any
 /// effect for local/native testing; `web_config::query_param` is the
 /// browser-reachable equivalent, same value vocabulary, so the two can't
-/// drift apart). Defaults to `MengerSponge` either way if unset/unrecognized.
+/// drift apart). Defaults to `MengerOscillatingSphere` either way if
+/// unset/unrecognized.
 ///
 /// `Demo`/`ClassicOnly` have authored level data (`beware_of_bumps`: a
 /// start position tuned to rest on a surface, a kill plane, `ang1`
@@ -113,7 +114,7 @@ impl SceneKind {
             Some("menger_sponge") => Self::MengerSponge,
             Some("menger_sphere") => Self::MengerSphere,
             Some("menger_oscillating_sphere") => Self::MengerOscillatingSphere,
-            _ => Self::MengerSponge,
+            _ => Self::MengerOscillatingSphere,
         }
     }
 
@@ -122,9 +123,9 @@ impl SceneKind {
     /// host's actual current scene onto the shareable join link (`&scene=`
     /// alongside `?join=`), so a joiner lands on the same scene the host is
     /// running instead of silently falling back to their own URL's
-    /// (usually absent) `?scene=` guess. `MengerSponge` gets an explicit
-    /// value here even though it's also `from_config`'s fallback -- a
-    /// join link should always say what it means, not lean on a default
+    /// (usually absent) `?scene=` guess. `MengerOscillatingSphere` gets an
+    /// explicit value here even though it's also `from_config`'s fallback --
+    /// a join link should always say what it means, not lean on a default
     /// happening to agree on both ends.
     pub fn query_value(self) -> &'static str {
         match self {
