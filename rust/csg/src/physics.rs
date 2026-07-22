@@ -1149,9 +1149,9 @@ mod tests {
     /// individual marble while adding marble-vs-marble collision. A big
     /// cuboid (not the demo level, and not a sphere) on purpose:
     /// `beware_of_bumps::START` sits on a resting ledge only about 1x the
-    /// marble's own radius wide (`render.rs`'s `animate_fractal` doc), so
-    /// offsetting away from it by enough to avoid marble-vs-marble contact
-    /// reliably walks off the ledge into open space (confirmed by an
+    /// marble's own radius wide, so offsetting away from it by enough to
+    /// avoid marble-vs-marble contact reliably walks off the ledge into
+    /// open space (confirmed by an
     /// earlier version of this test doing exactly that); a *sphere*'s
     /// surface curves away from any offset point, so straight-down gravity
     /// has a tangential component there and the marble never truly stops

@@ -27,8 +27,7 @@
 //! tool available at all) without needing to manually flip query params and
 //! reload between each comparison.
 //!
-//! Opt-in only (`perfprobe_enabled()`, same query-param-then-env-var
-//! pattern as `mrrm::mrrm_enabled`/`shadow_pass::shadow_lod_enabled`) --
+//! Opt-in only (`config::Config::perfprobe_enabled`) --
 //! `perfprobe_tick` is a no-op whenever it's off, so this has zero behavior
 //! change and negligible overhead (one resource read, one bool check) on
 //! every normal run.
@@ -99,20 +98,8 @@ impl ProbeWindow {
     }
 }
 
-/// `?perfprobe=1`/`MM_PERFPROBE=1` gate -- same `OnceLock` + query-param-
-/// then-env-var layering as `mrrm::mrrm_enabled`/
-/// `shadow_pass::shadow_lod_enabled`.
-pub fn perfprobe_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let value =
-            crate::web_config::query_param("perfprobe").or_else(|| std::env::var("MM_PERFPROBE").ok());
-        matches!(value.as_deref(), Some("1") | Some("true"))
-    })
-}
-
 /// Live probe state -- always inserted (`init_resource`), regardless of
-/// whether `perfprobe_enabled()` is true, so `render::update_material` can
+/// whether `config.perfprobe_enabled` is true, so `render::update_frame_data` can
 /// unconditionally read `fine_max_steps_override` without an `Option`
 /// param; `perfprobe_tick` simply never advances it past its `Default` when
 /// the probe is off, so `fine_max_steps_override` stays `0.0` (no override)
@@ -162,11 +149,12 @@ impl Default for PerfProbeState {
 /// so a session left running keeps producing fresh comparable samples).
 pub fn perfprobe_tick(
     time: Res<Time>,
+    config: Res<crate::config::Config>,
     mut state: ResMut<PerfProbeState>,
     mut coarse_cameras: Query<&mut Camera, (With<CoarseCamera>, Without<ShadowCamera>)>,
     mut shadow_cameras: Query<&mut Camera, (With<ShadowCamera>, Without<CoarseCamera>)>,
 ) {
-    if !perfprobe_enabled() {
+    if !config.perfprobe_enabled {
         return;
     }
 
@@ -231,16 +219,16 @@ pub fn perfprobe_tick(
 }
 
 /// Marker for the on-screen text entity showing the currently-active probe
-/// window -- only spawned/updated when `perfprobe_enabled()`, so a normal
-/// (non-probe) run's overlay is unchanged. `pub(crate)`: it appears in
+/// window -- only spawned/updated when `config.perfprobe_enabled`, so a
+/// normal (non-probe) run's overlay is unchanged. `pub(crate)`: it appears in
 /// `update_perfprobe_overlay_text`'s public query type, which `main.rs` (a
 /// different module) needs to be able to name when registering that system
 /// -- same reasoning as `mrrm::CoarseQuad`'s doc.
 #[derive(Component)]
 pub(crate) struct PerfProbeText;
 
-pub fn spawn_perfprobe_overlay(mut commands: Commands) {
-    if !perfprobe_enabled() {
+pub fn spawn_perfprobe_overlay(mut commands: Commands, config: Res<crate::config::Config>) {
+    if !config.perfprobe_enabled {
         return;
     }
     commands.spawn((
@@ -270,9 +258,10 @@ pub fn spawn_perfprobe_overlay(mut commands: Commands) {
 
 pub fn update_perfprobe_overlay_text(
     state: Res<PerfProbeState>,
+    config: Res<crate::config::Config>,
     mut text: Query<&mut Text, With<PerfProbeText>>,
 ) {
-    if !perfprobe_enabled() {
+    if !config.perfprobe_enabled {
         return;
     }
     let Ok(mut text) = text.single_mut() else {

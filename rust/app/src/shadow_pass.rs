@@ -59,26 +59,16 @@ const SHADOW_LAYER: usize = 3;
 /// shader-config doc calls half resolution the standard case.
 const SHADOW_SCALE_DIVISOR: u32 = 2;
 
-/// `?shadowlod=0` (web) / `MM_SHADOW_LOD=0` (native) disables the fine
-/// pass's use of this module's cached shadow value (falls back to marching
-/// a fresh shadow ray per full-res pixel, i.e. exactly the pre-this-change
-/// behavior) -- a per-frame *shader* toggle (`SceneUniforms::misc2.y`,
-/// written by `render::update_material`), not an entity/system-level one,
-/// for the same A/B-comparability reason as `mrrm::mrrm_enabled`'s doc:
-/// every frame's cameras/passes are identical whether this is on or off, so
-/// an `?shadowlod=0` vs `=1` screenshot comparison at a fixed camera state
-/// only ever differs in this one value. Matches `mrrm_enabled`'s
-/// query-param-then-env-var layering -- this now actually has an effect on
-/// the deployed web build, not just native. Cached in a `OnceLock` rather
-/// than re-parsing the URL every frame.
-pub fn shadow_lod_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let value =
-            crate::web_config::query_param("shadowlod").or_else(|| std::env::var("MM_SHADOW_LOD").ok());
-        value.as_deref() != Some("0")
-    })
-}
+// `?shadowlod=0`/`MM_SHADOW_LOD=0` disables the fine pass's use of this
+// module's cached shadow value (falls back to marching a fresh shadow ray
+// per full-res pixel, i.e. exactly the pre-this-change behavior) -- a
+// per-frame *shader* toggle (`SceneUniforms::misc2.y`, read from
+// `config::Config::shadow_lod_enabled` and written by
+// `render::update_frame_data`), not an entity/system-level one, for the
+// same A/B-comparability reason as `mrrm.rs`'s doc: every frame's
+// cameras/passes are identical whether this is on or off, so an
+// `?shadowlod=0` vs `=1` screenshot comparison at a fixed camera state
+// only ever differs in this one value.
 
 /// Rounds the window's current physical pixel size down by
 /// `SHADOW_SCALE_DIVISOR` in each dimension, flooring at 1px -- pure and

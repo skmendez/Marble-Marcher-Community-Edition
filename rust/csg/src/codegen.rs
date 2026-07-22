@@ -266,23 +266,34 @@ enum Combine {
 /// this uniform was never populated), which `ray_sphere_clip` (`MARCH_CORE`)
 /// treats as "don't clip, march the full range" rather than "everything
 /// misses".
-const BINDINGS: &str = "\
-struct SceneUniforms {
-    cam_pos: vec4<f32>,
-    cam_right: vec4<f32>,
-    cam_up: vec4<f32>,
-    cam_forward: vec4<f32>,
-    sun: vec4<f32>,
-    sun_col: vec4<f32>,
-    bg_col: vec4<f32>,
-    misc: vec4<f32>,
-    misc2: vec4<f32>,
-    bounding: vec4<f32>,
-}
+///
+/// The single authoritative field list for the GPU `SceneUniforms` ABI --
+/// every `vec4<f32>`, same order the Rust-side `render.rs::SceneUniforms`
+/// struct declares them in. This WGSL struct text below is *generated*
+/// from this list rather than hand-typed a second time; `render.rs` can't
+/// generate its own field declarations from this same list (no macro/derive
+/// wiring for that here, and it's not worth building one for a 10-field,
+/// rarely-changing struct), so it has its own `#[test]` that asserts its
+/// field order against this exact constant -- a mismatch is a loud test
+/// failure instead of a silent wrong-looking render.
+pub const SCENE_UNIFORMS_FIELD_NAMES: [&str; 10] = [
+    "cam_pos", "cam_right", "cam_up", "cam_forward", "sun", "sun_col", "bg_col", "misc", "misc2",
+    "bounding",
+];
 
-@group(2) @binding(0) var<uniform> scene: SceneUniforms;
-@group(2) @binding(1) var<storage, read> params: array<vec4<f32>>;
-";
+fn bindings() -> String {
+    let mut s = String::from("struct SceneUniforms {\n");
+    for name in SCENE_UNIFORMS_FIELD_NAMES {
+        s.push_str("    ");
+        s.push_str(name);
+        s.push_str(": vec4<f32>,\n");
+    }
+    s.push_str(
+        "}\n\n@group(2) @binding(0) var<uniform> scene: SceneUniforms;\n\
+         @group(2) @binding(1) var<storage, read> params: array<vec4<f32>>;\n",
+    );
+    s
+}
 
 /// Static WGSL helper library, ported from
 /// `game_folder/shaders/compute/utility/distance_estimators.glsl`
@@ -344,7 +355,7 @@ fn rot_zx(p: vec4<f32>, m: mat2x2<f32>) -> vec4<f32> {
 ";
 
 /// Extra binding the *fine* marcher shader alone needs, on top of the
-/// `scene`/`params` bindings every pass shares (`BINDINGS` above): the
+/// `scene`/`params` bindings every pass shares (`bindings()` above): the
 /// coarse pass's cached hit-distance render target (MRRM — see `mrrm.rs` in
 /// the app crate), read with `textureLoad` (exact texel, no sampler needed)
 /// rather than `textureSample` -- a coarse texel is already a
@@ -391,7 +402,7 @@ const SHADOW_TEXTURE_BINDING: &str = "\
 /// The fine pass's extra binding for the live marble list (multiplayer
 /// milestone 0): one `vec4<f32>` per marble (`xyz = center, w = radius`,
 /// `w <= 0.0` meaning "inactive/hidden", same convention the old single
-/// `scene.marble` uniform used), mirroring `BINDINGS`'s own
+/// `scene.marble` uniform used), mirroring `bindings()`'s own
 /// `params: array<vec4<f32>>` storage binding rather than a fixed-size
 /// uniform array (sidesteps WGSL's uniform-array padding/alignment rules
 /// entirely, and `arrayLength(&marbles)` gives the fragment shader the
@@ -1191,8 +1202,9 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
 
 /// Bindings decl + helpers, nothing else (DESIGN.md §5).
 pub fn generate_library() -> String {
-    let mut s = String::with_capacity(BINDINGS.len() + HELPERS.len() + 1);
-    s.push_str(BINDINGS);
+    let b = bindings();
+    let mut s = String::with_capacity(b.len() + HELPERS.len() + 1);
+    s.push_str(&b);
     s.push('\n');
     s.push_str(HELPERS);
     s

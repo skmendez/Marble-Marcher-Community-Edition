@@ -68,12 +68,9 @@ use crate::shadow_pass::{ShadowMarcherMaterial, ShadowQuad};
 /// Which scene to build, selected via
 /// `MM_SCENE=demo|classic_only|menger_sponge|menger_sphere|menger_oscillating_sphere`
 /// on native, or `?scene=<same value>` in the URL on the deployed web build
-/// (`std::env::var` always returns `Err` on wasm32-unknown-unknown -- there's
-/// no OS environment in a browser -- so `MM_SCENE` alone only ever had any
-/// effect for local/native testing; `web_config::query_param` is the
-/// browser-reachable equivalent, same value vocabulary, so the two can't
-/// drift apart). Defaults to `MengerOscillatingSphere` either way if
-/// unset/unrecognized.
+/// -- see `config::Config`'s doc for why this is read once into `Config`
+/// rather than each caller re-parsing it. Defaults to `MengerOscillatingSphere`
+/// either way if unset/unrecognized.
 ///
 /// `Demo`/`ClassicOnly` have authored level data (`beware_of_bumps`: a
 /// start position tuned to rest on a surface, a kill plane, `ang1`
@@ -116,15 +113,13 @@ pub struct MarbleSpawn {
 }
 
 impl SceneKind {
-    /// Reads `MM_SCENE` (native) or `?scene=` (web) -- see this type's doc.
-    /// `query_param` is always `None` on native (`web_config`'s doc), so the
-    /// `.or_else` falls straight through to `std::env::var` there exactly as
-    /// before; on wasm `std::env::var` is always `Err`, so the query param is
-    /// the only branch that can ever match.
-    pub fn from_config() -> Self {
-        let value = crate::web_config::query_param("scene")
-            .or_else(|| std::env::var("MM_SCENE").ok());
-        match value.as_deref() {
+    /// Pure parse from an already-resolved `?scene=`/`MM_SCENE` value --
+    /// reading the query param/env var itself is `config::Config`'s job now
+    /// (`Config::from_env`), not this type's; kept as a pure function
+    /// (rather than folded directly into `Config::from_env`) so it stays
+    /// independently unit-testable without needing a real URL/environment.
+    pub fn from_value(value: Option<&str>) -> Self {
+        match value {
             Some("demo") => Self::Demo,
             Some("classic_only") => Self::ClassicOnly,
             Some("menger_sponge") => Self::MengerSponge,
@@ -195,10 +190,20 @@ impl SceneKind {
     }
 }
 
-/// The fractal-tree-specific parameter handles, so [`update_material`] can
-/// animate `ang1` for [`SceneKind::Demo`] without needing to know about
-/// [`MengerHandles`] (the static display fractals don't have an `ang1`).
+/// The fractal-tree-specific parameter handles, so a future per-scene
+/// animation toggle can animate `ang1` for [`SceneKind::Demo`] without
+/// needing to know about [`MengerHandles`] (the static display fractals
+/// don't have an `ang1`).
 pub enum SceneHandles {
+    /// The `Demo`/`ClassicOnly` scenes' old wall-clock-driven `ang1` wobble
+    /// (`MM_ANIMATE_FRACTAL`) that used to read this back every frame was
+    /// removed (dead on the deployed web build, and wall-clock-driven
+    /// geometry animation is exactly the determinism anti-pattern this
+    /// session's `Expr`/tick-driven work has been eliminating elsewhere) --
+    /// not read anywhere now, kept for the same reason as the other two
+    /// variants below: a future, properly deterministic per-scene animation
+    /// toggle.
+    #[allow(dead_code)]
     Classic(ClassicHandles),
     /// Not read anywhere yet — kept for a future depth/color animation
     /// toggle on the static display fractals, symmetric to Classic's ang1.
@@ -308,6 +313,27 @@ mod scene_uniforms_impl {
     }
 }
 pub use scene_uniforms_impl::SceneUniforms;
+
+#[cfg(test)]
+mod scene_uniforms_abi_tests {
+    // Rust has no runtime struct-field reflection, so this can't generate
+    // its expected list *from* the `SceneUniforms` struct above -- it's a
+    // manually-kept mirror of that struct's field order, checked against
+    // `marble_csg::codegen::SCENE_UNIFORMS_FIELD_NAMES` (the single
+    // authoritative list the WGSL-side struct is actually *generated*
+    // from, see that constant's doc). If either side adds, removes, or
+    // reorders a field without updating the other, this fails loudly at
+    // `cargo test` time instead of silently misrendering.
+    const RUST_FIELD_ORDER: [&str; 10] = [
+        "cam_pos", "cam_right", "cam_up", "cam_forward", "sun", "sun_col", "bg_col", "misc",
+        "misc2", "bounding",
+    ];
+
+    #[test]
+    fn rust_field_order_matches_the_wgsl_codegen_source_of_truth() {
+        assert_eq!(RUST_FIELD_ORDER, marble_csg::codegen::SCENE_UNIFORMS_FIELD_NAMES);
+    }
+}
 
 /// Marker for the ray-marcher's own camera -- distinguishes it from
 /// `mrrm.rs`'s `CoarseCamera` so marcher-only systems don't need to guess
@@ -605,21 +631,25 @@ pub struct SceneState {
     /// frame. Empty for every scene except
     /// [`SceneKind::MengerOscillatingSphere`] today, but any future scene
     /// that wants an animated param just needs to populate this instead of
-    /// adding another one-off `SceneHandles` match arm to `update_material`.
+    /// adding another one-off `SceneHandles` match arm to `update_frame_data`.
     pub animations: Vec<(ScalarParam, Expr)>,
+    /// Not read anywhere now (see [`SceneHandles`]'s own doc on why) --
+    /// kept alongside its variants for the same future-per-scene-toggle
+    /// reason.
+    #[allow(dead_code)]
     pub handles: SceneHandles,
     pub material: Handle<FineMarcherMaterial>,
     /// The scene's world-space bounding sphere (`object.bounding_sphere`),
     /// packed as `xyz = center, w = radius` (`w <= 0.0` means "no bound" --
     /// `bounding_sphere` returned `None`), computed once here at setup
-    /// rather than every frame: it only depends on `params`, which this
-    /// scene's own tree either never changes after setup or (Demo's
-    /// opt-in `MM_ANIMATE_FRACTAL`) only nudges `ang1` -- a `Fold::Rotate`
-    /// angle, which `Fold::unfold_bounding_sphere` handles as an exact
-    /// isometry regardless of angle, so the bound stays valid without
-    /// needing to be recomputed as that animates. [`update_frame_data`]
-    /// writes this same value into every pass's `SceneUniforms::bounding`
-    /// each frame.
+    /// rather than every frame: even [`SceneKind::MengerOscillatingSphere`],
+    /// the one scene whose params do animate post-setup, never needs this
+    /// recomputed -- its bite sphere is strictly subtractive and its
+    /// radius never exceeds `MENGER_BITE_MAX_RADIUS`, already accounted for
+    /// in the Menger sponge's own (static) outer extent, so removing more
+    /// material as the bite radius oscillates can never enlarge the bound.
+    /// [`update_frame_data`] writes this same value into every pass's
+    /// `SceneUniforms::bounding` each frame.
     pub bounding_sphere: Vec4,
 }
 
@@ -642,12 +672,12 @@ fn pack_marbles(marbles: &[Marble]) -> Vec<Vec4> {
     marbles.iter().map(|m| m.pos.extend(m.rad)).collect()
 }
 
-/// Startup system: builds the selected scene ([`SceneKind::from_config`]),
-/// generates its WGSL, and spawns the fullscreen quad that renders it
-/// (DESIGN.md §8).
+/// Startup system: builds the selected scene (`config.scene`), generates
+/// its WGSL, and spawns the fullscreen quad that renders it (DESIGN.md §8).
 #[allow(clippy::too_many_arguments)]
 pub fn setup(
     mut commands: Commands,
+    config: Res<crate::config::Config>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<FineMarcherMaterial>>,
     mut shaders: ResMut<Assets<Shader>>,
@@ -655,7 +685,7 @@ pub fn setup(
     asset_server: Res<AssetServer>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    let kind = SceneKind::from_config();
+    let kind = config.scene;
     let mut params = Params::new();
 
     // CameraOrbit::default() is tuned for the Demo scene specifically (aimed
@@ -779,9 +809,9 @@ pub fn setup(
     // visually verifiable without inventing per-scene spawn layouts this
     // milestone doesn't need. Stacked above the primary spawn (not spread
     // out in X/Z): `beware_of_bumps::START` rests on a ledge only about 1x
-    // the marble's own radius wide (`animate_fractal`'s doc below), so they
-    // fall onto/into each other and the ledge together instead of each
-    // needing their own independently-verified flat spot to land on.
+    // the marble's own radius wide, so they fall onto/into each other and
+    // the ledge together instead of each needing their own
+    // independently-verified flat spot to land on.
     // Exact same X/Z, staggered only in Y: guarantees they actually collide
     // with each other on the way down (the lowest one lands first, the ones
     // still falling above it are on the same vertical line and *must* pass
@@ -953,27 +983,6 @@ pub fn sync_quad_scale(
     }
 }
 
-/// Set `MM_ANIMATE_FRACTAL=1` to continuously nudge `ang1` over time — a
-/// demo of live parameter updates with no shader recompile (the params
-/// buffer is just a buffer write; DESIGN.md §3). **Off by default**: this
-/// was an M4 proof-of-concept added before the marble had real physics, and
-/// it actively breaks gameplay — the marble rests on a strut only ~1x its
-/// own radius wide, and animating the fractal's rotation angle shifts that
-/// strut out from under it, so the marble slides and falls even with zero
-/// player input (confirmed by tracing the exact scenario headless: with the
-/// animation on, a motionless marble starts falling within a few seconds).
-/// The capability itself is still exercised by other means (codegen tests,
-/// this same buffer-write path running every frame regardless for the
-/// marble's position/radius) without needing to visibly wreck the level.
-///
-/// Cached in a `OnceLock`: env vars can't change after process start, and
-/// this is read inside a per-frame system (`std::env::var` takes the
-/// process-env lock and allocates on every call).
-fn animate_fractal() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("MM_ANIMATE_FRACTAL").as_deref() == Ok("1"))
-}
-
 /// One full marble-cubemap revolution every 2 seconds at the 60Hz physics
 /// tick (`marble_csg::rollback`'s tick rate) -- `update_frame_data_impl`'s
 /// doc on why this drives the rotation angle instead of wall-clock time.
@@ -986,9 +995,9 @@ const ROTATION_PERIOD_TICKS: u64 = 120;
 /// buffers (see `gpu.rs`). Replaces the three per-pass `update_material`/
 /// `update_coarse_material`/`update_shadow_material` systems that used to
 /// rewrite material assets (and thereby recreate buffers + bind groups)
-/// every frame; re-syncs fractal params only if `animate_fractal()` is
-/// enabled (otherwise the static params `setup()` wrote stay untouched,
-/// matching what the marbles' physics collides against).
+/// every frame; re-uploads `params` to the GPU only if `scene_state.
+/// animations` is non-empty (otherwise the static params `setup()` wrote
+/// stay untouched, matching what the marbles' physics collides against).
 ///
 /// All three passes share one camera basis (they render the same scene from
 /// the same eye) and differ only in their `misc`/`misc2` lanes:
@@ -1039,11 +1048,12 @@ pub fn update_frame_data(
     orbit: Res<CameraOrbit>,
     marble_state: Res<MarbleState>,
     mp: Res<MultiplayerSession>,
+    config: Res<crate::config::Config>,
     windows: Query<&Window, With<PrimaryWindow>>,
     coarse_render_target: Res<crate::mrrm::CoarseRenderTarget>,
     shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
     perfprobe: Res<crate::perfprobe::PerfProbeState>,
-    scene_state: ResMut<SceneState>,
+    scene_state: Res<SceneState>,
     frame: ResMut<MarcherFrameData>,
     materials: ResMut<Assets<FineMarcherMaterial>>,
     mut timings: ResMut<crate::fps_overlay::PhaseTimings>,
@@ -1054,6 +1064,7 @@ pub fn update_frame_data(
         orbit,
         marble_state,
         mp,
+        config,
         windows,
         coarse_render_target,
         shadow_render_target,
@@ -1080,38 +1091,15 @@ fn update_frame_data_impl(
     orbit: Res<CameraOrbit>,
     marble_state: Res<MarbleState>,
     mp: Res<MultiplayerSession>,
+    config: Res<crate::config::Config>,
     windows: Query<&Window, With<PrimaryWindow>>,
     coarse_render_target: Res<crate::mrrm::CoarseRenderTarget>,
     shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
     perfprobe: Res<crate::perfprobe::PerfProbeState>,
-    mut scene_state: ResMut<SceneState>,
+    scene_state: Res<SceneState>,
     mut frame: ResMut<MarcherFrameData>,
     mut materials: ResMut<Assets<FineMarcherMaterial>>,
 ) {
-    let t = time.elapsed_secs();
-
-    // ang1 animation only applies to (and only makes sense for) the Classic
-    // fractal tree the Demo scene builds; the static display fractals have
-    // no such parameter.
-    let mut params_changed = false;
-    if animate_fractal() {
-        if let SceneHandles::Classic(handles) = &scene_state.handles {
-            let ang1 = beware_of_bumps::ANG1 + 0.02 * (0.5 * t).sin();
-            let handles = *handles;
-            set_fractal_params(
-                &mut scene_state.params,
-                &handles,
-                beware_of_bumps::SCALE,
-                ang1,
-                beware_of_bumps::ANG2,
-                beware_of_bumps::SHIFT,
-                beware_of_bumps::COLOR,
-                beware_of_bumps::ITERS,
-            );
-            params_changed = true;
-        }
-    }
-
     // Scene-agnostic animated-param upload: `physics_sys::
     // marble_physics_tick_impl` already wrote this tick's evaluated values
     // straight into `scene_state.params` (offline path directly, connected
@@ -1119,15 +1107,22 @@ fn update_frame_data_impl(
     // evaluation doesn't happen here). This system just has to get the
     // result into `frame.params`; skipped entirely for scenes with no
     // animations (the common case) rather than re-copying an unchanged
-    // slice every frame for no reason.
-    if !scene_state.animations.is_empty() {
-        params_changed = true;
-    }
+    // slice every frame for no reason. (The `Demo` scene's older
+    // wall-clock-driven `ang1` wobble that used to live here was removed --
+    // it was already dead on the deployed web build (native-`env::var`-only,
+    // no query-param path), and reviving it would've meant giving a
+    // non-deterministic, desync-prone animation mechanism a live path to
+    // the actual deployed multiplayer game, the opposite direction from
+    // this session's `Expr`/tick-driven animation work. `menger_oscillating_
+    // sphere` is the real, shipped, deterministic way to get animated
+    // geometry now.)
+    let params_changed = !scene_state.animations.is_empty();
     if params_changed {
         frame.params.clear();
         frame.params.extend_from_slice(scene_state.params.slots());
     }
 
+    let t = time.elapsed_secs();
     let (aspect, resolution_height) = windows
         .single()
         .map(|w| (w.width() / w.height().max(1.0), w.physical_height() as f32))
@@ -1167,7 +1162,7 @@ fn update_frame_data_impl(
         // on or off and an `MM_MRRM=0` vs `MM_MRRM=1` A/B screenshot
         // comparison at a fixed camera state only ever differs in this
         // one value (see `mrrm::mrrm_enabled`'s doc).
-        misc: Vec4::new(aspect, t, resolution_height, if crate::mrrm::mrrm_enabled() { 1.0 } else { 0.0 }),
+        misc: Vec4::new(aspect, t, resolution_height, if config.mrrm_enabled { 1.0 } else { 0.0 }),
         // x: the shadow pass's own render-target height (`sample_shadow`'s
         // `sz` computation), y: `MM_SHADOW_LOD` on/off (same
         // A/B-comparability reasoning as MRRM's `misc.w` above), z: the
@@ -1175,7 +1170,7 @@ fn update_frame_data_impl(
         // marble cubemap's current Y-axis rotation angle (see above).
         misc2: Vec4::new(
             shadow_render_target.size.y as f32,
-            if crate::shadow_pass::shadow_lod_enabled() { 1.0 } else { 0.0 },
+            if config.shadow_lod_enabled { 1.0 } else { 0.0 },
             perfprobe.fine_max_steps_override,
             marble_rotation,
         ),

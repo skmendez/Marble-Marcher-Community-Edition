@@ -74,28 +74,16 @@ const COARSE_LAYER: usize = 2;
 /// for -- see `march_scene`'s doc in `marble_csg::codegen`).
 const COARSE_SCALE_DIVISOR: u32 = 8;
 
-/// `?mrrm=0` (web) / `MM_MRRM=0` (native) disables the fine pass's use of
-/// this module's coarse guess (falls back to always starting its march at
-/// `t=0`, i.e. exactly the pre-MRRM behavior) -- a per-frame *shader*
-/// toggle (`SceneUniforms::misc.w`, written by `render::update_material`)
-/// rather than an entity/system-level one that would stop this module's
-/// camera/pass from running at all: every frame's cameras/passes are
-/// identical whether MRRM is on or off, so an `?mrrm=0` vs `?mrrm=1`
-/// A/B screenshot comparison at a fixed camera state only ever differs in
-/// this one shader value, not in *what ran* -- which is what makes that
-/// comparison trustworthy as a regression check. Matches
-/// `render::SceneKind::from_config`'s query-param-then-env-var layering
-/// (`web_config::query_param`) -- unlike the original env-var-only version
-/// of this toggle, this now actually has an effect on the deployed web
-/// build, not just native. Cached in a `OnceLock` rather than re-parsing
-/// the URL every frame (this is read once per frame by `update_material`).
-pub fn mrrm_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let value = crate::web_config::query_param("mrrm").or_else(|| std::env::var("MM_MRRM").ok());
-        value.as_deref() != Some("0")
-    })
-}
+// `?mrrm=0`/`MM_MRRM=0` disables the fine pass's use of this module's
+// coarse guess (falls back to always starting its march at `t=0`, i.e.
+// exactly the pre-MRRM behavior) -- a per-frame *shader* toggle
+// (`SceneUniforms::misc.w`, read from `config::Config::mrrm_enabled` and
+// written by `render::update_frame_data`) rather than an entity/system-level
+// one that would stop this module's camera/pass from running at all: every
+// frame's cameras/passes are identical whether MRRM is on or off, so an
+// `?mrrm=0` vs `?mrrm=1` A/B screenshot comparison at a fixed camera state
+// only ever differs in this one shader value, not in *what ran* -- which is
+// what makes that comparison trustworthy as a regression check.
 
 /// Rounds the window's current physical pixel size down by
 /// `COARSE_SCALE_DIVISOR` in each dimension, flooring at 1px (a 0-sized

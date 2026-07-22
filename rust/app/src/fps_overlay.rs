@@ -58,23 +58,13 @@ use web_time::Duration;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
-/// `?debug=1` (web) / `MM_DEBUG=1` (native) shows this whole overlay (FPS,
-/// camera/touch state, marble positions, CPU phase timings, render
-/// resolution); hidden by default so the deployed URL a player actually
-/// shares/opens is clean. Matches `SceneKind::from_config`'s
-/// query-param-then-env-var layering (`web_config::query_param`); cached in
-/// a `OnceLock` like `mrrm::mrrm_enabled` since it's checked once at
-/// `Startup`, not re-parsed every frame. Default is the opposite polarity
-/// of `mrrm_enabled`/`shadow_lod_enabled` (those default *on*, disabled by
-/// `=0`; this defaults *off*, enabled only by an explicit `=1`) since this
-/// is debug-only UI, not a rendering behavior those toggles A/B-test.
-pub fn debug_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let value = crate::web_config::query_param("debug").or_else(|| std::env::var("MM_DEBUG").ok());
-        value.as_deref() == Some("1")
-    })
-}
+// `?debug=1`/`MM_DEBUG=1` (`config::Config::debug_enabled`) shows this
+// whole overlay (FPS, camera/touch state, marble positions, CPU phase
+// timings, render resolution); hidden by default so the deployed URL a
+// player actually shares/opens is clean. Default is the opposite polarity
+// of `mrrm_enabled`/`shadow_lod_enabled` (those default *on*, disabled by
+// `=0`; this defaults *off*, enabled only by an explicit `=1`) since this
+// is debug-only UI, not a rendering behavior those toggles A/B-test.
 
 /// How long a window of recent frame times to average over. Long enough to
 /// smooth both the startup transient and brief camera-pan cost swings;
@@ -238,8 +228,8 @@ struct MarblesDebugText;
 #[derive(Component)]
 struct PhaseTimingsText;
 
-fn spawn_fps_overlay(mut commands: Commands) {
-    if !debug_enabled() {
+fn spawn_fps_overlay(mut commands: Commands, config: Res<crate::config::Config>) {
+    if !config.debug_enabled {
         return;
     }
     commands

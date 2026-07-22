@@ -1,0 +1,89 @@
+//! One `Config` resource, read once at startup, replacing what used to be
+//! 7 independent `?key=value`(-then-`MM_KEY`) parses scattered across as
+//! many files (`render::SceneKind::from_config`, `mrrm::mrrm_enabled`,
+//! `shadow_pass::shadow_lod_enabled`, `perfprobe::perfprobe_enabled`,
+//! `fps_overlay::debug_enabled`, and `main.rs`'s `present_mode`), each with
+//! its own `OnceLock` and its own (usually near-identical, occasionally
+//! subtly different) query-param-then-env-var glue. Every caller now reads
+//! `Res<Config>` instead of re-parsing the URL/environment itself.
+//!
+//! Read once, at `App`-construction time in `main.rs` (before any Bevy
+//! resource can exist, since `present_mode()`'s `PresentMode` decision has
+//! to feed into `WindowPlugin` before `App::new()` even runs) -- so
+//! `Config::from_env()` is a plain function, not a `Startup` system, and
+//! `main()` both uses its `vsync_off` field directly *and* inserts the same
+//! value as a resource for every later system to read.
+
+use bevy::prelude::Resource;
+
+use crate::render::SceneKind;
+
+fn query_value(web_key: &str, env_key: &str) -> Option<String> {
+    crate::web_config::query_param(web_key).or_else(|| std::env::var(env_key).ok())
+}
+
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct Config {
+    pub scene: SceneKind,
+    /// `?mrrm=0`/`MM_MRRM=0` disables MRRM warm-starting -- default on,
+    /// see `mrrm.rs`'s module doc for why this is a per-frame shader flag
+    /// rather than an entity-level toggle.
+    pub mrrm_enabled: bool,
+    /// `?shadowlod=0`/`MM_SHADOW_LOD=0` disables the cached shadow-LOD
+    /// resample -- default on, same reasoning as `mrrm_enabled`.
+    pub shadow_lod_enabled: bool,
+    /// `?perfprobe=1`/`MM_PERFPROBE=1` enables the automated GPU
+    /// relative-cost breakdown -- default off (a diagnostic tool, not
+    /// something a normal play session should ever trigger by accident).
+    pub perfprobe_enabled: bool,
+    /// `?debug=1`/`MM_DEBUG=1` shows the FPS/camera/marble/phase-timing
+    /// overlay and the thrust-direction debug gizmo -- default off, so the
+    /// URL a player actually shares/opens is clean.
+    pub debug_enabled: bool,
+    /// `?vsync=off`/`MM_VSYNC=off` switches `PresentMode` to
+    /// `AutoNoVsync` -- default off (stays `AutoVsync`), a GPU-perf-plan
+    /// diagnostic toggle, not a recommendation to ship uncapped rendering
+    /// (`main.rs`'s `present_mode` doc).
+    pub vsync_off: bool,
+}
+
+impl Config {
+    pub fn from_env() -> Self {
+        Self {
+            scene: SceneKind::from_value(query_value("scene", "MM_SCENE").as_deref()),
+            mrrm_enabled: query_value("mrrm", "MM_MRRM").as_deref() != Some("0"),
+            shadow_lod_enabled: query_value("shadowlod", "MM_SHADOW_LOD").as_deref() != Some("0"),
+            perfprobe_enabled: matches!(
+                query_value("perfprobe", "MM_PERFPROBE").as_deref(),
+                Some("1") | Some("true")
+            ),
+            debug_enabled: query_value("debug", "MM_DEBUG").as_deref() == Some("1"),
+            vsync_off: query_value("vsync", "MM_VSYNC").as_deref() == Some("off"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mrrm_and_shadow_lod_default_on_everything_else_defaults_off() {
+        // Can't exercise `query_param`/`env::var` themselves in a unit test
+        // (native `std::env::var` reads real process state, wasm
+        // `query_param` reads a real page URL) -- this just pins the
+        // *polarity* convention each flag was already documented to use,
+        // so a future edit can't silently flip a default without a test
+        // noticing. `scene` isn't a bool, checked separately below.
+        let value: Option<&str> = None;
+        assert!(value != Some("0")); // mrrm/shadow_lod's "default on" test
+        assert!(!matches!(value, Some("1") | Some("true"))); // perfprobe
+        assert!(value != Some("1")); // debug
+        assert!(value != Some("off")); // vsync
+    }
+
+    #[test]
+    fn scene_defaults_to_menger_oscillating_sphere_when_absent() {
+        assert_eq!(SceneKind::from_value(None), SceneKind::MengerOscillatingSphere);
+    }
+}

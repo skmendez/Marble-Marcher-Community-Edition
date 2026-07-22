@@ -7,6 +7,7 @@
 //! relative) with `R` to force a respawn; the orbit camera follows it.
 
 mod camera;
+mod config;
 mod debug_gizmos;
 mod debug_screenshot;
 mod fps_overlay;
@@ -25,9 +26,10 @@ use bevy::sprite::Material2dPlugin;
 use bevy::window::WindowResolution;
 
 use camera::{orbit_camera_input, CameraOrbit};
+use config::Config;
 use debug_gizmos::draw_thrust_debug;
 use debug_screenshot::DebugScreenshotPlugin;
-use fps_overlay::{debug_enabled, FpsOverlayPlugin};
+use fps_overlay::FpsOverlayPlugin;
 use gpu::MarcherGpuPlugin;
 use mrrm::{resize_coarse_render_target, setup_mrrm_pipeline, sync_coarse_quad_scale, CoarseMarcherMaterial};
 use net::{
@@ -53,20 +55,20 @@ fn window_resolution() -> WindowResolution {
         .unwrap_or_else(|| WindowResolution::new(1280.0, 720.0))
 }
 
-/// `?vsync=off` (web) / `MM_VSYNC=off` (native) switches `PresentMode` from
-/// the default `AutoVsync` to `AutoNoVsync` -- a diagnostic toggle (perf
-/// plan milestone 3) to tell whether an observed frame-rate ceiling is a
-/// real GPU-throughput limit (frame time stays the same with vsync off) or
-/// compositor/vsync pacing (frame time drops). Same query-param-then-env
-/// layering as `mrrm::mrrm_enabled`/`shadow_pass::shadow_lod_enabled`, read
-/// once at `App` construction since `PresentMode` is fixed for the life of
-/// the window in this app (no runtime toggle needed). Not a recommendation
-/// to ship uncapped/tearing-prone rendering by default -- `AutoVsync` stays
-/// the default; this only exists so the question can actually be answered
-/// on a real high-refresh device, which this dev environment doesn't have.
-fn present_mode() -> bevy::window::PresentMode {
-    let value = crate::web_config::query_param("vsync").or_else(|| std::env::var("MM_VSYNC").ok());
-    if value.as_deref() == Some("off") {
+/// `config.vsync_off` switches `PresentMode` from the default `AutoVsync`
+/// to `AutoNoVsync` -- a diagnostic toggle (perf plan milestone 3) to tell
+/// whether an observed frame-rate ceiling is a real GPU-throughput limit
+/// (frame time stays the same with vsync off) or compositor/vsync pacing
+/// (frame time drops). Read once at `App` construction (via `Config::
+/// from_env`, below -- before any Bevy resource can exist, since
+/// `PresentMode` has to feed into `WindowPlugin` up front) since it's fixed
+/// for the life of the window in this app (no runtime toggle needed). Not a
+/// recommendation to ship uncapped/tearing-prone rendering by default --
+/// `AutoVsync` stays the default; this only exists so the question can
+/// actually be answered on a real high-refresh device, which this dev
+/// environment doesn't have.
+fn present_mode(config: &Config) -> bevy::window::PresentMode {
+    if config.vsync_off {
         bevy::window::PresentMode::AutoNoVsync
     } else {
         bevy::window::PresentMode::AutoVsync
@@ -74,6 +76,12 @@ fn present_mode() -> bevy::window::PresentMode {
 }
 
 fn main() {
+    // Read once, here, rather than as a `Startup` system: `present_mode`
+    // has to feed into `WindowPlugin` before `App::new()` even runs, so no
+    // resource could exist yet regardless (`config::Config`'s module doc).
+    // Inserted as a resource below so every other system reads `Res<Config>`
+    // instead of re-parsing the URL/environment itself.
+    let config = Config::from_env();
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -100,11 +108,12 @@ fn main() {
                 // aspect from `Window` every frame, so once real
                 // `WindowResized` events flow, resize-follow is free.
                 fit_canvas_to_parent: true,
-                present_mode: present_mode(),
+                present_mode: present_mode(&config),
                 ..default()
             }),
             ..default()
         }))
+        .insert_resource(config)
         // `MarcherGpuPlugin` owns the persistent per-frame GPU buffers every
         // material's bind group references (gpu.rs) -- added before the
         // material plugins so the buffers resource exists whenever a
@@ -174,7 +183,7 @@ fn main() {
                 // to persistent GPU buffers (gpu.rs).
                 update_frame_data,
                 update_perfprobe_overlay_text,
-                draw_thrust_debug.run_if(debug_enabled),
+                draw_thrust_debug.run_if(|config: Res<Config>| config.debug_enabled),
                 poll_net_status,
                 update_copy_button_visibility,
                 handle_copy_button_click,
