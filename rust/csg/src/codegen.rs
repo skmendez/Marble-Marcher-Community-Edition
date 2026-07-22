@@ -1097,7 +1097,22 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         let ambient = 0.3 + 0.4 * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0);
         let ao = 1.0 - f32(iters) / f32(MAX_STEPS);
         var color = base * (ambient + diffuse * sh) * ao;
-        color = mix(color, sky(rd), smoothstep(0.0, MAX_DIST, t));
+        // Fades toward sky(rd) starting only past MAX_DIST * 0.5 (was
+        // smoothstep(0.0, MAX_DIST, t), i.e. any hit at all started
+        // fading): the old onset-at-zero curve already blended ~22% of the
+        // pale sky-blue background in at t ~= 9 -- the Menger scenes' own
+        // default camera distance (render.rs's MengerOscillatingSphere
+        // override), not some rare zoomed-out edge case -- and against this
+        // material's already-pale creme base color that read as a
+        // near-total wash-out (reported live as excessive fog, confirmed
+        // via a screenshot of the untouched default view, no zoom
+        // involved). Since t can never exceed MAX_DIST for an actual hit
+        // (march_scene's max_d cutoff), the upper bound needs to sit past
+        // MAX_DIST too, or every distant-but-real hit would already be
+        // fully faded; 1.5x caps a maximally-distant hit at 50% fog rather
+        // than 100%, so even marching all the way out to MAX_DIST still
+        // shows something, not a flat sky-colored wall.
+        color = mix(color, sky(rd), smoothstep(MAX_DIST * 0.5, MAX_DIST * 1.5, t));
         return vec4<f32>(tonemap(color), 1.0);
     }
 

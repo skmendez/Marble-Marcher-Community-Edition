@@ -21,8 +21,10 @@
 //! pitch) — see `drag`'s doc for the exact construction and why both of
 //! those hold by construction, not by tuning.
 
-use bevy::input::mouse::{MouseMotion, MouseWheel};
+use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
+
+use crate::physics_sys::MarbleState;
 
 /// Radians of rotation per pixel of swipe magnitude (`drag`) — same
 /// numeric value the old yaw/pitch decomposition used for both axes, kept
@@ -39,6 +41,28 @@ pub(crate) const FOCAL_LENGTH: f32 = 1.5;
 const MIN_DISTANCE: f32 = 0.12;
 const MAX_DISTANCE: f32 = 20.0;
 const ZOOM_SENSITIVITY: f32 = 0.5;
+/// `MouseWheel::unit == Pixel` (trackpads, and some mice) reports raw pixel
+/// deltas rather than wheel "notches" -- a single physical gesture's
+/// magnitude can be 10-100x a `Line` event's. Dividing by this before
+/// applying `ZOOM_SENSITIVITY` (see `orbit_camera_input`) puts pixel deltas
+/// on the same per-line scale line deltas already use; ~100 CSS pixels per
+/// line is the standard DOM wheel-event convention (matches Chrome's
+/// default `deltaMode`-conversion factor). Without this, a single trackpad
+/// swipe on macOS got read as an enormous number of "lines" and jumped the
+/// camera straight to `MIN_DISTANCE`/`MAX_DISTANCE` instead of smoothly
+/// zooming -- reported live as "scrolling jumps between fog and 100% zoom".
+const PIXELS_PER_LINE: f32 = 100.0;
+/// The camera is never allowed closer than this multiple of the marble's
+/// own radius, on top of the flat `MIN_DISTANCE` floor -- `MIN_DISTANCE`
+/// alone isn't enough for every scene: the Menger scenes' marble
+/// (`render.rs::spawn_params`, `rad = 0.15`) is *larger* than
+/// `MIN_DISTANCE = 0.12`, so a full zoom-in there put the eye literally
+/// inside the marble's own geometry ("100% zoom... puts you inside the
+/// marble"). `1.5x` clears the surface with a comfortable margin while
+/// staying well under every scene's own tuned default distance
+/// (`render.rs::setup`'s per-scene `camera_orbit.distance` overrides), so
+/// zoom-in headroom is preserved everywhere.
+const MIN_DISTANCE_MARBLE_RADII: f32 = 1.5;
 
 /// Full 3D orbit orientation + distance around an externally supplied
 /// target (see [`CameraOrbit::eye_and_basis`]) — the target itself (the
@@ -225,6 +249,7 @@ pub fn orbit_camera_input(
     mut wheel: EventReader<MouseWheel>,
     mut orbit: ResMut<CameraOrbit>,
     mut twist_debug: ResMut<crate::fps_overlay::DebugTwistAccum>,
+    marble_state: Res<MarbleState>,
 ) {
     if mouse_buttons.pressed(MouseButton::Left) {
         for ev in motion.read() {
@@ -247,8 +272,13 @@ pub fn orbit_camera_input(
         twist_debug.0 += delta;
     }
 
+    let min_distance = MIN_DISTANCE.max(marble_state.local_marble().rad * MIN_DISTANCE_MARBLE_RADII);
     for ev in wheel.read() {
-        orbit.distance = (orbit.distance - ev.y * ZOOM_SENSITIVITY).clamp(MIN_DISTANCE, MAX_DISTANCE);
+        let lines = match ev.unit {
+            MouseScrollUnit::Line => ev.y,
+            MouseScrollUnit::Pixel => ev.y / PIXELS_PER_LINE,
+        };
+        orbit.distance = (orbit.distance - lines * ZOOM_SENSITIVITY).clamp(min_distance, MAX_DISTANCE);
     }
 }
 
