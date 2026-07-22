@@ -53,6 +53,26 @@ fn window_resolution() -> WindowResolution {
         .unwrap_or_else(|| WindowResolution::new(1280.0, 720.0))
 }
 
+/// `?vsync=off` (web) / `MM_VSYNC=off` (native) switches `PresentMode` from
+/// the default `AutoVsync` to `AutoNoVsync` -- a diagnostic toggle (perf
+/// plan milestone 3) to tell whether an observed frame-rate ceiling is a
+/// real GPU-throughput limit (frame time stays the same with vsync off) or
+/// compositor/vsync pacing (frame time drops). Same query-param-then-env
+/// layering as `mrrm::mrrm_enabled`/`shadow_pass::shadow_lod_enabled`, read
+/// once at `App` construction since `PresentMode` is fixed for the life of
+/// the window in this app (no runtime toggle needed). Not a recommendation
+/// to ship uncapped/tearing-prone rendering by default -- `AutoVsync` stays
+/// the default; this only exists so the question can actually be answered
+/// on a real high-refresh device, which this dev environment doesn't have.
+fn present_mode() -> bevy::window::PresentMode {
+    let value = crate::web_config::query_param("vsync").or_else(|| std::env::var("MM_VSYNC").ok());
+    if value.as_deref() == Some("off") {
+        bevy::window::PresentMode::AutoNoVsync
+    } else {
+        bevy::window::PresentMode::AutoVsync
+    }
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -80,6 +100,7 @@ fn main() {
                 // aspect from `Window` every frame, so once real
                 // `WindowResized` events flow, resize-follow is free.
                 fit_canvas_to_parent: true,
+                present_mode: present_mode(),
                 ..default()
             }),
             ..default()
