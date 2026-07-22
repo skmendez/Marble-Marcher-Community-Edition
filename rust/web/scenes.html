@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Marble Marcher CSG -- scenes</title>
+  <style>
+    html, body { margin: 0; background: #111; color: #eee; font-family: monospace; }
+    body { padding: 2rem; }
+    h1 { font-size: 1.2rem; font-weight: normal; color: #999; }
+    ul { list-style: none; padding: 0; }
+    li { margin: 0.75rem 0; }
+    a { color: #6cf; text-decoration: none; font-size: 1.1rem; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <h1>Marble Marcher CSG -- scenes</h1>
+  <!-- One entry per SceneKind variant (rust/app/src/render.rs) -- this is
+       just a plain index of `?scene=` values `SceneKind::from_config`
+       already accepts, kept in sync with that match by hand since it's a
+       short, rarely-changing list. -->
+  <ul>
+    <li><a href="index.html?scene=menger_oscillating_sphere">Menger sponge, oscillating bite sphere (default)</a></li>
+    <li><a href="index.html?scene=menger_sponge">Menger sponge</a></li>
+    <li><a href="index.html?scene=menger_sphere">Menger sponge, static bite sphere</a></li>
+    <li><a href="index.html?scene=demo">Demo (classic fractal + creme spheres)</a></li>
+    <li><a href="index.html?scene=classic_only">Classic fractal only</a></li>
+  </ul>
+</body>
+</html>

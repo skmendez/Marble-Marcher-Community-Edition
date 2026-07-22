@@ -64,6 +64,7 @@ jobs:
         run: |
           mkdir -p dist
           cp rust/web/index.html dist/
+          cp rust/web/scenes.html dist/
           cp rust/web/net.js dist/
           # Image assets (e.g. the marble's cubemap texture): Bevy's
           # AssetPlugin fetches these via HTTP relative to the served page
