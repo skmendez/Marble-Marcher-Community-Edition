@@ -12,7 +12,6 @@ mod debug_screenshot;
 mod fps_overlay;
 mod mrrm;
 mod net;
-mod perfprobe;
 mod physics_sys;
 mod render;
 mod shadow_pass;
@@ -35,7 +34,6 @@ use net::{
     handle_copy_button_click, poll_net_status, setup_networking, spawn_net_ui, sync_net_ui_text,
     update_copy_button_visibility, update_copy_feedback, CopyFeedback,
 };
-use perfprobe::{perfprobe_tick, spawn_perfprobe_overlay, update_perfprobe_overlay_text, PerfProbeState};
 use physics_sys::{marble_physics_tick, PendingSceneSync};
 use render::{apply_pending_scene_sync, finalize_marble_cubemap, setup, sync_quad_scale, update_material, FineMarcherMaterial};
 use shadow_pass::{
@@ -98,7 +96,6 @@ fn main() {
         .init_resource::<TouchDebugInfo>()
         .init_resource::<CopyFeedback>()
         .init_resource::<PendingSceneSync>()
-        .init_resource::<PerfProbeState>()
         // `setup` (below) inserts `SceneState`/`MarbleState`/
         // `MultiplayerSession` directly rather than `init_resource`-ing any
         // of them here -- none has a scene-independent `Default` to speak
@@ -117,15 +114,7 @@ fn main() {
         // placeholder `FineMarcherMaterial::shadow` handle in turn.
         .add_systems(
             Startup,
-            (
-                setup,
-                setup_mrrm_pipeline,
-                setup_shadow_pipeline,
-                setup_networking,
-                spawn_net_ui,
-                spawn_perfprobe_overlay,
-            )
-                .chain(),
+            (setup, setup_mrrm_pipeline, setup_shadow_pipeline, setup_networking, spawn_net_ui).chain(),
         )
         .add_systems(FixedUpdate, marble_physics_tick)
         .add_systems(
@@ -140,15 +129,9 @@ fn main() {
                 orbit_camera_input,
                 touch_camera_input,
                 finalize_marble_cubemap,
-                // Must run before the three `update_*_material` systems below:
-                // a probe window transition's camera-active/step-override
-                // changes need to apply on the same frame they happen, not one
-                // frame late (see `perfprobe::perfprobe_tick`'s doc).
-                perfprobe_tick,
                 update_material,
                 update_coarse_material,
                 update_shadow_material,
-                update_perfprobe_overlay_text,
                 draw_thrust_debug.run_if(debug_enabled),
                 poll_net_status,
                 update_copy_button_visibility,
