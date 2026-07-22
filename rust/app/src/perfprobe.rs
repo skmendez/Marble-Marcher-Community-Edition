@@ -123,16 +123,6 @@ pub struct PerfProbeState {
     window_started: Instant,
     sum_secs: f64,
     count: u32,
-    /// Set on `perfprobe_tick`'s first real call -- `window_started` is
-    /// otherwise stamped at resource-construction time (`Startup`, before
-    /// the pipeline's first-render shader-compile transient), which would
-    /// otherwise burn part of `Baseline`'s window on that transient and
-    /// could even finalize it with zero recorded frames if compilation ever
-    /// took longer than `WINDOW_DURATION_SECS`. The first tick instead
-    /// re-stamps `window_started` to *that* frame and returns without
-    /// finalizing/advancing anything, so `Baseline`'s timer only starts
-    /// once real frames are actually happening.
-    started: bool,
     /// Mirrors `ProbeWindow::fine_max_steps_override` for whichever window
     /// is currently active -- `render::update_material_impl` copies this
     /// straight into `SceneUniforms::misc2.z` every frame.
@@ -146,7 +136,6 @@ impl Default for PerfProbeState {
             window_started: Instant::now(),
             sum_secs: 0.0,
             count: 0,
-            started: false,
             fine_max_steps_override: NO_FINE_STEP_OVERRIDE,
         }
     }
@@ -167,12 +156,6 @@ pub fn perfprobe_tick(
     mut shadow_cameras: Query<&mut Camera, (With<ShadowCamera>, Without<CoarseCamera>)>,
 ) {
     if !perfprobe_enabled() {
-        return;
-    }
-
-    if !state.started {
-        state.started = true;
-        state.window_started = Instant::now();
         return;
     }
 
@@ -242,12 +225,8 @@ pub fn spawn_perfprobe_overlay(mut commands: Commands) {
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
-            // Bottom-left: `fps_overlay.rs`'s debug overlay lives top-left
-            // and `net.rs`'s share-link panel lives top-right (both visible
-            // at once when `?debug=1` and multiplayer UI are both up) --
-            // this avoids overlapping either.
-            bottom: Val::Px(6.0),
-            left: Val::Px(6.0),
+            top: Val::Px(6.0),
+            right: Val::Px(6.0),
             padding: UiRect::axes(Val::Px(6.0), Val::Px(3.0)),
             ..default()
         },
