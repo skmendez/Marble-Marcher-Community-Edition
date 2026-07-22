@@ -221,7 +221,11 @@ pub fn perfprobe_tick(
         if next.fine_max_steps_override() > 0.0 {
             next.fine_max_steps_override().to_string()
         } else {
-            "default(256)".to_string()
+            // Kept in sync by hand with `codegen.rs`'s `FINE_MAX_STEPS` --
+            // this is just a diagnostic log label, not a real dependency
+            // (the shader itself always reads the real constant), but a
+            // stale value here would mislead whoever's reading this output.
+            "default(128)".to_string()
         },
     );
 }
