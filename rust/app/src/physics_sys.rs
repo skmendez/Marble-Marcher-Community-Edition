@@ -48,10 +48,10 @@ use bevy::prelude::*;
 use crate::fps_overlay::PhaseTimings;
 
 use marble_csg::physics::{GravityMode, Marble, PhysicsConfig, PlayerInput};
-use marble_csg::rollback::{InputTransport, RollbackSim};
+use marble_csg::rollback::{InputTransport, PlayerIndex, RollbackSim};
 
 use crate::camera::CameraOrbit;
-use crate::net::{NetSession, NetStatus, Role, WebRtcTransport};
+use crate::net::{NetSession, NetStatus, Role, WebRtcTransport, HOST_INDEX};
 use crate::render::SceneState;
 use crate::touch::read_two_finger_gesture;
 
@@ -186,6 +186,14 @@ pub struct MultiplayerSession {
     /// premature, unsynchronized start this whole join flow exists to
     /// avoid (`marble_physics_tick_impl`'s doc).
     scene_synced: bool,
+    /// Host only: every joiner index that has ever disconnected — kept
+    /// (never removed, even on a later reconnect attempt, which this
+    /// milestone doesn't support for a returning player any differently
+    /// than a fresh one) so their marble keeps receiving a confirmed zero
+    /// input forever instead of repeating whatever they were last doing
+    /// (same idea `net::NetStatus::Disconnected`'s doc describes for the
+    /// old single-joiner case, generalized to a set of indices).
+    disconnected_remotes: Vec<PlayerIndex>,
 }
 
 impl MultiplayerSession {
@@ -210,6 +218,7 @@ impl MultiplayerSession {
             was_connected: false,
             resync_pending: false,
             scene_synced: false,
+            disconnected_remotes: Vec::new(),
         }
     }
 
@@ -310,25 +319,31 @@ fn exchange_checksums_and_resync(
 
 /// Drains and applies the host's most recent authoritative tick+state
 /// push, if any arrived since the last tick. The same `ResyncPayload`
-/// message (and this same adoption code) serves two triggers that both
+/// message (and this same adoption code) serves three triggers that all
 /// boil down to "adopt the host's state wholesale, no merge": the very
 /// first join (see [`marble_physics_tick_impl`]'s doc for why a real
-/// handshake-then-sync beats the old guessed-start-position scheme) and a
-/// later checksum-mismatch correction ([`exchange_checksums_and_resync`])
-/// -- there is deliberately no second, parallel "initial sync" message
-/// type. Only the first-join case needs anything beyond `hard_reset_to`
-/// itself: `hard_reset_to` requires the player count to already match, so
-/// a still-solo client grows to match the incoming count first (a one-time
-/// event, gated on `MultiplayerSession::joined`); a mismatch correction
-/// arrives once this side is already a real 2-player session, so that step
-/// is always a no-op by the time it matters.
+/// handshake-then-sync beats the old guessed-start-position scheme), a
+/// *later* joiner connecting (this side's own player count needs to grow
+/// to match too, even though it wasn't the one that just joined), and a
+/// checksum-mismatch correction ([`exchange_checksums_and_resync`]) --
+/// there is deliberately no second, parallel "initial sync" message type.
+/// `hard_reset_to` requires the player count to already match, so this
+/// grows in a loop to match the incoming player count first, however many
+/// players short it currently is (zero times for an ordinary mismatch
+/// correction once already fully joined, once for a first join, once more
+/// for each later joiner while this side was already connected).
 ///
 /// Called every tick regardless of `net.status`/role (cheap: a poll that's
 /// almost always empty) rather than gating on `Role::Joiner`, since only
 /// the non-host side ever actually receives one anyway
 /// (`WebRtcTransport::poll_resync_payloads`'s own doc) -- one fewer
-/// place that needs to know which role gets which messages.
-fn apply_resync_payload(mp: &mut MultiplayerSession, marble_state: &mut MarbleState, role: Role) {
+/// place that needs to know which role gets which messages. Must run
+/// after [`apply_welcome`] each tick (`marble_physics_tick_impl`'s
+/// ordering) so `marble_state.local_player_index` is already correct by
+/// the time this reads it (this fn's own first-join narrow-down step is
+/// the one place that still needs to *write* it, to `0`, before any
+/// `Welcome` could plausibly have arrived).
+fn apply_resync_payload(mp: &mut MultiplayerSession, marble_state: &mut MarbleState) {
     let Some(transport) = mp.transport.as_mut() else { return };
     let Some((tick, marbles)) = transport.poll_resync_payloads().into_iter().next_back() else {
         return;
@@ -336,17 +351,20 @@ fn apply_resync_payload(mp: &mut MultiplayerSession, marble_state: &mut MarbleSt
     if !mp.joined {
         // First time this client has ever heard from a host: strip `Demo`'s
         // decorative extra marbles (`render::setup`'s doc) down to just
-        // this client's own real one, then grow to match the incoming
-        // player count with a throwaway placeholder -- `hard_reset_to`
-        // just below overwrites it immediately, so its actual value
-        // doesn't matter.
+        // this client's own real one.
         if mp.sim.num_players() > 1 {
             mp.sim = mp.sim.narrow_to(marble_state.local_player_index);
             marble_state.local_player_index = 0;
         }
-        let placeholder_rad = mp.sim.marbles()[0].rad;
-        mp.sim.add_player_at(role.remote_index(), Marble::spawn(Vec3::ZERO, placeholder_rad));
         mp.joined = true;
+    }
+    // Grow to match the incoming player count -- a throwaway placeholder
+    // spawn point/radius, since `hard_reset_to` just below overwrites
+    // every player's actual state immediately regardless.
+    while mp.sim.num_players() < marbles.len() {
+        let idx = mp.sim.num_players();
+        let placeholder_rad = mp.sim.marbles()[0].rad;
+        mp.sim.add_player_at(idx, Marble::spawn(Vec3::ZERO, placeholder_rad));
     }
     info!("multiplayer: adopting authoritative join/resync state from host at tick {tick}");
     mp.sim.hard_reset_to(tick, marbles);
@@ -357,8 +375,26 @@ fn apply_resync_payload(mp: &mut MultiplayerSession, marble_state: &mut MarbleSt
     // (the old `base + offset` scheme this whole flow replaces): it's
     // just whatever the host said, same as everything else here.
     marble_state.start_positions = mp.sim.marbles().iter().map(|m| m.pos).collect();
-    marble_state.local_player_index = role.local_index();
     marble_state.marbles = mp.sim.marbles().to_vec();
+}
+
+/// Drains and applies the host's "you are player index K" message, if one
+/// arrived since the last tick — a joiner's own player index is no longer
+/// a compile-time constant now that more than one joiner can exist
+/// (`net::Role`'s doc), so this is how it learns the value the host
+/// assigned it. Always a no-op on the host itself (never receives one,
+/// its own index is always `0`) and on every tick nothing's arrived.
+/// Called before [`apply_resync_payload`] each tick (`marble_physics_tick_impl`'s
+/// ordering) so that function's `marble_state.local_player_index` read is
+/// already correct — safe by wire order too: PeerJS's `reliable: true`
+/// channel preserves send order, and the host always sends `Welcome`
+/// before that same connection's first `ResyncPayload`/`SceneSync`
+/// (`marble_physics_tick_impl`'s join-handling doc).
+fn apply_welcome(mp: &mut MultiplayerSession, marble_state: &mut MarbleState) {
+    let Some(transport) = mp.transport.as_mut() else { return };
+    if let Some(index) = transport.poll_welcomes().into_iter().next_back() {
+        marble_state.local_player_index = index;
+    }
 }
 
 /// Rewind window depth (in ticks, i.e. ~267ms at 60Hz) — deep enough to
@@ -473,68 +509,81 @@ fn marble_physics_tick_impl(
 
     // Edge-triggered on the *transition into* `Connected` -- a freshly
     // opened data channel, first-ever or a same-tab reconnect alike (see
-    // `MultiplayerSession::was_connected`'s doc). Level-triggering this on
-    // `Connected` alone (the old condition) would either re-run every tick
-    // or, gated on `transport.is_none()` as it used to be, never re-run
-    // after the very first connection at all -- neither is right once a
-    // reconnect needs the same handling as a first join.
+    // `MultiplayerSession::was_connected`'s doc). Only used to create
+    // `mp.transport` once, ever, on the first connection event of any
+    // kind -- the actual per-joiner join-handling below runs unconditionally
+    // every tick instead (a host can gain a second, third, ... joiner at
+    // any later time, not just alongside the very first).
     let just_connected = net.status == NetStatus::Connected && !mp.was_connected;
     mp.was_connected = net.status == NetStatus::Connected;
+    if just_connected && mp.transport.is_none() {
+        mp.transport = Some(WebRtcTransport::new(net.role));
+    }
 
-    if just_connected {
-        if mp.transport.is_none() {
-            mp.transport = Some(WebRtcTransport::new(net.role));
-        }
-        if net.role == Role::Host {
-            // First-ever join only (`mp.joined` stays true forever after
-            // this, so a later reconnect skips straight to resending fresh
-            // state below): narrow away `Demo`'s decorative extra marbles
-            // (`render::setup`'s doc) -- a no-op for every other scene,
-            // which always starts solo with exactly 1 marble already --
-            // then grow the still-solo session in place to a real 2-player
-            // one (`MultiplayerSession`'s doc).
+    // Host: handle every joiner index that connected this tick (almost
+    // always empty -- a no-op poll on every quiet tick, and always empty
+    // on a joiner, `WebRtcTransport::take_newly_connected`'s doc). Each one
+    // grows this session by exactly one player and gets a `Welcome`
+    // telling it its assigned index; once at least one has ever connected,
+    // a single combined tick+state (+ scene, first time only in practice)
+    // push goes out to *everyone* currently connected -- existing joiners
+    // need this too, so their own `RollbackSim` grows to match the new
+    // count (`apply_resync_payload`'s doc), even though they weren't the
+    // one that just joined.
+    if net.role == Role::Host {
+        let new_indices =
+            mp.transport.as_mut().map(WebRtcTransport::take_newly_connected).unwrap_or_default();
+        for _ in &new_indices {
+            // First-ever joiner only: narrow away `Demo`'s decorative extra
+            // marbles (`render::setup`'s doc) -- a no-op for every other
+            // scene, which always starts solo with exactly 1 marble
+            // already.
             if !mp.joined {
                 if mp.sim.num_players() > 1 {
                     mp.sim = mp.sim.narrow_to(marble_state.local_player_index);
                     marble_state.start_positions = vec![marble_state.start_positions[marble_state.local_player_index]];
                     marble_state.local_player_index = 0;
                 }
-                let remote_index = net.role.remote_index();
-                let base = marble_state.start_positions[marble_state.local_player_index];
-                let rad = mp.sim.marbles()[marble_state.local_player_index].rad;
-                let remote_start = base + Vec3::new(remote_index as f32 * 0.4, 0.0, 0.0);
-                mp.sim.add_player_at(remote_index, Marble::spawn(remote_start, rad));
-                marble_state.start_positions.insert(remote_index, remote_start);
                 mp.joined = true;
+                // The host never waits on anything -- it's always
+                // authoritative, so this is set once, here, rather than
+                // gated on a round trip the way a joiner's is below.
+                mp.scene_synced = true;
             }
-            // The handshake just completed -- push this side's current
-            // tick and full state to the joiner right away, reusing
-            // `ResyncPayload` verbatim (`apply_resync_payload`'s doc):
-            // "here's the authoritative tick + state, adopt it" is exactly
-            // what a fresh join needs too, not just a checksum-mismatch
-            // correction. This is the fix for the actual bug this task
-            // exists for -- previously each side just kept its own
-            // independently-run tick counter and only ever reconciled the
-            // resulting divergence reactively, via periodic checksums,
-            // long after the two sessions had already drifted apart by
-            // however many ticks the handshake itself took. Runs on
-            // *every* freshly opened connection, first-ever or a
-            // reconnect alike, for the same reason the growth step above
-            // is skipped on a reconnect: the two sides' ticks keep
-            // drifting apart independently for the whole time they're
-            // disconnected (`NetStatus::Disconnected`'s doc), so a
-            // reconnect needs exactly the same realignment a first join
-            // does -- one join/rejoin code path, not a special case for
-            // "first time" vs "reconnecting".
+            let idx = mp.sim.num_players();
+            let base = marble_state.start_positions[0];
+            let rad = mp.sim.marbles()[0].rad;
+            let start = base + Vec3::new(idx as f32 * 0.4, 0.0, 0.0);
+            mp.sim.add_player_at(idx, Marble::spawn(start, rad));
+            marble_state.start_positions.push(start);
+            if let Some(transport) = mp.transport.as_mut() {
+                transport.send_welcome(idx, idx);
+            }
+        }
+        // The handshake(s) just completed -- push this side's current tick
+        // and full state to everyone right away, reusing `ResyncPayload`
+        // verbatim (`apply_resync_payload`'s doc): "here's the
+        // authoritative tick + state, adopt it" is exactly what a fresh
+        // join needs too, not just a checksum-mismatch correction. This is
+        // the fix for the original 2-player-only bug this flow was built
+        // for -- previously each side just kept its own independently-run
+        // tick counter and only ever reconciled the resulting divergence
+        // reactively, via periodic checksums, long after the two sessions
+        // had already drifted apart by however many ticks the handshake
+        // itself took. Runs on every tick with at least one new connection,
+        // first-ever or a later joiner (or a same-tab reconnect, which also
+        // surfaces as a `take_newly_connected` entry) alike, for the same
+        // reason: ticks keep drifting apart independently for the whole
+        // time any side is disconnected (`NetStatus::Disconnected`'s doc),
+        // so each of these events needs exactly the same realignment --
+        // one join/rejoin/grow code path, not a special case per trigger.
+        if !new_indices.is_empty() {
             if let Some(transport) = mp.transport.as_mut() {
                 transport.send_resync_payload(mp.sim.current_tick(), mp.sim.marbles().to_vec());
                 // The host's whole scene tree, atomically alongside the
                 // tick+state push above -- see `render::SceneBundle`'s
                 // (`marble_csg::scene_sync`) module doc for why a joiner
-                // needs this at all, not just a `?scene=` name. The host
-                // never needs to *wait* on anything here (it's already
-                // authoritative), so `scene_synced` is just set, not
-                // gated on a round trip the way the joiner's is below.
+                // needs this at all, not just a `?scene=` name.
                 let bundle = marble_csg::scene_sync::SceneBundle {
                     object: scene.object.clone(),
                     params: scene.params.clone(),
@@ -542,17 +591,18 @@ fn marble_physics_tick_impl(
                 };
                 transport.send_scene_sync(bundle.to_bytes());
             }
-            mp.scene_synced = true;
         }
     }
 
-    // Joiner's side of the hand-off above: adopt whatever the host's most
-    // recent join/resync payload says, wholesale. Polled every tick (not
-    // gated on `just_connected`) since the payload is a separate message
-    // that arrives at least one network hop after the handshake itself
-    // completes -- see `apply_resync_payload`'s doc. A no-op on the host
-    // (never receives one) and on any tick nothing's actually arrived.
-    apply_resync_payload(mp, &mut marble_state, net.role);
+    // Joiner's side of the hand-off above: learn this client's own
+    // assigned index, then adopt whatever the host's most recent
+    // join/resync payload says, wholesale. Both polled every tick (not
+    // gated on `just_connected`) since each is a separate message that
+    // arrives at least one network hop after the handshake itself
+    // completes. A no-op on the host (never receives either) and on any
+    // tick nothing's actually arrived.
+    apply_welcome(mp, &mut marble_state);
+    apply_resync_payload(mp, &mut marble_state);
 
     // Scene-sync half of the same hand-off: stash the raw bytes for
     // `render::apply_pending_scene_sync` (`Update`) to actually decode and
@@ -598,16 +648,43 @@ fn marble_physics_tick_impl(
     // two sides don't actually agree on yet.
     if net.status == NetStatus::Connected && mp.joined && mp.scene_synced {
         if let Some(transport) = mp.transport.as_mut() {
+            // Host only: note any joiner that dropped this tick (kept
+            // forever after -- `MultiplayerSession::disconnected_remotes`'s
+            // doc) before the real input exchange below, so this same
+            // tick's arrivals already include their confirmed-zero fill-in
+            // rather than lagging a tick behind.
+            if net.role == Role::Host {
+                for idx in transport.take_newly_disconnected() {
+                    if !mp.disconnected_remotes.contains(&idx) {
+                        mp.disconnected_remotes.push(idx);
+                    }
+                }
+            }
+            // `send_input`/`poll_received` broadcast/relay across every
+            // known remote for a host, or talk to the one host connection
+            // for a joiner (`WebRtcTransport`'s doc) -- this call site
+            // doesn't need to know which.
             transport.send_input(tick, local_input);
             arrivals.extend(transport.poll_received());
+            // Host only: every joiner that has ever disconnected sits
+            // under zero input from here on, rather than silently
+            // repeating whatever they were last doing right up to the
+            // moment they dropped (empty on a joiner -- `disconnected_remotes`
+            // is host-only state).
+            for &idx in &mp.disconnected_remotes {
+                arrivals.push((idx, tick, PlayerInput { dx: 0.0, dy: 0.0, orientation: Quat::IDENTITY }));
+            }
         }
     } else if mp.transport.is_some() && mp.joined && mp.scene_synced {
-        // Was connected, isn't anymore -- the departed peer's marble sits
-        // under zero input from here on (`MultiplayerSession`'s doc),
-        // rather than silently repeating whatever they were last doing
-        // right up to the moment they dropped.
-        let remote_idx = net.role.remote_index();
-        arrivals.push((remote_idx, tick, PlayerInput { dx: 0.0, dy: 0.0, orientation: Quat::IDENTITY }));
+        // Joiner only in practice: `net.status` only ever actually settles
+        // into `Disconnected` for a joiner (`net.js`'s host-side `close`
+        // handler never resets the shared `status` back down once it's
+        // ever become "connected", precisely because a host can have other
+        // still-live joiners even after one drops -- a host's per-joiner
+        // disconnect handling lives in the branch above instead, driven by
+        // `take_newly_disconnected`, not this one). The host itself sits
+        // under zero input from here on.
+        arrivals.push((HOST_INDEX, tick, PlayerInput { dx: 0.0, dy: 0.0, orientation: Quat::IDENTITY }));
     }
 
     let kill_y = marble_state.kill_y;

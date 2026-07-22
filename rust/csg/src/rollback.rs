@@ -581,9 +581,8 @@ impl RollbackSim {
     /// caller is the rare edge case of a solo session that already had more
     /// than one marble for reasons unrelated to real players (`Demo`'s
     /// decorative extra marbles, spawned purely for a single-player
-    /// marble-collision visual demo, `render::setup`'s doc) gaining a real
-    /// second player: multiplayer is always exactly 2 *real* players
-    /// (`net::Role`), so those decorative extras get dropped at that point
+    /// marble-collision visual demo, `render::setup`'s doc) gaining its
+    /// first real player: those decorative extras get dropped at that point
     /// — same as this app already did before this session became always-on
     /// (they were never networked to begin with) — while still preserving
     /// `current_tick` and the real local player's own live state and input

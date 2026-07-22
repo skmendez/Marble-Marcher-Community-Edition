@@ -12,56 +12,112 @@
 // browser WebRTC plus a free public signaling broker (0.peerjs.com by
 // default) purely for the initial SDP/ICE handshake; once connected, data
 // flows directly peer-to-peer, not through the broker.
+//
+// N-player topology: host-relay star, not a mesh. Every joiner connects
+// only to the host (PeerJS gives this for free); joiners never connect to
+// each other directly. The host assigns each incoming connection the next
+// sequential player index (1, 2, 3, ...; host is always 0) and keeps that
+// assignment for the session -- a departed joiner's index is never reused
+// (matches net.rs's "stable index order" convention). Capped at
+// MAX_JOINERS additional players (4 total) -- a connection beyond that is
+// closed immediately.
 window.mmNet = (function () {
+  const MAX_JOINERS = 3;
+
   let peer = null;
-  let conn = null;
+  // Joiner role only: this client's single connection to the host.
+  let hostConn = null;
+  let received = []; // joiner only: array of Uint8Array, arrival order.
+
+  // Host role only: player index (1..MAX_JOINERS) -> PeerJS DataConnection.
+  let joinerConns = {};
+  let receivedByIndex = {}; // player index -> array of Uint8Array.
+  let connectedSet = new Set(); // indices currently open.
+  let newlyConnected = []; // indices that opened since the last poll.
+  let newlyDisconnected = []; // indices that closed since the last poll.
+  let nextJoinerIndex = 1;
+
   let hostedId = "";
   let lastError = "";
   // 0 idle, 1 hosting (waiting for a peer to connect), 2 connected,
-  // 3 disconnected (was connected, now isn't), 4 error.
+  // 3 disconnected (was connected, now isn't), 4 error. For the host this
+  // reflects "at least one joiner has ever connected" -- per-joiner detail
+  // is what newlyConnected/newlyDisconnected are for.
   let status = 0;
-  let received = []; // array of Uint8Array, one per message, in arrival order
-  // 0 idle (no copy attempted / already consumed), 1 last copy succeeded,
-  // 2 last copy failed -- `navigator.clipboard.writeText` is Promise-based,
-  // so this can't just return a bool synchronously to the wasm caller; the
-  // Rust side polls `takeClipboardStatus` once a frame instead, same shape
-  // as `takeError`/`takeReceived`.
   let clipboardStatus = 0;
 
-  function setupConnection(c) {
-    conn = c;
-    conn.on("open", () => {
+  function setupJoinerConnection(c) {
+    hostConn = c;
+    hostConn.on("open", () => {
       status = 2;
     });
-    conn.on("data", (data) => {
-      // Always sent as a raw ArrayBuffer from the Rust side (net.rs packs
-      // fixed-size binary records) -- PeerJS hands it back as whatever
-      // arrived, normalize to Uint8Array here so `takeReceived` never has
-      // to branch on type.
+    hostConn.on("data", (data) => {
       received.push(new Uint8Array(data));
     });
-    conn.on("close", () => {
+    hostConn.on("close", () => {
       if (status === 2) status = 3;
     });
-    conn.on("error", (err) => {
+    hostConn.on("error", (err) => {
       lastError = String(err && err.message ? err.message : err);
       status = 4;
     });
   }
 
+  function setupHostConnection(idx, c) {
+    joinerConns[idx] = c;
+    receivedByIndex[idx] = [];
+    c.on("open", () => {
+      connectedSet.add(idx);
+      newlyConnected.push(idx);
+      status = 2;
+    });
+    c.on("data", (data) => {
+      receivedByIndex[idx].push(new Uint8Array(data));
+    });
+    c.on("close", () => {
+      if (connectedSet.has(idx)) {
+        connectedSet.delete(idx);
+        newlyDisconnected.push(idx);
+      }
+    });
+    c.on("error", (err) => {
+      lastError = String(err && err.message ? err.message : err);
+    });
+  }
+
+  function concatAndClear(arr) {
+    if (arr.length === 0) return new Uint8Array(0);
+    const total = arr.reduce((n, r) => n + r.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const r of arr) {
+      out.set(r, offset);
+      offset += r.length;
+    }
+    arr.length = 0;
+    return out;
+  }
+
   return {
-    // Creates this client's Peer with a broker-assigned id and waits for
-    // an incoming connection -- call once, at startup, unconditionally
-    // (see net.rs's doc: every session hosts by default, whether or not
-    // anyone ever uses the resulting link is irrelevant to single-player
-    // behavior).
+    // Creates this client's Peer with a broker-assigned id and accepts
+    // incoming connections, one per joiner, up to MAX_JOINERS -- call
+    // once, at startup, unconditionally (see net.rs's doc: every session
+    // hosts by default, whether or not anyone ever uses the resulting
+    // link is irrelevant to single-player behavior).
     host: function () {
       peer = new Peer();
       peer.on("open", (id) => {
         hostedId = id;
         status = 1;
       });
-      peer.on("connection", (c) => setupConnection(c));
+      peer.on("connection", (c) => {
+        if (nextJoinerIndex > MAX_JOINERS) {
+          c.close(); // session already at the player cap
+          return;
+        }
+        const idx = nextJoinerIndex++;
+        setupHostConnection(idx, c);
+      });
       peer.on("error", (err) => {
         lastError = String(err && err.message ? err.message : err);
         status = 4;
@@ -73,20 +129,26 @@ window.mmNet = (function () {
     join: function (hostId) {
       peer = new Peer();
       peer.on("open", () => {
-        setupConnection(peer.connect(hostId, { reliable: true, serialization: "binary" }));
+        setupJoinerConnection(peer.connect(hostId, { reliable: true, serialization: "binary" }));
       });
       peer.on("error", (err) => {
         lastError = String(err && err.message ? err.message : err);
         status = 4;
       });
     },
-    // `bytes` is a Uint8Array from the wasm side. No-op if not currently
-    // connected -- callers are expected to check `status()` themselves,
-    // this is just a safe fallback against a stray call during a
-    // connect/disconnect race.
+    // Joiner-only: send to the one host connection. `bytes` is a
+    // Uint8Array from the wasm side. No-op if not currently connected.
     send: function (bytes) {
-      if (conn && conn.open) {
-        conn.send(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+      if (hostConn && hostConn.open) {
+        hostConn.send(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+      }
+    },
+    // Host-only: send to one specific joiner by its assigned index.
+    // No-op if that index isn't currently connected.
+    sendTo: function (idx, bytes) {
+      const c = joinerConns[idx];
+      if (c && c.open) {
+        c.send(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
       }
     },
     // `text` is the full invite link. Fire-and-forget from the wasm side --
@@ -126,20 +188,31 @@ window.mmNet = (function () {
       lastError = "";
       return e;
     },
-    // Drains every message received since the last call, concatenated
-    // into one flat Uint8Array -- safe because net.rs only ever sends
-    // fixed-size 32-byte records, so no length-prefixing is needed on
-    // either side; the Rust side just chunks the result by 32.
+    // Joiner-only: drains every message received from the host since the
+    // last call, concatenated into one flat Uint8Array -- each message
+    // self-describes its own length (net.rs's tagged protocol), so no
+    // extra framing is needed here.
     takeReceived: function () {
-      if (received.length === 0) return new Uint8Array(0);
-      const total = received.reduce((n, r) => n + r.length, 0);
-      const out = new Uint8Array(total);
-      let offset = 0;
-      for (const r of received) {
-        out.set(r, offset);
-        offset += r.length;
-      }
-      received = [];
+      return concatAndClear(received);
+    },
+    // Host-only: drains every message received from joiner `idx` since
+    // the last call, same flat-concatenation convention as `takeReceived`.
+    takeReceivedFrom: function (idx) {
+      return concatAndClear(receivedByIndex[idx] || []);
+    },
+    // Host-only: player indices whose connection opened since the last
+    // call to this function (each index reported exactly once, the tick
+    // its connection actually opens).
+    newlyConnectedIndices: function () {
+      const out = new Uint8Array(newlyConnected);
+      newlyConnected = [];
+      return out;
+    },
+    // Host-only: player indices whose connection closed since the last
+    // call to this function.
+    newlyDisconnectedIndices: function () {
+      const out = new Uint8Array(newlyDisconnected);
+      newlyDisconnected = [];
       return out;
     },
   };

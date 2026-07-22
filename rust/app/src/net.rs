@@ -11,11 +11,18 @@
 //! callback lifetimes right from `wasm-bindgen` is exactly the kind of
 //! thing worth keeping in plain JS where it's simpler to write and read.
 //!
-//! **Exactly 2 players, always**: the host is always player index `0`, the
-//! joiner always `1` — matches `rollback.rs`'s own test setups
-//! (`two_player_setup`) and keeps the join-link flow simple (one incoming
-//! `DataConnection`, not a mesh/star topology decision). N > 2 networked
-//! players is future work, not this milestone.
+//! **Up to 4 players, host-relay topology**: the host is always player
+//! index `0`; each joiner gets the next sequential index (`1`, `2`, `3`) in
+//! connection order, capped at `MAX_JOINERS` additional players (matches
+//! `codegen.rs`'s per-marble tint, which already wraps at 4 colors — a
+//! natural, already-hinted-at scope boundary). PeerJS gives every joiner a
+//! direct connection to the host for free (a star topology), but never a
+//! direct joiner-to-joiner connection — so the host relays every `Input`
+//! message it receives from one joiner to every *other* connected joiner
+//! (`WebRtcTransport::sort_message`), while a joiner only ever talks to the
+//! host directly, exactly as before. This matches this codebase's existing
+//! host-authoritative convention throughout (`Role`'s doc, resync always
+//! flows from the host) rather than a full mesh.
 //!
 //! **Networking is strictly additive**: nothing here changes single-player
 //! behavior. A session always starts hosting in the background (creating a
@@ -31,6 +38,13 @@ use marble_csg::physics::{Marble, PlayerInput};
 use marble_csg::rollback::{InputTransport, PlayerIndex, Tick};
 
 use crate::web_config::query_param;
+
+/// Additional players beyond the host — matches `net.js`'s own
+/// `MAX_JOINERS` (kept in sync by convention, not a shared constant,
+/// since one lives in Rust and the other in plain JS): a connection
+/// beyond this cap is closed immediately on the JS side, so Rust never
+/// even hears about it.
+pub const MAX_JOINERS: usize = 3;
 
 /// Wire size of one packed [`PlayerInput`] record: `tick: u64` (8) +
 /// `dx`/`dy: f32` (4 each) + `orientation: Quat` as 4×`f32` (16) = 32
@@ -102,6 +116,7 @@ const TAG_CHECKSUM: u8 = 1;
 const TAG_RESYNC_REQUEST: u8 = 2;
 const TAG_RESYNC_PAYLOAD: u8 = 3;
 const TAG_SCENE_SYNC: u8 = 4;
+const TAG_WELCOME: u8 = 5;
 
 /// One message on the wire, tag-prefixed so [`WebRtcTransport`] can share
 /// a single channel between the original per-tick input exchange and the
@@ -147,6 +162,16 @@ enum NetMessage {
     SceneSync {
         bytes: Vec<u8>,
     },
+    /// Host -> exactly one newly-connected joiner: "you are player index
+    /// K" (`net.js` assigns joiner indices sequentially at connect time,
+    /// but only the host's side of the connection knows the assignment —
+    /// this is how the joiner learns it). Sent once per connection,
+    /// always before that same connection's first `ResyncPayload`/
+    /// `SceneSync` (PeerJS's `reliable: true` channel preserves send
+    /// order), never relayed to other joiners.
+    Welcome {
+        index: PlayerIndex,
+    },
 }
 
 fn encode_message(msg: &NetMessage) -> Vec<u8> {
@@ -186,6 +211,9 @@ fn encode_message(msg: &NetMessage) -> Vec<u8> {
             out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             out.extend_from_slice(bytes);
             out
+        }
+        NetMessage::Welcome { index } => {
+            vec![TAG_WELCOME, *index as u8]
         }
     }
 }
@@ -235,10 +263,15 @@ fn decode_messages(bytes: &[u8]) -> Vec<NetMessage> {
                 i += len;
                 out.push(NetMessage::SceneSync { bytes: payload });
             }
+            TAG_WELCOME => {
+                let index = bytes[i] as PlayerIndex;
+                i += 1;
+                out.push(NetMessage::Welcome { index });
+            }
             // An unrecognized tag means the stream is malformed -- can't
             // happen in practice (both peers always run the exact same
             // build, so every tag either side ever writes is one of the
-            // five above), but stopping rather than guessing how many
+            // six above), but stopping rather than guessing how many
             // bytes to skip past garbage is the safe failure mode.
             _ => break,
         }
@@ -258,6 +291,8 @@ mod js_bridge {
         pub fn join(host_id: &str);
         #[wasm_bindgen(js_namespace = mmNet, js_name = send)]
         pub fn send(bytes: &[u8]);
+        #[wasm_bindgen(js_namespace = mmNet, js_name = sendTo)]
+        pub fn send_to(idx: u8, bytes: &[u8]);
         #[wasm_bindgen(js_namespace = mmNet, js_name = status)]
         pub fn status() -> i32;
         #[wasm_bindgen(js_namespace = mmNet, js_name = hostedId)]
@@ -266,6 +301,12 @@ mod js_bridge {
         pub fn take_error() -> String;
         #[wasm_bindgen(js_namespace = mmNet, js_name = takeReceived)]
         pub fn take_received() -> Vec<u8>;
+        #[wasm_bindgen(js_namespace = mmNet, js_name = takeReceivedFrom)]
+        pub fn take_received_from(idx: u8) -> Vec<u8>;
+        #[wasm_bindgen(js_namespace = mmNet, js_name = newlyConnectedIndices)]
+        pub fn newly_connected_indices() -> Vec<u8>;
+        #[wasm_bindgen(js_namespace = mmNet, js_name = newlyDisconnectedIndices)]
+        pub fn newly_disconnected_indices() -> Vec<u8>;
         #[wasm_bindgen(js_namespace = mmNet, js_name = copyToClipboard)]
         pub fn copy_to_clipboard(text: &str);
         #[wasm_bindgen(js_namespace = mmNet, js_name = takeClipboardStatus)]
@@ -282,6 +323,7 @@ mod js_bridge {
     pub fn host() {}
     pub fn join(_host_id: &str) {}
     pub fn send(_bytes: &[u8]) {}
+    pub fn send_to(_idx: u8, _bytes: &[u8]) {}
     pub fn status() -> i32 {
         0
     }
@@ -292,6 +334,15 @@ mod js_bridge {
         String::new()
     }
     pub fn take_received() -> Vec<u8> {
+        Vec::new()
+    }
+    pub fn take_received_from(_idx: u8) -> Vec<u8> {
+        Vec::new()
+    }
+    pub fn newly_connected_indices() -> Vec<u8> {
+        Vec::new()
+    }
+    pub fn newly_disconnected_indices() -> Vec<u8> {
         Vec::new()
     }
     pub fn copy_to_clipboard(_text: &str) {}
@@ -337,32 +388,28 @@ impl NetStatus {
     }
 }
 
-/// This client's role: host (player 0, waiting for/hosting a joiner) or
-/// joiner (player 1, connecting to a host's shared link) — fixed for the
-/// whole session from the very first frame (`?join=` present or not),
-/// never renegotiated.
+/// The host's own player index — always `0`, host-relay topology (module
+/// doc).
+pub const HOST_INDEX: PlayerIndex = 0;
+
+/// This client's role: host (player `0`, accepting up to [`MAX_JOINERS`]
+/// joiners) or joiner (connecting to a host's shared link, sequentially
+/// assigned indices `1..=MAX_JOINERS`) — fixed for the whole session from
+/// the very first frame (`?join=` present or not), never renegotiated.
+///
+/// Unlike the old exactly-2-players design, a joiner's own player index is
+/// no longer a pure function of `Role` — it's assigned by the host at
+/// connect time and learned via [`NetMessage::Welcome`]
+/// (`WebRtcTransport::poll_welcomes`), since two different joiners
+/// connecting to the same host land at different indices. `physics_sys.rs`
+/// tracks the learned value directly on `MarbleState::local_player_index`
+/// (defaulting to `0`, correct for the host and a reasonable placeholder
+/// for a joiner until its `Welcome` arrives, which happens before any real
+/// input exchange starts — `MultiplayerSession`'s doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Host,
     Joiner,
-}
-
-impl Role {
-    /// This client's own player index in the (always exactly 2 players)
-    /// session — see the module doc.
-    pub fn local_index(self) -> PlayerIndex {
-        match self {
-            Self::Host => 0,
-            Self::Joiner => 1,
-        }
-    }
-
-    pub fn remote_index(self) -> PlayerIndex {
-        match self {
-            Self::Host => 1,
-            Self::Joiner => 0,
-        }
-    }
 }
 
 /// Whole-session networking state — one per app, inserted at [`Startup`].
@@ -660,60 +707,190 @@ pub fn sync_net_ui_text(session: Res<NetSession>, mut text: Query<&mut Text, Wit
     }
 }
 
-/// [`InputTransport`] over the live WebRTC data channel, extended to also
-/// carry the checksum/resync side channel (rollback resiliency) — see the
-/// module doc for the wire format. `remote` is fixed for the whole session
-/// (exactly one other player, always the same index — [`Role::remote_index`]).
+/// [`InputTransport`] over the live WebRTC data channel(s), extended to
+/// also carry the checksum/resync side channel (rollback resiliency) and
+/// the host-relay fan-out (module doc) — see the module doc for the wire
+/// format.
+///
+/// A joiner has exactly one remote (the host, implicitly [`HOST_INDEX`])
+/// and talks to it via `net.js`'s single-connection `send`/`takeReceived`.
+/// A host has up to [`MAX_JOINERS`] remotes, tracked in `known_remotes`
+/// (grows via [`Self::take_newly_connected`], never shrinks — a departed
+/// joiner's index is never reused, same stable-index-order guarantee
+/// `MultiplayerSession` already relies on) and talks to them via
+/// `net.js`'s per-index `sendTo`/`takeReceivedFrom`.
 pub struct WebRtcTransport {
-    remote: PlayerIndex,
+    role: Role,
+    /// Host only: every joiner index that has ever connected. Empty and
+    /// unused for a joiner.
+    known_remotes: Vec<PlayerIndex>,
     /// Demultiplexed per-kind inboxes, filled by [`Self::drain_and_demux`]
     /// and drained by each kind's own `poll_*` method — separate from
-    /// `net.js`'s own single `received` queue so that `poll_received`
-    /// (the [`InputTransport`] trait method) and the three new `poll_*`
-    /// methods below can each be called independently, in any order, any
-    /// number of times per tick, without one silently stealing messages
-    /// meant for another.
+    /// `net.js`'s own receive queue(s) so that `poll_received` (the
+    /// [`InputTransport`] trait method) and the other `poll_*` methods
+    /// below can each be called independently, in any order, any number of
+    /// times per tick, without one silently stealing messages meant for
+    /// another.
     pending_inputs: Vec<(PlayerIndex, Tick, PlayerInput)>,
+    /// Origin-less: a joiner's only source is unambiguously the host; a
+    /// host never *acts* on a checksum comparison regardless of which
+    /// joiner it came from (only the non-host side ever requests a
+    /// correction, `net::Role`'s host-authoritative convention), so
+    /// there's nothing origin-specific to do with this at either role.
     pending_checksums: Vec<(Tick, u64)>,
+    /// Origin-less for the same reason: a host answers *any* resync
+    /// request by broadcasting its current state to every connected
+    /// joiner (not just the one that asked) — simpler and just as correct
+    /// as a targeted answer, since an authoritative resync is never wrong
+    /// for a peer that didn't actually need it, and this avoids needing
+    /// per-joiner request tracking for what should be a rare event.
     pending_resync_requests: Vec<Tick>,
+    /// Joiner-only: always from the host.
     pending_resync_payloads: Vec<(Tick, Vec<Marble>)>,
+    /// Joiner-only: always from the host.
     pending_scene_syncs: Vec<Vec<u8>>,
+    /// Joiner-only: "you are player index K" from the host, once per
+    /// connection.
+    pending_welcomes: Vec<PlayerIndex>,
 }
 
 impl WebRtcTransport {
     pub fn new(role: Role) -> Self {
         Self {
-            remote: role.remote_index(),
+            role,
+            known_remotes: Vec::new(),
             pending_inputs: Vec::new(),
             pending_checksums: Vec::new(),
             pending_resync_requests: Vec::new(),
             pending_resync_payloads: Vec::new(),
             pending_scene_syncs: Vec::new(),
+            pending_welcomes: Vec::new(),
         }
     }
 
-    /// Drains whatever `net.js` has received since the last poll (of
-    /// *any* kind) and sorts each decoded message into its own buffer —
-    /// the one place that actually calls `js_bridge::take_received`, so
-    /// every `poll_*` method (including [`InputTransport::poll_received`])
-    /// can call this unconditionally: whichever runs first each tick does
-    /// the real draining, the rest just find `net.js`'s own queue already
-    /// empty.
-    fn drain_and_demux(&mut self) {
-        let bytes = js_bridge::take_received();
-        for msg in decode_messages(&bytes) {
-            match msg {
-                NetMessage::Input { tick, input } => self.pending_inputs.push((self.remote, tick, input)),
-                NetMessage::Checksum { tick, hash } => self.pending_checksums.push((tick, hash)),
-                NetMessage::ResyncRequest { tick } => self.pending_resync_requests.push(tick),
-                NetMessage::ResyncPayload { tick, marbles } => self.pending_resync_payloads.push((tick, marbles)),
-                NetMessage::SceneSync { bytes } => self.pending_scene_syncs.push(bytes),
+    /// Host-only: player indices whose connection opened since the last
+    /// call — also folds them into `known_remotes` so `Self::broadcast`/
+    /// `Self::relay_input_except` immediately include them. A no-op,
+    /// always-empty poll for a joiner (`js_bridge::newly_connected_indices`
+    /// is host-only in `net.js` too).
+    pub fn take_newly_connected(&mut self) -> Vec<PlayerIndex> {
+        if self.role != Role::Host {
+            return Vec::new();
+        }
+        let indices: Vec<PlayerIndex> =
+            js_bridge::newly_connected_indices().into_iter().map(|b| b as PlayerIndex).collect();
+        for &idx in &indices {
+            debug_assert!(
+                (1..=MAX_JOINERS).contains(&idx),
+                "net.js should never report a joiner index outside 1..=MAX_JOINERS (got {idx})"
+            );
+            if !self.known_remotes.contains(&idx) {
+                self.known_remotes.push(idx);
+            }
+        }
+        indices
+    }
+
+    /// Host-only: player indices whose connection closed since the last
+    /// call. Stays in `known_remotes` regardless (a send to a closed
+    /// connection is already a harmless no-op on the JS side) — this is
+    /// purely for `physics_sys.rs` to know which indices need a confirmed
+    /// zero input from here on (`MultiplayerSession`'s doc).
+    pub fn take_newly_disconnected(&mut self) -> Vec<PlayerIndex> {
+        if self.role != Role::Host {
+            return Vec::new();
+        }
+        js_bridge::newly_disconnected_indices().into_iter().map(|b| b as PlayerIndex).collect()
+    }
+
+    /// Sends `bytes` to every currently-known remote (a joiner has
+    /// exactly one, the host; a host sends to every joiner that has ever
+    /// connected). Used for this side's *own* outgoing messages (its own
+    /// input, its own checksum, an authoritative resync/scene push) —
+    /// distinct from [`Self::relay_input_except`], which forwards a
+    /// *received* message on to others.
+    fn broadcast(&self, bytes: &[u8]) {
+        match self.role {
+            Role::Joiner => js_bridge::send(bytes),
+            Role::Host => {
+                for &idx in &self.known_remotes {
+                    js_bridge::send_to(idx as u8, bytes);
+                }
             }
         }
     }
 
+    /// Host-only: forwards one joiner's `Input` message on to every
+    /// *other* connected joiner, so every peer's `RollbackSim` ends up with
+    /// every player's input each tick (module doc) — PeerJS gives a star
+    /// topology, joiners never connect to each other directly, so this
+    /// relay is the only way an input reaches anyone but the host.
+    fn relay_input_except(&self, origin: PlayerIndex, bytes: &[u8]) {
+        for &idx in &self.known_remotes {
+            if idx != origin {
+                js_bridge::send_to(idx as u8, bytes);
+            }
+        }
+    }
+
+    /// Sends `Welcome { index }` directly to exactly one connection (the
+    /// joiner that just connected as that index) — never broadcast, since
+    /// every other connection already knows its own index.
+    pub fn send_welcome(&self, to: PlayerIndex, index: PlayerIndex) {
+        js_bridge::send_to(to as u8, &encode_message(&NetMessage::Welcome { index }));
+    }
+
+    /// Drains whatever `net.js` has received since the last poll (of
+    /// *any* kind), from every known channel, and sorts each decoded
+    /// message into its own buffer — the one place that actually calls
+    /// `js_bridge::take_received`/`take_received_from`, so every `poll_*`
+    /// method (including [`InputTransport::poll_received`]) can call this
+    /// unconditionally: whichever runs first each tick does the real
+    /// draining, the rest just find the queue(s) already empty.
+    fn drain_and_demux(&mut self) {
+        match self.role {
+            Role::Joiner => {
+                let bytes = js_bridge::take_received();
+                for msg in decode_messages(&bytes) {
+                    self.sort_message(HOST_INDEX, msg);
+                }
+            }
+            Role::Host => {
+                for idx in self.known_remotes.clone() {
+                    let bytes = js_bridge::take_received_from(idx as u8);
+                    for msg in decode_messages(&bytes) {
+                        self.sort_message(idx, msg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Files one decoded message into its kind's buffer, tagged with
+    /// `origin` where that's meaningful ([`Self::pending_inputs`] only —
+    /// see the other `pending_*` fields' docs for why they don't need it).
+    /// Relays a host-received `Input` to every other joiner inline, here,
+    /// so relay happens exactly once per real message received, not as a
+    /// separate pass.
+    fn sort_message(&mut self, origin: PlayerIndex, msg: NetMessage) {
+        if self.role == Role::Host {
+            if let NetMessage::Input { .. } = &msg {
+                let bytes = encode_message(&msg);
+                self.relay_input_except(origin, &bytes);
+            }
+        }
+        match msg {
+            NetMessage::Input { tick, input } => self.pending_inputs.push((origin, tick, input)),
+            NetMessage::Checksum { tick, hash } => self.pending_checksums.push((tick, hash)),
+            NetMessage::ResyncRequest { tick } => self.pending_resync_requests.push(tick),
+            NetMessage::ResyncPayload { tick, marbles } => self.pending_resync_payloads.push((tick, marbles)),
+            NetMessage::SceneSync { bytes } => self.pending_scene_syncs.push(bytes),
+            NetMessage::Welcome { index } => self.pending_welcomes.push(index),
+        }
+    }
+
     pub fn send_scene_sync(&mut self, bytes: Vec<u8>) {
-        js_bridge::send(&encode_message(&NetMessage::SceneSync { bytes }));
+        self.broadcast(&encode_message(&NetMessage::SceneSync { bytes }));
     }
 
     /// Drains every scene-sync bundle the peer has sent since the last call
@@ -725,15 +902,19 @@ impl WebRtcTransport {
     }
 
     pub fn send_checksum(&mut self, tick: Tick, hash: u64) {
-        js_bridge::send(&encode_message(&NetMessage::Checksum { tick, hash }));
+        self.broadcast(&encode_message(&NetMessage::Checksum { tick, hash }));
     }
 
     pub fn send_resync_request(&mut self, tick: Tick) {
-        js_bridge::send(&encode_message(&NetMessage::ResyncRequest { tick }));
+        // Only ever called when `role == Role::Joiner` (its one caller in
+        // `physics_sys.rs` is gated on that) -- `broadcast` degrades to a
+        // plain single send for a joiner regardless, so this is correct
+        // either way.
+        self.broadcast(&encode_message(&NetMessage::ResyncRequest { tick }));
     }
 
     pub fn send_resync_payload(&mut self, tick: Tick, marbles: Vec<Marble>) {
-        js_bridge::send(&encode_message(&NetMessage::ResyncPayload { tick, marbles }));
+        self.broadcast(&encode_message(&NetMessage::ResyncPayload { tick, marbles }));
     }
 
     /// Drains every checksum the peer has sent since the last call.
@@ -742,9 +923,9 @@ impl WebRtcTransport {
         std::mem::take(&mut self.pending_checksums)
     }
 
-    /// Drains every resync request the peer has sent since the last call
-    /// (only ever populated on the host side — a non-host peer never
-    /// receives one, `Role`'s host-authoritative convention).
+    /// Drains every resync request received since the last call (only
+    /// ever populated on the host side — a non-host peer never receives
+    /// one, `Role`'s host-authoritative convention).
     pub fn poll_resync_requests(&mut self) -> Vec<Tick> {
         self.drain_and_demux();
         std::mem::take(&mut self.pending_resync_requests)
@@ -756,11 +937,18 @@ impl WebRtcTransport {
         self.drain_and_demux();
         std::mem::take(&mut self.pending_resync_payloads)
     }
+
+    /// Drains every `Welcome` received since the last call (joiner-only in
+    /// practice — a host never receives one).
+    pub fn poll_welcomes(&mut self) -> Vec<PlayerIndex> {
+        self.drain_and_demux();
+        std::mem::take(&mut self.pending_welcomes)
+    }
 }
 
 impl InputTransport for WebRtcTransport {
     fn send_input(&mut self, tick: Tick, input: PlayerInput) {
-        js_bridge::send(&encode_message(&NetMessage::Input { tick, input }));
+        self.broadcast(&encode_message(&NetMessage::Input { tick, input }));
     }
 
     fn poll_received(&mut self) -> Vec<(PlayerIndex, Tick, PlayerInput)> {
@@ -788,14 +976,6 @@ mod tests {
         assert_eq!(got.orientation, input.orientation);
     }
 
-    #[test]
-    fn role_indices_are_always_the_opposite_pair() {
-        assert_eq!(Role::Host.local_index(), 0);
-        assert_eq!(Role::Host.remote_index(), 1);
-        assert_eq!(Role::Joiner.local_index(), 1);
-        assert_eq!(Role::Joiner.remote_index(), 0);
-    }
-
     fn sample_marble(x: f32) -> Marble {
         Marble { pos: Vec3::new(x, x + 1.0, x + 2.0), vel: Vec3::new(-x, x * 0.5, 0.25), rad: 0.3, last_thrust: Vec3::ZERO }
     }
@@ -813,6 +993,7 @@ mod tests {
             NetMessage::ResyncRequest { tick: 7 },
             NetMessage::ResyncPayload { tick: 55, marbles: vec![sample_marble(1.0), sample_marble(2.0)] },
             NetMessage::SceneSync { bytes: vec![1, 2, 3, 4, 5] },
+            NetMessage::Welcome { index: 2 },
         ];
         for msg in cases {
             let decoded = decode_messages(&encode_message(&msg));
@@ -842,6 +1023,7 @@ mod tests {
                     }
                 }
                 (NetMessage::SceneSync { bytes: b1 }, NetMessage::SceneSync { bytes: b2 }) => assert_eq!(b1, b2),
+                (NetMessage::Welcome { index: i1 }, NetMessage::Welcome { index: i2 }) => assert_eq!(i1, i2),
                 _ => panic!("decoded message kind doesn't match the encoded kind"),
             }
         }
@@ -865,19 +1047,21 @@ mod tests {
         bytes.extend(encode_message(&NetMessage::ResyncRequest { tick: 3 }));
         bytes.extend(encode_message(&NetMessage::ResyncPayload { tick: 4, marbles: vec![sample_marble(0.0)] }));
         bytes.extend(encode_message(&NetMessage::SceneSync { bytes: vec![9, 8, 7] }));
+        bytes.extend(encode_message(&NetMessage::Welcome { index: 3 }));
         bytes.extend(encode_message(&NetMessage::Input {
             tick: 5,
             input: PlayerInput { dx: 0.5, dy: 0.5, orientation: Quat::IDENTITY },
         }));
 
         let decoded = decode_messages(&bytes);
-        assert_eq!(decoded.len(), 6);
+        assert_eq!(decoded.len(), 7);
         assert!(matches!(decoded[0], NetMessage::Input { tick: 1, .. }));
         assert!(matches!(decoded[1], NetMessage::Checksum { tick: 2, hash: 999 }));
         assert!(matches!(decoded[2], NetMessage::ResyncRequest { tick: 3 }));
         assert!(matches!(decoded[3], NetMessage::ResyncPayload { tick: 4, .. }));
         assert!(matches!(&decoded[4], NetMessage::SceneSync { bytes } if bytes == &[9, 8, 7]));
-        assert!(matches!(decoded[5], NetMessage::Input { tick: 5, .. }));
+        assert!(matches!(decoded[5], NetMessage::Welcome { index: 3 }));
+        assert!(matches!(decoded[6], NetMessage::Input { tick: 5, .. }));
     }
 
     /// [`WebRtcTransport`]'s demultiplexing: a fabricated byte stream
