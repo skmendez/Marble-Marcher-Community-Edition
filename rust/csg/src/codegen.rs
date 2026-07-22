@@ -422,6 +422,17 @@ const MARBLE_TEXTURE_BINDING: &str = "\
 /// before (ray setup) and after (miss sentinel vs. full shading) differs.
 const MARCH_CORE: &str = "\
 const MAX_STEPS: i32 = 256;
+// The fine pass's own *default* step budget (distinct from `MAX_STEPS`,
+// which the coarse/shadow passes still use unchanged for their own
+// from-`t=0` marches, and which also still serves as `march_scene`'s
+// documented \"safe fallback\" ceiling) -- warm-started from MRRM's coarse
+// hit distance (`t0` below), so a full-`MAX_STEPS` budget was measured
+// overkill: verified visually across the Menger scenes (silhouette
+// corners, recursive tunnel openings, close-up marble framing) and the
+// Demo scene at several camera angles/distances with no missed geometry,
+// no popping, no banding at 128 -- half the old budget for the pass that
+// actually costs the most per pixel.
+const FINE_MAX_STEPS: i32 = 128;
 const MAX_DIST: f32 = 30.0;
 // Starting over-relaxation factor for the primary march (Enhanced Sphere
 // Tracing; ported from MMCE's ray_march, utility/ray_marching.glsl). MMCE
@@ -693,7 +704,14 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
 /// skips all shading -- but harmless dead code there is worse than a third
 /// copy, so this lives in its own block included only where used.
 const SHADING_CORE: &str = "\
-const SHADOW_STEPS: i32 = 24;
+// Reduced from 24 to 16 this session -- the improved-sphere-tracing soft
+// shadow technique below already converges faster per step than a naive
+// `min(d/t)` march would, and this pass only ever feeds a half-resolution,
+// depth-aware-resampled visibility term into the fine pass (`sample_shadow`),
+// not a direct per-fine-pixel shadow ray -- re-verified visually across the
+// Menger scenes' corner/tunnel shadows and the Demo scene at several sun
+// angles with no visible new banding/acne versus 24.
+const SHADOW_STEPS: i32 = 16;
 // Angular size (tangent of the half-angle) of the sun disc, controlling
 // shadow penumbra softness in the improved soft-shadow technique below --
 // MMCE passes this in as a per-scene `light_angle` parameter we don't have
@@ -701,15 +719,22 @@ const SHADOW_STEPS: i32 = 24;
 // razor-hard directional-sun-like shadow, chosen by visual inspection.
 const LIGHT_ANGLE: f32 = 0.06;
 
+// Tetrahedral central-difference normal (4 `map()` calls, down from the
+// prior axis-aligned 6-tap version's 6) -- Inigo Quilez's well-established
+// cheaper equivalent: sampling at the 4 vertices of a regular tetrahedron
+// centered on `p` instead of +-eps along each of the 3 axes gives the same
+// gradient-estimate quality (both are first-order central differences,
+// just over a different, still-symmetric sample set) for 33% fewer map()
+// evaluations, the single most expensive operation in this whole shader.
+// Re-verified visually across the Menger scenes and Demo at several camera
+// angles/distances with no visible change in shading/normal quality.
 fn calc_normal(p: vec3<f32>, eps: f32) -> vec3<f32> {
-    let dx = vec3<f32>(eps, 0.0, 0.0);
-    let dy = vec3<f32>(0.0, eps, 0.0);
-    let dz = vec3<f32>(0.0, 0.0, eps);
-    return normalize(vec3<f32>(
-        map(p + dx) - map(p - dx),
-        map(p + dy) - map(p - dy),
-        map(p + dz) - map(p - dz),
-    ));
+    let k = 0.5773502691896258; // 1/sqrt(3): unit-length tetrahedron vertex offset
+    let e1 = vec3<f32>(k, -k, -k) * eps;
+    let e2 = vec3<f32>(-k, -k, k) * eps;
+    let e3 = vec3<f32>(-k, k, -k) * eps;
+    let e4 = vec3<f32>(k, k, k) * eps;
+    return normalize(e1 * map(p + e1) + e2 * map(p + e2) + e3 * map(p + e3) + e4 * map(p + e4));
 }
 
 // Improved soft shadows via the closest-distance-to-the-cone technique
@@ -954,6 +979,12 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     var t = 0.0;
     var hit_frac = false;
     var iters = 0;
+    // Declared at this outer scope (not just `let`-bound inside the block
+    // below, where it's computed) because the AO term further down also
+    // needs it, well after this block closes -- default `FINE_MAX_STEPS`
+    // covers the `clip.x > clip.y` (no valid march at all) case too, where
+    // the block below never runs and AO's divisor still needs *some* value.
+    var fine_max_steps = FINE_MAX_STEPS;
     if (clip.x <= clip.y) {
         // MRRM (multi-resolution ray marching): start this march from the
         // coarse pre-pass's cached hit distance for this pixel instead of
@@ -994,10 +1025,10 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         // `scene.misc2.z`: `?perfprobe=`'s runtime fine-pass step-budget
         // override (`perfprobe.rs`) -- `0.0` (the default, and the only
         // value every non-probe run ever sees) means \"no override, use the
-        // full MAX_STEPS budget\"; a positive value clamps this march's
-        // step count for one probe window, to measure how much of the fine
-        // pass's GPU cost the step budget itself accounts for.
-        let fine_max_steps = select(MAX_STEPS, i32(scene.misc2.z), scene.misc2.z > 0.5);
+        // default FINE_MAX_STEPS budget\"; a positive value clamps this
+        // march's step count for one probe window, to measure how much of
+        // the fine pass's GPU cost the step budget itself accounts for.
+        fine_max_steps = select(FINE_MAX_STEPS, i32(scene.misc2.z), scene.misc2.z > 0.5);
         let march = march_scene(ro, rd, t0, pixel_angle, clip.y, fine_max_steps);
         t = march.t;
         hit_frac = march.hit;
@@ -1127,7 +1158,13 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
             sh = shadow(p + n * 2.0 * eps, scene.sun.xyz, pixel_angle);
         }
         let ambient = 0.3 + 0.4 * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0);
-        let ao = 1.0 - f32(iters) / f32(MAX_STEPS);
+        // Divides by `fine_max_steps` (the budget this specific march
+        // actually ran under), not the shared `MAX_STEPS` constant -- with
+        // `FINE_MAX_STEPS` now smaller than `MAX_STEPS`, and `?perfprobe=`'s
+        // override shrinking it further still, dividing by the wrong
+        // (larger) constant would cap this term well short of fully dark
+        // in deep recursive crevices, silently flattening AO contrast.
+        let ao = 1.0 - f32(iters) / f32(fine_max_steps);
         var color = base * (ambient + diffuse * sh) * ao;
         // Fades toward sky(rd) starting only past MAX_DIST * 0.5 (was
         // smoothstep(0.0, MAX_DIST, t), i.e. any hit at all started
@@ -1234,12 +1271,15 @@ pub fn generate_shader(obj: &Object) -> String {
 /// runs at `1/COARSE_ITERATION_DIVISOR` the fine pass's iteration count
 /// (floored at [`MIN_REPEAT_ITERATIONS`]) -- see
 /// [`CodeWriter::iteration_divisor`]'s doc for why neither pass needs full
-/// fractal fidelity. `2` is a starting point verified visually (not a
-/// derived constant): halving still leaves enough recursive detail for
-/// MRRM's warm-start guess and the shadow pass's occlusion test to track the
-/// fine pass's real surface closely, without paying for iterations whose
-/// effect is already sub-pixel at these passes' own coarser resolution.
-const COARSE_ITERATION_DIVISOR: i32 = 2;
+/// fractal fidelity. Raised from `2` to `3` this session, re-verified
+/// visually the same way the original `2` was (not a derived constant):
+/// still leaves enough recursive detail for MRRM's warm-start guess and the
+/// shadow pass's occlusion test to track the fine pass's real surface
+/// closely across the Menger scenes' corners/tunnels and the Demo scene, at
+/// several camera distances, without paying for iterations whose effect is
+/// already sub-pixel at these passes' own coarser resolution. Floored at
+/// [`MIN_REPEAT_ITERATIONS`] regardless, so this can't degenerate further.
+const COARSE_ITERATION_DIVISOR: i32 = 3;
 
 /// Full fragment shader for the app's MRRM *coarse* pre-pass (`mrrm.rs`):
 /// import line + bindings (no coarse-texture binding -- this pass doesn't
