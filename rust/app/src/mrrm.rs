@@ -391,12 +391,12 @@ pub fn update_coarse_material(
     windows: Query<&Window, With<PrimaryWindow>>,
     coarse_render_target: Res<CoarseRenderTarget>,
     quads: Query<&MeshMaterial2d<CoarseMarcherMaterial>, With<CoarseQuad>>,
-    gpu_writes: ResMut<crate::direct_gpu_writes::FrameGpuWrites>,
+    materials: ResMut<Assets<CoarseMarcherMaterial>>,
     mut timings: ResMut<crate::fps_overlay::PhaseTimings>,
 ) {
     let start = web_time::Instant::now();
     update_coarse_material_impl(
-        time, orbit, marble_state, scene_state, windows, coarse_render_target, quads, gpu_writes,
+        time, orbit, marble_state, scene_state, windows, coarse_render_target, quads, materials,
     );
     timings.record("coarse", start.elapsed());
 }
@@ -410,7 +410,7 @@ fn update_coarse_material_impl(
     windows: Query<&Window, With<PrimaryWindow>>,
     coarse_render_target: Res<CoarseRenderTarget>,
     quads: Query<&MeshMaterial2d<CoarseMarcherMaterial>, With<CoarseQuad>>,
-    mut gpu_writes: ResMut<crate::direct_gpu_writes::FrameGpuWrites>,
+    mut materials: ResMut<Assets<CoarseMarcherMaterial>>,
 ) {
     let t = time.elapsed_secs();
     let aspect = windows
@@ -422,13 +422,9 @@ fn update_coarse_material_impl(
     let marble = marble_state.local_marble();
     let (eye, right, up, forward) = orbit.eye_and_basis(marble.pos);
 
-    // `direct_gpu_writes` module doc: same-size content-only update, direct
-    // GPU write instead of `Assets<CoarseMarcherMaterial>::get_mut` (which
-    // was reallocating a fresh uniform buffer *and* bind group every frame).
     for mesh_material in &quads {
-        gpu_writes.coarse_scene = Some((
-            mesh_material.0.id(),
-            SceneUniforms {
+        if let Some(mat) = materials.get_mut(&mesh_material.0) {
+            mat.scene = SceneUniforms {
                 cam_pos: eye.extend(0.0),
                 cam_right: right.extend(0.0),
                 cam_up: up.extend(0.0),
@@ -436,8 +432,8 @@ fn update_coarse_material_impl(
                 misc: Vec4::new(aspect, t, coarse_height, 0.0),
                 bounding: scene_state.bounding_sphere,
                 ..SceneUniforms::default()
-            },
-        ));
+            };
+        }
     }
 }
 
