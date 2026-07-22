@@ -12,38 +12,25 @@
 //!   two separate generated shader modules instead of one shared one.
 //!
 //! Deviation from DESIGN.md §8: the design sketches `params` as a bare
-//! `Vec<Vec4>` field with `#[storage(1, read_only)]`. Neither that nor the
-//! `Handle<ShaderStorageBuffer>` indirection this used before are used
-//! anymore: all per-frame data (scene uniforms, params, marbles) now lives
-//! in `gpu::MarcherGpuBuffers` -- persistent GPU buffers written in place
-//! each frame with `queue.write_buffer` instead of round-tripping through
-//! `Assets` mutation (see `gpu.rs`'s module doc for why: the old
-//! `Assets`-mutation path was a confirmed, unbounded GPU resource leak --
-//! ~179 buffers/sec, ~359 bind groups/sec, zero destroys, measured directly
-//! against production). The materials here hand-implement `AsBindGroup` to
-//! bind those shared buffers, so a material asset is only ever *mutated*
-//! (and its bind group rebuilt) when a render-target texture handle changes
-//! (resize) or a storage buffer's element count genuinely changes (a
-//! multiplayer join growing the marble count, or a scene resync) -- see
-//! `update_frame_data`'s doc.
+//! `Vec<Vec4>` field with `#[storage(1, read_only)]`. In bevy_render
+//! 0.16.1 the `AsBindGroup` derive's non-`buffer` `storage(..)` arm only
+//! accepts a `Handle<ShaderStorageBuffer>` field (it looks up a GPU buffer
+//! asset by handle; see `bevy_render_macros::as_bind_group` and
+//! `bevy_render::storage::ShaderStorageBuffer`) — there is no derive path
+//! that turns an inline `Vec<Vec4>` field into a storage binding directly.
+//! So `params` here is a `Handle<ShaderStorageBuffer>`, and the per-frame
+//! system writes `Params::slots()` into that asset's bytes via
+//! `ShaderStorageBuffer::set_data` (still a pure buffer write, no shader
+//! recompile — the design's actual intent, just via an asset indirection).
 
 use bevy::asset::weak_handle;
-use bevy::ecs::system::lifetimeless::SRes;
-use bevy::ecs::system::SystemParamItem;
 use bevy::image::Image;
 use bevy::prelude::*;
-use bevy::render::render_asset::RenderAssets;
-use bevy::render::render_resource::binding_types::{
-    sampler, storage_buffer_read_only, texture_2d, texture_cube, uniform_buffer,
-};
 use bevy::render::render_resource::{
-    AsBindGroup, AsBindGroupError, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
-    BindGroupLayoutEntry, BindingResources, Extent3d, PreparedBindGroup, SamplerBindingType,
-    ShaderRef, ShaderStages, TextureDimension, TextureFormat, TextureSampleType,
-    TextureViewDescriptor, TextureViewDimension, UnpreparedBindGroup,
+    AsBindGroup, Extent3d, ShaderRef, TextureDimension, TextureFormat, TextureViewDescriptor,
+    TextureViewDimension,
 };
-use bevy::render::renderer::RenderDevice;
-use bevy::render::texture::GpuImage;
+use bevy::render::storage::ShaderStorageBuffer;
 use bevy::sprite::Material2d;
 use bevy::ui::IsDefaultUiCamera;
 use bevy::window::PrimaryWindow;
@@ -60,10 +47,7 @@ use marble_csg::scene_sync::SceneBundle;
 use marble_csg::{Object, Params, ScalarParam};
 
 use crate::camera::CameraOrbit;
-use crate::gpu::{MarcherFrameData, MarcherGpuBuffers};
-use crate::mrrm::{CoarseMarcherMaterial, CoarseQuad};
 use crate::physics_sys::{MarbleState, MultiplayerSession, PendingSceneSync};
-use crate::shadow_pass::{ShadowMarcherMaterial, ShadowQuad};
 
 /// Which scene to build, selected via
 /// `MM_SCENE=demo|classic_only|menger_sponge|menger_sphere|menger_oscillating_sphere`
@@ -316,105 +300,40 @@ pub struct MarcherCamera;
 #[derive(Component)]
 pub struct MarcherQuad;
 
-/// The fine (full-resolution) marcher's material. Bindings 0/1/4 (scene
-/// uniforms, params, marble list) come from `gpu::MarcherGpuBuffers`'s
-/// persistent shared buffers, not from fields on this struct -- see the
-/// hand-written [`AsBindGroup`] impl below and `gpu.rs`'s module doc. The
-/// remaining fields are the MRRM coarse pre-pass's cached hit-distance
-/// render target (`mrrm.rs`), the half-resolution shadow/AO pass's cached
-/// visibility (`shadow_pass.rs`), and the marble's cubemap texture
-/// (`MarbleCubemap`'s doc). `coarse`/`shadow` need no paired sampler: the
-/// generated shader only ever reads them with `textureLoad` (exact texel;
-/// `sample_shadow` does its own hand-rolled depth-aware 4-tap blend for the
-/// shadow one), never `textureSample`. `marble_texture` does need one --
-/// the shader samples it with `textureSample` (a filtered, direction-vector
-/// lookup), not `textureLoad` (`marble_csg::codegen::MARBLE_TEXTURE_BINDING`'s
-/// doc) -- bound from its own `GpuImage::sampler` below. Mutating any of
-/// these three handles (render-target resize, or the cubemap finishing its
-/// async load) is what re-prepares this material -- which is exactly the
-/// case where the bind group genuinely must be rebuilt (it holds the old
-/// texture's view). See `marble_csg::codegen::COARSE_TEXTURE_BINDING`'s doc
+/// The fine (full-resolution) marcher's material. Two bindings unchanged
+/// from pre-MRRM (`scene`/`params`), the MRRM coarse pre-pass's cached
+/// hit-distance render target (`mrrm.rs`) and the half-resolution shadow/AO
+/// pass's cached visibility (`shadow_pass.rs`) as a third and fourth -- no
+/// paired `#[sampler]` bindings: the generated shader only ever reads these
+/// textures with `textureLoad` (exact texel; `sample_shadow` does its own
+/// hand-rolled depth-aware 4-tap blend for the shadow one), never
+/// `textureSample`, so no sampler is needed at all -- and a fifth, the live
+/// marble list (multiplayer milestone 0, `marble_csg::codegen::MARBLE_BUFFER_BINDING`),
+/// mirroring `params`' own storage-buffer pattern rather than a fixed-size
+/// uniform array. See `marble_csg::codegen::COARSE_TEXTURE_BINDING`'s doc
 /// for a known, environment-specific (llvmpipe-only) crash this exact data
 /// flow triggers in this project's native test sandbox -- not a bug in this
 /// binding/shader.
-#[derive(Asset, TypePath, Clone)]
+#[derive(Asset, TypePath, AsBindGroup, Clone)]
 pub struct FineMarcherMaterial {
+    #[uniform(0)]
+    pub scene: SceneUniforms,
+    #[storage(1, read_only)]
+    pub params: Handle<ShaderStorageBuffer>,
+    #[texture(2)]
     pub coarse: Handle<Image>,
+    #[texture(3)]
     pub shadow: Handle<Image>,
+    #[storage(4, read_only)]
+    pub marbles: Handle<ShaderStorageBuffer>,
+    /// The marble's cubemap texture (`MarbleCubemap`'s doc) -- unlike
+    /// `coarse`/`shadow` this genuinely needs a paired `#[sampler]`: the
+    /// shader samples it with `textureSample` (a filtered, direction-vector
+    /// lookup), not `textureLoad`, so a real sampler binding is required,
+    /// not optional (`marble_csg::codegen::MARBLE_TEXTURE_BINDING`'s doc).
+    #[texture(5, dimension = "cube")]
+    #[sampler(6)]
     pub marble_texture: Handle<Image>,
-}
-
-impl AsBindGroup for FineMarcherMaterial {
-    type Data = ();
-    type Param = (SRes<MarcherGpuBuffers>, SRes<RenderAssets<GpuImage>>);
-
-    fn label() -> Option<&'static str> {
-        Some("fine_marcher_material")
-    }
-
-    fn as_bind_group(
-        &self,
-        layout: &BindGroupLayout,
-        render_device: &RenderDevice,
-        (buffers, images): &mut SystemParamItem<'_, '_, Self::Param>,
-    ) -> Result<PreparedBindGroup<Self::Data>, AsBindGroupError> {
-        // `RetryNextUpdate` until `gpu::write_marcher_buffers`'s first run
-        // has allocated the shared buffers and the render targets/cubemap
-        // exist as GPU images -- the material prepare machinery re-attempts
-        // next frame, so startup order isn't load-bearing here.
-        let scene = buffers.fine_scene.binding().ok_or(AsBindGroupError::RetryNextUpdate)?;
-        let params = buffers.params.binding().ok_or(AsBindGroupError::RetryNextUpdate)?;
-        let marbles = buffers.marbles.binding().ok_or(AsBindGroupError::RetryNextUpdate)?;
-        let coarse = images.get(&self.coarse).ok_or(AsBindGroupError::RetryNextUpdate)?;
-        let shadow = images.get(&self.shadow).ok_or(AsBindGroupError::RetryNextUpdate)?;
-        let marble_texture =
-            images.get(&self.marble_texture).ok_or(AsBindGroupError::RetryNextUpdate)?;
-        let bind_group = render_device.create_bind_group(
-            Self::label(),
-            layout,
-            &BindGroupEntries::with_indices((
-                (0, scene),
-                (1, params),
-                (2, &coarse.texture_view),
-                (3, &shadow.texture_view),
-                (4, marbles),
-                (5, &marble_texture.texture_view),
-                (6, &marble_texture.sampler),
-            )),
-        );
-        Ok(PreparedBindGroup { bindings: BindingResources(Vec::new()), bind_group, data: () })
-    }
-
-    fn unprepared_bind_group(
-        &self,
-        _layout: &BindGroupLayout,
-        _render_device: &RenderDevice,
-        _param: &mut SystemParamItem<'_, '_, Self::Param>,
-        _force_no_bindless: bool,
-    ) -> Result<UnpreparedBindGroup<Self::Data>, AsBindGroupError> {
-        // The shared-buffer bindings can't be expressed as owned resources;
-        // `as_bind_group` above is the real implementation.
-        Err(AsBindGroupError::CreateBindGroupDirectly)
-    }
-
-    fn bind_group_layout_entries(
-        _render_device: &RenderDevice,
-        _force_no_bindless: bool,
-    ) -> Vec<BindGroupLayoutEntry> {
-        BindGroupLayoutEntries::with_indices(
-            ShaderStages::FRAGMENT,
-            (
-                (0, uniform_buffer::<SceneUniforms>(false)),
-                (1, storage_buffer_read_only::<Vec<Vec4>>(false)),
-                (2, texture_2d(TextureSampleType::Float { filterable: true })),
-                (3, texture_2d(TextureSampleType::Float { filterable: true })),
-                (4, storage_buffer_read_only::<Vec<Vec4>>(false)),
-                (5, texture_cube(TextureSampleType::Float { filterable: true })),
-                (6, sampler(SamplerBindingType::Filtering)),
-            ),
-        )
-        .to_vec()
-    }
 }
 
 impl Material2d for FineMarcherMaterial {
@@ -604,6 +523,11 @@ pub struct SceneState {
     pub animations: Vec<(ScalarParam, Expr)>,
     pub handles: SceneHandles,
     pub material: Handle<FineMarcherMaterial>,
+    pub params_buffer: Handle<ShaderStorageBuffer>,
+    /// The live marble list (`FineMarcherMaterial::marbles`/
+    /// `MARBLE_BUFFER_BINDING`'s doc), rewritten every frame by
+    /// `update_material` from `MarbleState::marbles`.
+    pub marbles_buffer: Handle<ShaderStorageBuffer>,
     /// The scene's world-space bounding sphere (`object.bounding_sphere`),
     /// packed as `xyz = center, w = radius` (`w <= 0.0` means "no bound" --
     /// `bounding_sphere` returned `None`), computed once here at setup
@@ -612,9 +536,10 @@ pub struct SceneState {
     /// opt-in `MM_ANIMATE_FRACTAL`) only nudges `ang1` -- a `Fold::Rotate`
     /// angle, which `Fold::unfold_bounding_sphere` handles as an exact
     /// isometry regardless of angle, so the bound stays valid without
-    /// needing to be recomputed as that animates. [`update_frame_data`]
-    /// writes this same value into every pass's `SceneUniforms::bounding`
-    /// each frame.
+    /// needing to be recomputed as that animates. Every pass's material
+    /// writes this same value into its own `SceneUniforms::bounding` each
+    /// frame (`update_material`/`mrrm::update_coarse_material`/
+    /// `shadow_pass::update_shadow_material`).
     pub bounding_sphere: Vec4,
 }
 
@@ -646,6 +571,7 @@ pub fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<FineMarcherMaterial>>,
     mut shaders: ResMut<Assets<Shader>>,
+    mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
     mut camera_orbit: ResMut<CameraOrbit>,
     asset_server: Res<AssetServer>,
     mut images: ResMut<Assets<Image>>,
@@ -765,6 +691,7 @@ pub fn setup(
         Shader::from_wgsl(wgsl, "generated://marcher.wgsl"),
     );
 
+    let params_buffer = storage_buffers.add(ShaderStorageBuffer::from(params.slots().to_vec()));
     let bounding_sphere = pack_bounding_sphere(&object, &params);
 
     let spawn = kind.spawn_params();
@@ -791,6 +718,8 @@ pub fn setup(
         .iter()
         .map(|&start| Marble::spawn(start, spawn.rad))
         .collect();
+    let marbles_buffer = storage_buffers.add(ShaderStorageBuffer::from(pack_marbles(&marbles)));
+
     // `coarse`/`shadow: Handle::default()` are placeholders -- `mrrm::setup_mrrm_pipeline`
     // and `shadow_pass::setup_shadow_pipeline` (Startup systems chained to
     // run after this one) correct them to the real render targets once
@@ -806,24 +735,14 @@ pub fn setup(
     // later changes shape" issue that broke production once already).
     let marble_cubemap_handle: Handle<Image> = asset_server.load("marble_cubemap.png");
     let material = materials.add(FineMarcherMaterial {
+        scene: SceneUniforms::default(),
+        params: params_buffer.clone(),
         coarse: Handle::default(),
         shadow: Handle::default(),
+        marbles: marbles_buffer.clone(),
         marble_texture: images.add(make_placeholder_cubemap()),
     });
     commands.insert_resource(MarbleCubemap { loading: marble_cubemap_handle, done: false });
-
-    // Initial frame data: `update_frame_data` overwrites the uniforms every
-    // frame; params/marbles just need to carry the real initial contents so
-    // the very first `gpu::write_marcher_buffers` run allocates the storage
-    // buffers at their final starting sizes (see `gpu.rs`'s module doc for
-    // why growing past this later, e.g. a multiplayer join, is still safe).
-    commands.insert_resource(MarcherFrameData {
-        fine: SceneUniforms::default(),
-        coarse: SceneUniforms::default(),
-        shadow: SceneUniforms::default(),
-        params: params.slots().to_vec(),
-        marbles: pack_marbles(&marbles),
-    });
 
     // Renders straight to the primary window (no adaptive-resolution
     // render-to-texture indirection -- removed after it turned out to cause
@@ -848,6 +767,8 @@ pub fn setup(
         animations,
         handles,
         material,
+        params_buffer,
+        marbles_buffer,
         bounding_sphere,
     });
 
@@ -879,26 +800,12 @@ pub fn setup(
 /// this codebase (`net.rs`'s `decode_messages`): a malformed bundle can't
 /// happen between two clients running the same build, but silently ignoring
 /// one is a safer failure mode than trusting corrupt geometry.
-///
-/// Also force-touches all three materials (one no-op `Assets::get_mut` each)
-/// so their bind groups rebuild against `gpu::MarcherGpuBuffers::params`'s
-/// buffer object, in case the new scene's param count differs from the old
-/// one and `write_marcher_buffers` reallocated it underneath them (`gpu.rs`'s
-/// module doc) -- cheap and correct to do unconditionally here since a scene
-/// resync already forces a full shader regen (pipeline recompile) regardless,
-/// unlike the per-frame path this would be wasteful on.
-#[allow(clippy::too_many_arguments)]
 pub fn apply_pending_scene_sync(
     mut pending_scene: ResMut<PendingSceneSync>,
     mut scene_state: ResMut<SceneState>,
     mut mp: ResMut<MultiplayerSession>,
     mut shaders: ResMut<Assets<Shader>>,
-    mut frame: ResMut<MarcherFrameData>,
-    mut fine_materials: ResMut<Assets<FineMarcherMaterial>>,
-    mut coarse_materials: ResMut<Assets<CoarseMarcherMaterial>>,
-    mut shadow_materials: ResMut<Assets<ShadowMarcherMaterial>>,
-    coarse_quads: Query<&MeshMaterial2d<CoarseMarcherMaterial>, With<CoarseQuad>>,
-    shadow_quads: Query<&MeshMaterial2d<ShadowMarcherMaterial>, With<ShadowQuad>>,
+    mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
 ) {
     let Some(bytes) = pending_scene.0.take() else { return };
     let Some(bundle) = SceneBundle::from_bytes(&bytes) else {
@@ -909,30 +816,20 @@ pub fn apply_pending_scene_sync(
 
     let wgsl = generate_shader(&object);
     shaders.insert(MARCHER_SHADER_HANDLE.id(), Shader::from_wgsl(wgsl, "generated://marcher.wgsl"));
-    frame.params.clear();
-    frame.params.extend_from_slice(params.slots());
+    if let Some(buffer) = storage_buffers.get_mut(&scene_state.params_buffer) {
+        buffer.set_data(params.slots().to_vec());
+    }
     scene_state.bounding_sphere = pack_bounding_sphere(&object, &params);
     scene_state.object = object;
     scene_state.params = params;
     scene_state.animations = animations;
-
-    fine_materials.get_mut(&scene_state.material);
-    for mesh_material in &coarse_quads {
-        coarse_materials.get_mut(&mesh_material.0);
-    }
-    for mesh_material in &shadow_quads {
-        shadow_materials.get_mut(&mesh_material.0);
-    }
 
     mp.mark_scene_synced();
     info!("multiplayer: applied the host's authoritative scene sync");
 }
 
 /// Keeps the fullscreen quad's world size equal to the window's pixel size
-/// (robust across resizes -- DESIGN.md §8). Deref-muts the `Transform` only
-/// when the size actually differs, so change detection (and the transform
-/// propagation + re-extraction it triggers) stays quiet on the vast
-/// majority of frames where the window hasn't resized.
+/// every frame (cheap, robust across resizes — DESIGN.md §8).
 pub fn sync_quad_scale(
     windows: Query<&Window, With<PrimaryWindow>>,
     mut quads: Query<&mut Transform, With<MarcherQuad>>,
@@ -941,10 +838,8 @@ pub fn sync_quad_scale(
         return;
     };
     for mut transform in &mut quads {
-        if transform.scale.x != window.width() || transform.scale.y != window.height() {
-            transform.scale.x = window.width();
-            transform.scale.y = window.height();
-        }
+        transform.scale.x = window.width();
+        transform.scale.y = window.height();
     }
 }
 
@@ -960,47 +855,18 @@ pub fn sync_quad_scale(
 /// The capability itself is still exercised by other means (codegen tests,
 /// this same buffer-write path running every frame regardless for the
 /// marble's position/radius) without needing to visibly wreck the level.
-///
-/// Cached in a `OnceLock`: env vars can't change after process start, and
-/// this is read inside a per-frame system (`std::env::var` takes the
-/// process-env lock and allocates on every call).
 fn animate_fractal() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("MM_ANIMATE_FRACTAL").as_deref() == Ok("1"))
+    std::env::var("MM_ANIMATE_FRACTAL").as_deref() == Ok("1")
 }
 
-/// Per-frame system: writes the orbit camera basis (following the local
-/// player's marble), timing, the live marble list, and each pass's own
-/// target-resolution/flag lanes into [`MarcherFrameData`] -- plain CPU data
-/// that `gpu::write_marcher_buffers` uploads in place into persistent
-/// buffers (see `gpu.rs`). Replaces the three per-pass `update_material`/
-/// `update_coarse_material`/`update_shadow_material` systems that used to
-/// rewrite material assets (and thereby recreate buffers + bind groups)
-/// every frame; re-syncs fractal params only if `animate_fractal()` is
-/// enabled (otherwise the static params `setup()` wrote stay untouched,
-/// matching what the marbles' physics collides against).
-///
-/// All three passes share one camera basis (they render the same scene from
-/// the same eye) and differ only in their `misc`/`misc2` lanes:
-///  - `misc.z` is *each pass's own* render-target height (drives that
-///    pass's distance-scaled hit threshold/cone angle -- `codegen.rs`'s
-///    `MARCH_CORE`), so the coarse pass gets its coarse height, not the
-///    window's.
-///  - `misc.x` (aspect) is the *window's* aspect for every pass, not each
-///    target's own -- see `mrrm::update_coarse_material`'s old doc (kept
-///    below on the coarse branch) for why.
-///  - Only the fine pass gets sun/bg colors, the MRRM/shadow-LOD/perfprobe
-///    flags; the shadow pass gets the sun direction it marches toward.
-///
-/// Also detects a marble-count change (a multiplayer join growing the
-/// player count -- `physics_sys.rs`'s `RollbackSim::add_player_at`) and
-/// force-touches [`FineMarcherMaterial`] exactly then, so its bind group
-/// rebuilds against `gpu::MarcherGpuBuffers::marbles`'s buffer object once
-/// `write_marcher_buffers` reallocates it for the new (larger) marble list
-/// -- see `gpu.rs`'s module doc for why this is the one per-frame-reachable
-/// case the persistent-buffer design has to handle instead of asserting
-/// against.
-///
+/// Per-frame system: writes the orbit camera basis (now following the
+/// local player's marble), timing, and the live marble list into the
+/// material (DESIGN.md §7/§8); re-syncs fractal params only if
+/// `animate_fractal()` is enabled (otherwise the static params `setup()`
+/// wrote stay untouched, matching what the marbles' physics collides
+/// against).
+/// Thin timing wrapper -- see `fps_overlay::PhaseTimings`'s doc for exactly
+/// what this measures (CPU-side uniform computation, not GPU execution).
 /// Uses `web_time::Instant`, not `std::time::Instant`: the latter panics
 /// unconditionally on `wasm32-unknown-unknown` ("time not implemented on
 /// this platform" -- no OS clock on that target), which took production
@@ -1009,63 +875,50 @@ fn animate_fractal() -> bool {
 /// `Performance.now()` via `web_sys` on wasm, and is a transparent
 /// pass-through to real `std::time` everywhere else.
 #[allow(clippy::too_many_arguments)]
-pub fn update_frame_data(
+pub fn update_material(
     time: Res<Time>,
     orbit: Res<CameraOrbit>,
     marble_state: Res<MarbleState>,
     windows: Query<&Window, With<PrimaryWindow>>,
-    coarse_render_target: Res<crate::mrrm::CoarseRenderTarget>,
     shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
     perfprobe: Res<crate::perfprobe::PerfProbeState>,
     scene_state: ResMut<SceneState>,
-    frame: ResMut<MarcherFrameData>,
     materials: ResMut<Assets<FineMarcherMaterial>>,
+    storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
     mut timings: ResMut<crate::fps_overlay::PhaseTimings>,
 ) {
     let start = web_time::Instant::now();
-    update_frame_data_impl(
+    update_material_impl(
         time,
         orbit,
         marble_state,
         windows,
-        coarse_render_target,
         shadow_render_target,
         perfprobe,
         scene_state,
-        frame,
         materials,
+        storage_buffers,
     );
-    // One combined system now (three per-pass systems merged, `gpu.rs`'s
-    // module doc), but the debug overlay's existing "fine=/coarse=/shadow="
-    // readout stays meaningful by recording the same elapsed time under all
-    // three labels -- CPU-side uniform computation for all three passes
-    // genuinely does happen together now, so a per-pass split would just be
-    // reporting the same number three ways with extra bookkeeping.
-    let elapsed = start.elapsed();
-    timings.record("fine", elapsed);
-    timings.record("coarse", elapsed);
-    timings.record("shadow", elapsed);
+    timings.record("fine", start.elapsed());
 }
 
 #[allow(clippy::too_many_arguments)] // SystemParam count, unchanged from before the timing wrapper split
-fn update_frame_data_impl(
+fn update_material_impl(
     time: Res<Time>,
     orbit: Res<CameraOrbit>,
     marble_state: Res<MarbleState>,
     windows: Query<&Window, With<PrimaryWindow>>,
-    coarse_render_target: Res<crate::mrrm::CoarseRenderTarget>,
     shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
     perfprobe: Res<crate::perfprobe::PerfProbeState>,
     mut scene_state: ResMut<SceneState>,
-    mut frame: ResMut<MarcherFrameData>,
     mut materials: ResMut<Assets<FineMarcherMaterial>>,
+    mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
 ) {
     let t = time.elapsed_secs();
 
     // ang1 animation only applies to (and only makes sense for) the Classic
     // fractal tree the Demo scene builds; the static display fractals have
     // no such parameter.
-    let mut params_changed = false;
     if animate_fractal() {
         if let SceneHandles::Classic(handles) = &scene_state.handles {
             let ang1 = beware_of_bumps::ANG1 + 0.02 * (0.5 * t).sin();
@@ -1080,7 +933,9 @@ fn update_frame_data_impl(
                 beware_of_bumps::COLOR,
                 beware_of_bumps::ITERS,
             );
-            params_changed = true;
+            if let Some(buffer) = storage_buffers.get_mut(&scene_state.params_buffer) {
+                buffer.set_data(scene_state.params.slots().to_vec());
+            }
         }
     }
 
@@ -1089,15 +944,13 @@ fn update_frame_data_impl(
     // straight into `scene_state.params` (offline path directly, connected
     // path via `RollbackSim` -- see `SceneState::animations`'s doc for why
     // evaluation doesn't happen here). This system just has to get the
-    // result into `frame.params`; skipped entirely for scenes with no
-    // animations (the common case) rather than re-copying an unchanged
-    // slice every frame for no reason.
+    // result onto the GPU every frame; skipped entirely for scenes with no
+    // animations (the common case) rather than uploading an unchanged
+    // buffer every frame for no reason.
     if !scene_state.animations.is_empty() {
-        params_changed = true;
-    }
-    if params_changed {
-        frame.params.clear();
-        frame.params.extend_from_slice(scene_state.params.slots());
+        if let Some(buffer) = storage_buffers.get_mut(&scene_state.params_buffer) {
+            buffer.set_data(scene_state.params.slots().to_vec());
+        }
     }
 
     let (aspect, resolution_height) = windows
@@ -1110,70 +963,39 @@ fn update_frame_data_impl(
     let target = marble_state.local_marble().pos;
     let (eye, right, up, forward) = orbit.eye_and_basis(target);
 
-    let base = SceneUniforms {
-        cam_pos: eye.extend(0.0),
-        cam_right: right.extend(0.0),
-        cam_up: up.extend(0.0),
-        cam_forward: forward.extend(1.5),
-        bounding: scene_state.bounding_sphere,
-        ..SceneUniforms::default()
-    };
+    // Live marble list -> its storage buffer, every frame (multiplayer
+    // milestone 0 -- mirrors the params-buffer per-frame write pattern just
+    // above, same reasoning: a pure buffer write, no shader recompile).
+    if let Some(buffer) = storage_buffers.get_mut(&scene_state.marbles_buffer) {
+        buffer.set_data(pack_marbles(&marble_state.marbles));
+    }
 
-    frame.fine = SceneUniforms {
-        sun: beware_of_bumps::sun_dir().extend(0.0),
-        sun_col: beware_of_bumps::SUN_COL.extend(0.0),
-        bg_col: beware_of_bumps::BG.extend(0.0),
-        // w: MRRM on/off (`crate::mrrm::mrrm_enabled`) -- a uniform flag
-        // rather than skipping the coarse pass/texture binding entirely,
-        // so every frame's cameras/passes are identical whether MRRM is
-        // on or off and an `MM_MRRM=0` vs `MM_MRRM=1` A/B screenshot
-        // comparison at a fixed camera state only ever differs in this
-        // one value (see `mrrm::mrrm_enabled`'s doc).
-        misc: Vec4::new(aspect, t, resolution_height, if crate::mrrm::mrrm_enabled() { 1.0 } else { 0.0 }),
-        // x: the shadow pass's own render-target height (`sample_shadow`'s
-        // `sz` computation), y: `MM_SHADOW_LOD` on/off (same
-        // A/B-comparability reasoning as MRRM's `misc.w` above), z: the
-        // `?perfprobe=` diagnostic's fine-step-budget override.
-        misc2: Vec4::new(
-            shadow_render_target.size.y as f32,
-            if crate::shadow_pass::shadow_lod_enabled() { 1.0 } else { 0.0 },
-            perfprobe.fine_max_steps_override,
-            0.0,
-        ),
-        ..base
-    };
-
-    // `misc.x` (aspect) is the *window's* current size, not this pass's own
-    // (slightly different after integer-dividing by `COARSE_SCALE_DIVISOR`,
-    // e.g. a 540-tall window gives a 67-tall coarse target, a ~1%
-    // aspect-ratio drift from 540/8=67.5) -- using the window's aspect
-    // keeps every pass casting rays in matching directions for the same UV
-    // coordinate, which is what makes the coarse pass's hit distance a
-    // meaningful guess for the fine pixel at all; the resolution mismatch
-    // itself (many fine pixels per coarse texel) is already what the
-    // backed-off starting-`t` guess accounts for, so it doesn't need this
-    // aspect drift piled on top.
-    frame.coarse = SceneUniforms {
-        misc: Vec4::new(aspect, t, coarse_render_target.size.y as f32, 0.0),
-        ..base
-    };
-
-    frame.shadow = SceneUniforms {
-        sun: beware_of_bumps::sun_dir().extend(0.0),
-        misc: Vec4::new(aspect, t, shadow_render_target.size.y as f32, 0.0),
-        ..base
-    };
-
-    // Live marble list, every frame (multiplayer milestone 0) -- detect a
-    // count change (a join growing the player count) before overwriting, so
-    // the one material whose bind group references this buffer
-    // (`FineMarcherMaterial`; `Coarse`/`ShadowMarcherMaterial` don't bind
-    // marbles) gets force-touched exactly on that rare frame (see this fn's
-    // doc and `gpu.rs`'s module doc).
-    let marbles_len_changed = frame.marbles.len() != marble_state.marbles.len();
-    frame.marbles.clear();
-    frame.marbles.extend(marble_state.marbles.iter().map(|m| m.pos.extend(m.rad)));
-    if marbles_len_changed {
-        materials.get_mut(&scene_state.material);
+    if let Some(mat) = materials.get_mut(&scene_state.material) {
+        mat.scene = SceneUniforms {
+            cam_pos: eye.extend(0.0),
+            cam_right: right.extend(0.0),
+            cam_up: up.extend(0.0),
+            cam_forward: forward.extend(1.5),
+            sun: beware_of_bumps::sun_dir().extend(0.0),
+            sun_col: beware_of_bumps::SUN_COL.extend(0.0),
+            bg_col: beware_of_bumps::BG.extend(0.0),
+            // w: MRRM on/off (`crate::mrrm::mrrm_enabled`) -- a uniform flag
+            // rather than skipping the coarse pass/texture binding entirely,
+            // so every frame's cameras/passes are identical whether MRRM is
+            // on or off and an `MM_MRRM=0` vs `MM_MRRM=1` A/B screenshot
+            // comparison at a fixed camera state only ever differs in this
+            // one value (see `mrrm::mrrm_enabled`'s doc).
+            misc: Vec4::new(aspect, t, resolution_height, if crate::mrrm::mrrm_enabled() { 1.0 } else { 0.0 }),
+            // x: the shadow pass's own render-target height (`sample_shadow`'s
+            // `sz` computation), y: `MM_SHADOW_LOD` on/off (same
+            // A/B-comparability reasoning as MRRM's `misc.w` above).
+            misc2: Vec4::new(
+                shadow_render_target.size.y as f32,
+                if crate::shadow_pass::shadow_lod_enabled() { 1.0 } else { 0.0 },
+                perfprobe.fine_max_steps_override,
+                0.0,
+            ),
+            bounding: scene_state.bounding_sphere,
+        };
     }
 }

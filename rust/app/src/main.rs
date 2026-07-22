@@ -10,7 +10,6 @@ mod camera;
 mod debug_gizmos;
 mod debug_screenshot;
 mod fps_overlay;
-mod gpu;
 mod mrrm;
 mod net;
 mod perfprobe;
@@ -28,16 +27,21 @@ use camera::{orbit_camera_input, CameraOrbit};
 use debug_gizmos::draw_thrust_debug;
 use debug_screenshot::DebugScreenshotPlugin;
 use fps_overlay::{debug_enabled, FpsOverlayPlugin};
-use gpu::MarcherGpuPlugin;
-use mrrm::{resize_coarse_render_target, setup_mrrm_pipeline, sync_coarse_quad_scale, CoarseMarcherMaterial};
+use mrrm::{
+    resize_coarse_render_target, setup_mrrm_pipeline, sync_coarse_quad_scale,
+    update_coarse_material, CoarseMarcherMaterial,
+};
 use net::{
     handle_copy_button_click, poll_net_status, setup_networking, spawn_net_ui, sync_net_ui_text,
     update_copy_button_visibility, update_copy_feedback, CopyFeedback,
 };
 use perfprobe::{perfprobe_tick, spawn_perfprobe_overlay, update_perfprobe_overlay_text, PerfProbeState};
 use physics_sys::{marble_physics_tick, PendingSceneSync};
-use render::{apply_pending_scene_sync, finalize_marble_cubemap, setup, sync_quad_scale, update_frame_data, FineMarcherMaterial};
-use shadow_pass::{resize_shadow_render_target, setup_shadow_pipeline, sync_shadow_quad_scale, ShadowMarcherMaterial};
+use render::{apply_pending_scene_sync, finalize_marble_cubemap, setup, sync_quad_scale, update_material, FineMarcherMaterial};
+use shadow_pass::{
+    resize_shadow_render_target, setup_shadow_pipeline, sync_shadow_quad_scale,
+    update_shadow_material, ShadowMarcherMaterial,
+};
 use touch::{touch_camera_input, TouchDebugInfo};
 
 /// `MM_WINDOW_SIZE=WxH` overrides the window's starting resolution — mainly
@@ -84,11 +88,6 @@ fn main() {
             }),
             ..default()
         }))
-        // `MarcherGpuPlugin` owns the persistent per-frame GPU buffers every
-        // material's bind group references (gpu.rs) -- added before the
-        // material plugins so the buffers resource exists whenever a
-        // material prepare system first runs.
-        .add_plugins(MarcherGpuPlugin)
         .add_plugins(Material2dPlugin::<FineMarcherMaterial>::default())
         .add_plugins(Material2dPlugin::<CoarseMarcherMaterial>::default())
         .add_plugins(Material2dPlugin::<ShadowMarcherMaterial>::default())
@@ -146,12 +145,9 @@ fn main() {
                 // changes need to apply on the same frame they happen, not one
                 // frame late (see `perfprobe::perfprobe_tick`'s doc).
                 perfprobe_tick,
-                // Writes all three passes' uniforms + the marble list into
-                // `MarcherFrameData` (render.rs) -- replaced the three
-                // per-pass `update_material`/`update_coarse_material`/
-                // `update_shadow_material` systems when per-frame data moved
-                // to persistent GPU buffers (gpu.rs).
-                update_frame_data,
+                update_material,
+                update_coarse_material,
+                update_shadow_material,
                 update_perfprobe_overlay_text,
                 draw_thrust_debug.run_if(debug_enabled),
                 poll_net_status,

@@ -20,30 +20,23 @@
 //! reasoning as `mrrm.rs`'s module doc.
 
 use bevy::asset::weak_handle;
-use bevy::ecs::system::lifetimeless::SRes;
-use bevy::ecs::system::SystemParamItem;
 use bevy::image::Image;
 use bevy::prelude::*;
 use bevy::render::camera::RenderTarget;
-use bevy::render::render_asset::RenderAssets;
-use bevy::render::render_resource::binding_types::{
-    storage_buffer_read_only, texture_2d, uniform_buffer,
-};
 use bevy::render::render_resource::{
-    AsBindGroup, AsBindGroupError, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
-    BindGroupLayoutEntry, BindingResources, Extent3d, PreparedBindGroup, ShaderRef, ShaderStages,
-    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, UnpreparedBindGroup,
+    AsBindGroup, Extent3d, ShaderRef, TextureDimension, TextureFormat, TextureUsages,
 };
-use bevy::render::renderer::RenderDevice;
-use bevy::render::texture::GpuImage;
+use bevy::render::storage::ShaderStorageBuffer;
 use bevy::render::view::RenderLayers;
 use bevy::sprite::Material2d;
 use bevy::window::PrimaryWindow;
 
 use marble_csg::codegen::generate_shadow_shader;
+use marble_csg::scenes::beware_of_bumps;
 
-use crate::gpu::MarcherGpuBuffers;
+use crate::camera::CameraOrbit;
 use crate::mrrm::CoarseRenderTarget;
+use crate::physics_sys::MarbleState;
 use crate::render::{SceneState, SceneUniforms};
 
 /// All shadow-pass entities (camera + quad) live on this layer -- distinct
@@ -95,72 +88,20 @@ pub fn shadow_target_size(window_size: UVec2) -> UVec2 {
 const SHADOW_MARCHER_SHADER_HANDLE: Handle<Shader> =
     weak_handle!("9d3e5a71-2f84-4b6c-9a1d-7c5e8f0b2d4a");
 
-/// The shadow pass's own material: bindings 0/1 (scene/params) come from
-/// `gpu::MarcherGpuBuffers`'s persistent shared buffers (see `gpu.rs`); the
-/// only field left is MRRM's coarse hit-distance texture (binding 2, this
+/// The shadow pass's own material: `scene`/`params` (bindings 0/1, same as
+/// every pass) plus MRRM's coarse hit-distance texture (binding 2, this
 /// pass's own warm-start source -- same bind-group shape `FineMarcherMaterial`
 /// had before it also grew a `shadow` binding, see `generate_shadow_shader`'s
 /// doc for why this still needs its own `Material2d`/shader module rather
-/// than reusing either the coarse or fine one). Mutating `coarse` (MRRM's
-/// render target resizing) is the only thing that re-prepares this
-/// material now.
-#[derive(Asset, TypePath, Clone)]
+/// than reusing either the coarse or fine one).
+#[derive(Asset, TypePath, AsBindGroup, Clone)]
 pub struct ShadowMarcherMaterial {
+    #[uniform(0)]
+    pub scene: SceneUniforms,
+    #[storage(1, read_only)]
+    pub params: Handle<ShaderStorageBuffer>,
+    #[texture(2)]
     pub coarse: Handle<Image>,
-}
-
-impl AsBindGroup for ShadowMarcherMaterial {
-    type Data = ();
-    type Param = (SRes<MarcherGpuBuffers>, SRes<RenderAssets<GpuImage>>);
-
-    fn label() -> Option<&'static str> {
-        Some("shadow_marcher_material")
-    }
-
-    fn as_bind_group(
-        &self,
-        layout: &BindGroupLayout,
-        render_device: &RenderDevice,
-        (buffers, images): &mut SystemParamItem<'_, '_, Self::Param>,
-    ) -> Result<PreparedBindGroup<Self::Data>, AsBindGroupError> {
-        // `RetryNextUpdate` until `gpu::write_marcher_buffers`'s first run
-        // has allocated the shared buffers and the coarse render target
-        // exists as a GPU image (render.rs's fine impl doc).
-        let scene = buffers.shadow_scene.binding().ok_or(AsBindGroupError::RetryNextUpdate)?;
-        let params = buffers.params.binding().ok_or(AsBindGroupError::RetryNextUpdate)?;
-        let coarse = images.get(&self.coarse).ok_or(AsBindGroupError::RetryNextUpdate)?;
-        let bind_group = render_device.create_bind_group(
-            Self::label(),
-            layout,
-            &BindGroupEntries::with_indices(((0, scene), (1, params), (2, &coarse.texture_view))),
-        );
-        Ok(PreparedBindGroup { bindings: BindingResources(Vec::new()), bind_group, data: () })
-    }
-
-    fn unprepared_bind_group(
-        &self,
-        _layout: &BindGroupLayout,
-        _render_device: &RenderDevice,
-        _param: &mut SystemParamItem<'_, '_, Self::Param>,
-        _force_no_bindless: bool,
-    ) -> Result<UnpreparedBindGroup<Self::Data>, AsBindGroupError> {
-        Err(AsBindGroupError::CreateBindGroupDirectly)
-    }
-
-    fn bind_group_layout_entries(
-        _render_device: &RenderDevice,
-        _force_no_bindless: bool,
-    ) -> Vec<BindGroupLayoutEntry> {
-        BindGroupLayoutEntries::with_indices(
-            ShaderStages::FRAGMENT,
-            (
-                (0, uniform_buffer::<SceneUniforms>(false)),
-                (1, storage_buffer_read_only::<Vec<Vec4>>(false)),
-                (2, texture_2d(TextureSampleType::Float { filterable: true })),
-            ),
-        )
-        .to_vec()
-    }
 }
 
 impl Material2d for ShadowMarcherMaterial {
@@ -256,8 +197,11 @@ pub fn setup_shadow_pipeline(
         fine_material.shadow = image_handle.clone();
     }
 
-    let shadow_material =
-        shadow_materials.add(ShadowMarcherMaterial { coarse: coarse_render_target.image.clone() });
+    let shadow_material = shadow_materials.add(ShadowMarcherMaterial {
+        scene: SceneUniforms::default(),
+        params: scene_state.params_buffer.clone(),
+        coarse: coarse_render_target.image.clone(),
+    });
 
     commands.spawn((
         Camera2d,
@@ -317,20 +261,13 @@ pub fn resize_shadow_render_target(
     let native_size = UVec2::new(window.physical_width().max(1), window.physical_height().max(1));
     let desired = shadow_target_size(native_size);
 
-    // Keep the `coarse` binding current (MRRM's own render target is
-    // rebuilt independently on its own resize schedule) -- but check with
-    // an immutable `get` first: an unconditional `get_mut` marks the
-    // material asset modified every frame, which re-runs its whole
-    // bind-group preparation (`gpu.rs`'s module doc) for what is a no-op
-    // write on every frame that isn't an actual resize.
+    // Always keep the `coarse` binding current (MRRM's own render target is
+    // rebuilt independently on its own resize schedule) -- cheap (a handle
+    // clone + possible no-op `Assets` write), and simpler than trying to
+    // coordinate two independent resize systems' ordering.
     for shadow_quad in &shadow_quads {
-        let stale = shadow_materials
-            .get(&shadow_quad.0)
-            .is_some_and(|mat| mat.coarse != coarse_render_target.image);
-        if stale {
-            if let Some(mat) = shadow_materials.get_mut(&shadow_quad.0) {
-                mat.coarse = coarse_render_target.image.clone();
-            }
+        if let Some(mat) = shadow_materials.get_mut(&shadow_quad.0) {
+            mat.coarse = coarse_render_target.image.clone();
         }
     }
 
@@ -355,17 +292,77 @@ pub fn resize_shadow_render_target(
 }
 
 /// Keeps the shadow quad's world size equal to its own render target's pixel
-/// size -- mirrors `mrrm::sync_coarse_quad_scale`, including its
-/// "deref-mut only on a real change" guard.
+/// size every frame -- mirrors `mrrm::sync_coarse_quad_scale`.
 pub fn sync_shadow_quad_scale(
     render_target: Res<ShadowRenderTarget>,
     mut quads: Query<&mut Transform, With<ShadowQuad>>,
 ) {
-    let (w, h) = (render_target.size.x as f32, render_target.size.y as f32);
     for mut transform in &mut quads {
-        if transform.scale.x != w || transform.scale.y != h {
-            transform.scale.x = w;
-            transform.scale.y = h;
+        transform.scale.x = render_target.size.x as f32;
+        transform.scale.y = render_target.size.y as f32;
+    }
+}
+
+/// `Update` system: writes the shadow pass's own `SceneUniforms` each frame
+/// -- same camera basis as `render::update_material`/`mrrm::update_coarse_material`
+/// (every pass renders the same scene from the same camera), but `misc.z`
+/// is *this* pass's own render-target height, and `bounding` is the scene's
+/// bounding sphere (`ray_sphere_clip`'s pre-test, same value every pass
+/// writes -- `SceneState::bounding_sphere`'s doc).
+#[allow(clippy::too_many_arguments)]
+/// Thin timing wrapper -- see `fps_overlay::PhaseTimings`'s doc for exactly
+/// what this measures (CPU-side uniform computation, not GPU execution).
+pub fn update_shadow_material(
+    time: Res<Time>,
+    orbit: Res<CameraOrbit>,
+    marble_state: Res<MarbleState>,
+    scene_state: Res<SceneState>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    shadow_render_target: Res<ShadowRenderTarget>,
+    quads: Query<&MeshMaterial2d<ShadowMarcherMaterial>, With<ShadowQuad>>,
+    materials: ResMut<Assets<ShadowMarcherMaterial>>,
+    mut timings: ResMut<crate::fps_overlay::PhaseTimings>,
+) {
+    let start = web_time::Instant::now();
+    update_shadow_material_impl(
+        time, orbit, marble_state, scene_state, windows, shadow_render_target, quads, materials,
+    );
+    timings.record("shadow", start.elapsed());
+}
+
+#[allow(clippy::too_many_arguments)] // SystemParam count, unchanged from before the timing wrapper split
+fn update_shadow_material_impl(
+    time: Res<Time>,
+    orbit: Res<CameraOrbit>,
+    marble_state: Res<MarbleState>,
+    scene_state: Res<SceneState>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    shadow_render_target: Res<ShadowRenderTarget>,
+    quads: Query<&MeshMaterial2d<ShadowMarcherMaterial>, With<ShadowQuad>>,
+    mut materials: ResMut<Assets<ShadowMarcherMaterial>>,
+) {
+    let t = time.elapsed_secs();
+    let aspect = windows
+        .single()
+        .map(|w| w.width() / w.height().max(1.0))
+        .unwrap_or(1.0);
+    let shadow_height = shadow_render_target.size.y as f32;
+
+    let marble = marble_state.local_marble();
+    let (eye, right, up, forward) = orbit.eye_and_basis(marble.pos);
+
+    for mesh_material in &quads {
+        if let Some(mat) = materials.get_mut(&mesh_material.0) {
+            mat.scene = SceneUniforms {
+                cam_pos: eye.extend(0.0),
+                cam_right: right.extend(0.0),
+                cam_up: up.extend(0.0),
+                cam_forward: forward.extend(1.5),
+                sun: beware_of_bumps::sun_dir().extend(0.0),
+                misc: Vec4::new(aspect, t, shadow_height, 0.0),
+                bounding: scene_state.bounding_sphere,
+                ..SceneUniforms::default()
+            };
         }
     }
 }

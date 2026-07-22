@@ -38,25 +38,21 @@
 //! vice versa).
 
 use bevy::asset::weak_handle;
-use bevy::ecs::system::lifetimeless::SRes;
-use bevy::ecs::system::SystemParamItem;
 use bevy::image::Image;
 use bevy::prelude::*;
 use bevy::render::camera::RenderTarget;
-use bevy::render::render_resource::binding_types::{storage_buffer_read_only, uniform_buffer};
 use bevy::render::render_resource::{
-    AsBindGroup, AsBindGroupError, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
-    BindGroupLayoutEntry, BindingResources, Extent3d, PreparedBindGroup, ShaderRef, ShaderStages,
-    TextureDimension, TextureFormat, TextureUsages, UnpreparedBindGroup,
+    AsBindGroup, Extent3d, ShaderRef, TextureDimension, TextureFormat, TextureUsages,
 };
-use bevy::render::renderer::RenderDevice;
+use bevy::render::storage::ShaderStorageBuffer;
 use bevy::render::view::RenderLayers;
 use bevy::sprite::Material2d;
 use bevy::window::PrimaryWindow;
 
 use marble_csg::codegen::generate_coarse_shader;
 
-use crate::gpu::MarcherGpuBuffers;
+use crate::camera::CameraOrbit;
+use crate::physics_sys::MarbleState;
 use crate::render::{SceneState, SceneUniforms};
 
 /// All MRRM coarse-pass entities (camera + quad) live on this layer --
@@ -112,70 +108,19 @@ pub fn coarse_target_size(window_size: UVec2) -> UVec2 {
 const COARSE_MARCHER_SHADER_HANDLE: Handle<Shader> =
     weak_handle!("6f1a2c3d-6a10-4f9a-8b7d-2a6b0c9f5e21");
 
-/// The MRRM coarse pass's own material: bindings 0/1 (scene/params) come
-/// from `gpu::MarcherGpuBuffers`'s persistent shared buffers (see
-/// `gpu.rs`) -- no `coarse_tex` binding (this pass doesn't read its own
-/// output), so this is a genuinely different bind-group layout from the
-/// fine pass's, hence a separate `Material2d` struct/generated shader
-/// module rather than a second entry point sharing one (see
-/// `marble_csg::codegen::COARSE_MARCHER`'s doc for why the module itself
-/// is also separate, not just the entry point).
-///
-/// Fieldless: both bindings come from the shared buffers, so this material
-/// is never mutated after setup and its bind group is created exactly
-/// once.
-#[derive(Asset, TypePath, Clone)]
-pub struct CoarseMarcherMaterial {}
-
-impl AsBindGroup for CoarseMarcherMaterial {
-    type Data = ();
-    type Param = SRes<MarcherGpuBuffers>;
-
-    fn label() -> Option<&'static str> {
-        Some("coarse_marcher_material")
-    }
-
-    fn as_bind_group(
-        &self,
-        layout: &BindGroupLayout,
-        render_device: &RenderDevice,
-        buffers: &mut SystemParamItem<'_, '_, Self::Param>,
-    ) -> Result<PreparedBindGroup<Self::Data>, AsBindGroupError> {
-        // `RetryNextUpdate` until `gpu::write_marcher_buffers`'s first run
-        // has allocated the shared buffers (render.rs's fine impl doc).
-        let scene = buffers.coarse_scene.binding().ok_or(AsBindGroupError::RetryNextUpdate)?;
-        let params = buffers.params.binding().ok_or(AsBindGroupError::RetryNextUpdate)?;
-        let bind_group = render_device.create_bind_group(
-            Self::label(),
-            layout,
-            &BindGroupEntries::with_indices(((0, scene), (1, params))),
-        );
-        Ok(PreparedBindGroup { bindings: BindingResources(Vec::new()), bind_group, data: () })
-    }
-
-    fn unprepared_bind_group(
-        &self,
-        _layout: &BindGroupLayout,
-        _render_device: &RenderDevice,
-        _param: &mut SystemParamItem<'_, '_, Self::Param>,
-        _force_no_bindless: bool,
-    ) -> Result<UnpreparedBindGroup<Self::Data>, AsBindGroupError> {
-        Err(AsBindGroupError::CreateBindGroupDirectly)
-    }
-
-    fn bind_group_layout_entries(
-        _render_device: &RenderDevice,
-        _force_no_bindless: bool,
-    ) -> Vec<BindGroupLayoutEntry> {
-        BindGroupLayoutEntries::with_indices(
-            ShaderStages::FRAGMENT,
-            (
-                (0, uniform_buffer::<SceneUniforms>(false)),
-                (1, storage_buffer_read_only::<Vec<Vec4>>(false)),
-            ),
-        )
-        .to_vec()
-    }
+/// The MRRM coarse pass's own material: just `scene`/`params` (identical
+/// bindings 0/1 to `FineMarcherMaterial`) -- no `coarse_tex` binding (this
+/// pass doesn't read its own output), so this is a genuinely different
+/// bind-group layout from the fine pass's, hence a separate `Material2d`
+/// struct/generated shader module rather than a second entry point sharing
+/// one (see `marble_csg::codegen::COARSE_MARCHER`'s doc for why the module
+/// itself is also separate, not just the entry point).
+#[derive(Asset, TypePath, AsBindGroup, Clone)]
+pub struct CoarseMarcherMaterial {
+    #[uniform(0)]
+    pub scene: SceneUniforms,
+    #[storage(1, read_only)]
+    pub params: Handle<ShaderStorageBuffer>,
 }
 
 impl Material2d for CoarseMarcherMaterial {
@@ -313,7 +258,10 @@ pub fn setup_mrrm_pipeline(
         fine_material.coarse = image_handle.clone();
     }
 
-    let coarse_material = coarse_materials.add(CoarseMarcherMaterial {});
+    let coarse_material = coarse_materials.add(CoarseMarcherMaterial {
+        scene: SceneUniforms::default(),
+        params: scene_state.params_buffer.clone(),
+    });
 
     commands.spawn((
         Camera2d,
@@ -403,18 +351,88 @@ pub fn resize_coarse_render_target(
 }
 
 /// Keeps the coarse quad's world size equal to its own render target's
-/// pixel size -- mirrors `render::sync_quad_scale` for the fine
-/// quad/target, including its "deref-mut only on a real change" guard (the
-/// target size only changes on a window resize).
+/// pixel size every frame -- mirrors `render::sync_quad_scale` for the fine
+/// quad/target.
 pub fn sync_coarse_quad_scale(
     render_target: Res<CoarseRenderTarget>,
     mut quads: Query<&mut Transform, With<CoarseQuad>>,
 ) {
-    let (w, h) = (render_target.size.x as f32, render_target.size.y as f32);
     for mut transform in &mut quads {
-        if transform.scale.x != w || transform.scale.y != h {
-            transform.scale.x = w;
-            transform.scale.y = h;
+        transform.scale.x = render_target.size.x as f32;
+        transform.scale.y = render_target.size.y as f32;
+    }
+}
+
+/// `Update` system: writes the coarse pass's own `SceneUniforms` each frame
+/// -- same camera basis as `render::update_material` (both passes render
+/// the same scene from the same camera), but `misc.z` is *this* pass's own
+/// render-target height (`coarse_render_target.size.y`), not the fine
+/// pass's, so its shader's cone-angle threshold (`marble_csg::codegen`'s
+/// `COARSE_MARCHER`) matches its own, much coarser, resolution.
+///
+/// `misc.x` (aspect) is taken from the *window's* current size, not this
+/// pass's own (slightly different after integer-dividing by
+/// `COARSE_SCALE_DIVISOR`, e.g. a 540-tall window gives a 67-tall coarse
+/// target, a ~1% aspect-ratio drift from 540/8=67.5) -- using the window's
+/// aspect keeps both passes casting rays in matching directions for the
+/// same UV coordinate, which is what makes the coarse pass's hit distance a
+/// meaningful guess for the fine pixel at all; the resolution mismatch
+/// itself (many fine pixels per coarse texel) is already what the backed-off
+/// starting-`t` guess in `render.rs`'s `fragment` accounts for, so it
+/// doesn't need this aspect drift piled on top.
+#[allow(clippy::too_many_arguments)]
+/// Thin timing wrapper -- see `fps_overlay::PhaseTimings`'s doc for exactly
+/// what this measures (CPU-side uniform computation, not GPU execution).
+pub fn update_coarse_material(
+    time: Res<Time>,
+    orbit: Res<CameraOrbit>,
+    marble_state: Res<MarbleState>,
+    scene_state: Res<SceneState>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    coarse_render_target: Res<CoarseRenderTarget>,
+    quads: Query<&MeshMaterial2d<CoarseMarcherMaterial>, With<CoarseQuad>>,
+    materials: ResMut<Assets<CoarseMarcherMaterial>>,
+    mut timings: ResMut<crate::fps_overlay::PhaseTimings>,
+) {
+    let start = web_time::Instant::now();
+    update_coarse_material_impl(
+        time, orbit, marble_state, scene_state, windows, coarse_render_target, quads, materials,
+    );
+    timings.record("coarse", start.elapsed());
+}
+
+#[allow(clippy::too_many_arguments)] // SystemParam count, unchanged from before the timing wrapper split
+fn update_coarse_material_impl(
+    time: Res<Time>,
+    orbit: Res<CameraOrbit>,
+    marble_state: Res<MarbleState>,
+    scene_state: Res<SceneState>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    coarse_render_target: Res<CoarseRenderTarget>,
+    quads: Query<&MeshMaterial2d<CoarseMarcherMaterial>, With<CoarseQuad>>,
+    mut materials: ResMut<Assets<CoarseMarcherMaterial>>,
+) {
+    let t = time.elapsed_secs();
+    let aspect = windows
+        .single()
+        .map(|w| w.width() / w.height().max(1.0))
+        .unwrap_or(1.0);
+    let coarse_height = coarse_render_target.size.y as f32;
+
+    let marble = marble_state.local_marble();
+    let (eye, right, up, forward) = orbit.eye_and_basis(marble.pos);
+
+    for mesh_material in &quads {
+        if let Some(mat) = materials.get_mut(&mesh_material.0) {
+            mat.scene = SceneUniforms {
+                cam_pos: eye.extend(0.0),
+                cam_right: right.extend(0.0),
+                cam_up: up.extend(0.0),
+                cam_forward: forward.extend(1.5),
+                misc: Vec4::new(aspect, t, coarse_height, 0.0),
+                bounding: scene_state.bounding_sphere,
+                ..SceneUniforms::default()
+            };
         }
     }
 }
