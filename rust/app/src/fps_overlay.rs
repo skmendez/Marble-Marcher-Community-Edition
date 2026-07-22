@@ -291,7 +291,7 @@ fn spawn_fps_overlay(mut commands: Commands, config: Res<crate::config::Config>)
                     ..default()
                 },
                 TextColor(Color::srgb(0.75, 0.75, 0.75)),
-                RenderResolutionText,
+                RenderResolutionText::default(),
             ));
         });
 }
@@ -302,23 +302,31 @@ fn spawn_fps_overlay(mut commands: Commands, config: Res<crate::config::Config>)
 /// indirection" note), but this line exists now so the upcoming adaptive
 /// resolution work (perf plan milestone 5) has a place to show the real,
 /// possibly-scaled-down render target size instead of just the window size.
-#[derive(Component)]
-struct RenderResolutionText;
+/// Caches the last-seen `(width, height)` so `update_render_resolution_text`
+/// can skip the `format!` call entirely on the (vast majority of) frames
+/// where the resolution hasn't actually changed, not just skip the `Text`
+/// write -- this value only ever changes on a real window resize.
+#[derive(Component, Default)]
+struct RenderResolutionText {
+    last_size: Option<(u32, u32)>,
+}
 
 fn update_render_resolution_text(
     windows: Query<&Window, With<PrimaryWindow>>,
-    mut text: Query<&mut Text, With<RenderResolutionText>>,
+    mut text: Query<(&mut Text, &mut RenderResolutionText)>,
 ) {
-    let Ok(mut text) = text.single_mut() else {
+    let Ok((mut text, mut state)) = text.single_mut() else {
         return;
     };
     let Ok(window) = windows.single() else {
         return;
     };
-    let new_text = format!("render: {}x{}", window.physical_width(), window.physical_height());
-    if text.0 != new_text {
-        text.0 = new_text;
+    let size = (window.physical_width(), window.physical_height());
+    if state.last_size == Some(size) {
+        return;
     }
+    state.last_size = Some(size);
+    text.0 = format!("render: {}x{}", size.0, size.1);
 }
 
 fn update_phase_timings_text(

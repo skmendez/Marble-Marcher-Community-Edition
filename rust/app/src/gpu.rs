@@ -128,8 +128,18 @@ pub fn write_marcher_buffers(
     buffers.fine_scene.set(frame.fine);
     buffers.coarse_scene.set(frame.coarse);
     buffers.shadow_scene.set(frame.shadow);
-    buffers.params.set(frame.params.clone());
-    buffers.marbles.set(frame.marbles.clone());
+    // `get_mut` + `clear`/`extend_from_slice` instead of `set(frame.params
+    // .clone())`: `frame` (the extracted `MarcherFrameData`) is already one
+    // fresh clone of the main world's data made moments ago by
+    // `ExtractResourcePlugin`; `.set(...clone())` here would be a *second*
+    // full alloc+copy+free of the same bytes every frame, discarding
+    // `buffers.params`'s own already-allocated storage instead of reusing
+    // it. This keeps that storage's capacity across frames (steady-state:
+    // zero allocations once the vecs have grown to their working size).
+    buffers.params.get_mut().clear();
+    buffers.params.get_mut().extend_from_slice(&frame.params);
+    buffers.marbles.get_mut().clear();
+    buffers.marbles.get_mut().extend_from_slice(&frame.marbles);
 
     buffers.fine_scene.write_buffer(&device, &queue);
     buffers.coarse_scene.write_buffer(&device, &queue);
