@@ -246,7 +246,11 @@ mod scene_uniforms_impl {
         /// computation, mirroring how `misc.z` threads the coarse pass's own
         /// resolution into the fine pass's MRRM back-off), y `MM_SHADOW_LOD`
         /// on/off flag (same uniform-flag convention as `misc.w`'s MRRM
-        /// flag -- see `shadow_pass::shadow_lod_enabled`), z/w unused.
+        /// flag -- see `shadow_pass::shadow_lod_enabled`), z the `?perfprobe=`
+        /// diagnostic's runtime override for the fine pass's march step
+        /// budget (`perfprobe.rs`; `0.0` means "no override, use the
+        /// compile-time `MAX_STEPS`" -- the value every non-probe run ever
+        /// sees), w unused.
         pub misc2: Vec4,
         /// xyz world-space bounding-sphere center, w radius (`<= 0.0` means
         /// "no bound" -- either the scene is genuinely unbounded or this was
@@ -877,6 +881,7 @@ pub fn update_material(
     marble_state: Res<MarbleState>,
     windows: Query<&Window, With<PrimaryWindow>>,
     shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
+    perfprobe: Res<crate::perfprobe::PerfProbeState>,
     scene_state: ResMut<SceneState>,
     materials: ResMut<Assets<FineMarcherMaterial>>,
     storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
@@ -884,7 +889,15 @@ pub fn update_material(
 ) {
     let start = web_time::Instant::now();
     update_material_impl(
-        time, orbit, marble_state, windows, shadow_render_target, scene_state, materials, storage_buffers,
+        time,
+        orbit,
+        marble_state,
+        windows,
+        shadow_render_target,
+        perfprobe,
+        scene_state,
+        materials,
+        storage_buffers,
     );
     timings.record("fine", start.elapsed());
 }
@@ -896,6 +909,7 @@ fn update_material_impl(
     marble_state: Res<MarbleState>,
     windows: Query<&Window, With<PrimaryWindow>>,
     shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
+    perfprobe: Res<crate::perfprobe::PerfProbeState>,
     mut scene_state: ResMut<SceneState>,
     mut materials: ResMut<Assets<FineMarcherMaterial>>,
     mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
@@ -978,7 +992,7 @@ fn update_material_impl(
             misc2: Vec4::new(
                 shadow_render_target.size.y as f32,
                 if crate::shadow_pass::shadow_lod_enabled() { 1.0 } else { 0.0 },
-                0.0,
+                perfprobe.fine_max_steps_override,
                 0.0,
             ),
             bounding: scene_state.bounding_sphere,

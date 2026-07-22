@@ -500,7 +500,15 @@ struct MarchResult {
 // `<= MAX_DIST`, see its doc); same never-unsafe-only-wasteful reasoning as
 // `t0` applies to a loose `max_d`, so a caller can always pass `MAX_DIST`
 // as a safe fallback.
-fn march_scene(ro: vec3<f32>, rd: vec3<f32>, t0: f32, pixel_angle: f32, max_d: f32) -> MarchResult {
+//
+// `max_steps` is the loop bound every caller passes explicitly (rather than
+// this function reading the `MAX_STEPS` constant itself): the coarse/shadow
+// passes always pass `MAX_STEPS` unchanged, but the fine pass's caller
+// (`MARCHER`) can pass a smaller runtime value when the `?perfprobe=`
+// diagnostic (`perfprobe.rs`) wants to measure how much of the fine pass's
+// GPU cost comes from its step budget -- see `SceneUniforms::misc2`'s doc
+// for the uniform this rides in on.
+fn march_scene(ro: vec3<f32>, rd: vec3<f32>, t0: f32, pixel_angle: f32, max_d: f32, max_steps: i32) -> MarchResult {
     var t = t0;
     var prev_h = 0.0;
     var omega = OVERRELAX;
@@ -508,7 +516,7 @@ fn march_scene(ro: vec3<f32>, rd: vec3<f32>, t0: f32, pixel_angle: f32, max_d: f
     var candidate_err = 1e20;
     var iters = 0;
     var hit_frac = false;
-    for (var i = 0; i < MAX_STEPS; i++) {
+    for (var i = 0; i < max_steps; i++) {
         iters = i;
         if (t > max_d) {
             break;
@@ -600,7 +608,7 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(-1.0, 0.0, 0.0, 1.0);
     }
 
-    let result = march_scene(ro, rd, clip.x, pixel_angle, clip.y);
+    let result = march_scene(ro, rd, clip.x, pixel_angle, clip.y, MAX_STEPS);
     if (result.hit) {
         return vec4<f32>(result.t, 0.0, 0.0, 1.0);
     }
@@ -659,7 +667,7 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         t0 = max(t0, coarse_t - coarse_t * coarse_pixel_angle);
     }
 
-    let march = march_scene(ro, rd, t0, pixel_angle, clip.y);
+    let march = march_scene(ro, rd, t0, pixel_angle, clip.y, MAX_STEPS);
     if (!march.hit) {
         return vec4<f32>(1.0, 0.0, 0.0, MAX_DIST);
     }
@@ -978,7 +986,14 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
             }
         }
 
-        let march = march_scene(ro, rd, t0, pixel_angle, clip.y);
+        // `scene.misc2.z`: `?perfprobe=`'s runtime fine-pass step-budget
+        // override (`perfprobe.rs`) -- `0.0` (the default, and the only
+        // value every non-probe run ever sees) means \"no override, use the
+        // full MAX_STEPS budget\"; a positive value clamps this march's
+        // step count for one probe window, to measure how much of the fine
+        // pass's GPU cost the step budget itself accounts for.
+        let fine_max_steps = select(MAX_STEPS, i32(scene.misc2.z), scene.misc2.z > 0.5);
+        let march = march_scene(ro, rd, t0, pixel_angle, clip.y, fine_max_steps);
         t = march.t;
         hit_frac = march.hit;
         iters = march.iters;
