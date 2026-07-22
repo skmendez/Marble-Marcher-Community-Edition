@@ -9,6 +9,7 @@
 mod camera;
 mod debug_gizmos;
 mod debug_screenshot;
+mod direct_gpu_writes;
 mod fps_overlay;
 mod mrrm;
 mod net;
@@ -25,6 +26,7 @@ use bevy::window::WindowResolution;
 use camera::{orbit_camera_input, CameraOrbit};
 use debug_gizmos::draw_thrust_debug;
 use debug_screenshot::DebugScreenshotPlugin;
+use direct_gpu_writes::DirectGpuWritesPlugin;
 use fps_overlay::FpsOverlayPlugin;
 use mrrm::{
     resize_coarse_render_target, setup_mrrm_pipeline, sync_coarse_quad_scale,
@@ -91,6 +93,7 @@ fn main() {
         .add_plugins(Material2dPlugin::<ShadowMarcherMaterial>::default())
         .add_plugins(FpsOverlayPlugin)
         .add_plugins(DebugScreenshotPlugin)
+        .add_plugins(DirectGpuWritesPlugin)
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<CameraOrbit>()
         .init_resource::<TouchDebugInfo>()

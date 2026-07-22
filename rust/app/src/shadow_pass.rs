@@ -320,12 +320,12 @@ pub fn update_shadow_material(
     windows: Query<&Window, With<PrimaryWindow>>,
     shadow_render_target: Res<ShadowRenderTarget>,
     quads: Query<&MeshMaterial2d<ShadowMarcherMaterial>, With<ShadowQuad>>,
-    materials: ResMut<Assets<ShadowMarcherMaterial>>,
+    gpu_writes: ResMut<crate::direct_gpu_writes::FrameGpuWrites>,
     mut timings: ResMut<crate::fps_overlay::PhaseTimings>,
 ) {
     let start = web_time::Instant::now();
     update_shadow_material_impl(
-        time, orbit, marble_state, scene_state, windows, shadow_render_target, quads, materials,
+        time, orbit, marble_state, scene_state, windows, shadow_render_target, quads, gpu_writes,
     );
     timings.record("shadow", start.elapsed());
 }
@@ -339,7 +339,7 @@ fn update_shadow_material_impl(
     windows: Query<&Window, With<PrimaryWindow>>,
     shadow_render_target: Res<ShadowRenderTarget>,
     quads: Query<&MeshMaterial2d<ShadowMarcherMaterial>, With<ShadowQuad>>,
-    mut materials: ResMut<Assets<ShadowMarcherMaterial>>,
+    mut gpu_writes: ResMut<crate::direct_gpu_writes::FrameGpuWrites>,
 ) {
     let t = time.elapsed_secs();
     let aspect = windows
@@ -351,9 +351,13 @@ fn update_shadow_material_impl(
     let marble = marble_state.local_marble();
     let (eye, right, up, forward) = orbit.eye_and_basis(marble.pos);
 
+    // `direct_gpu_writes` module doc: same-size content-only update, direct
+    // GPU write instead of `Assets<ShadowMarcherMaterial>::get_mut` (which
+    // was reallocating a fresh uniform buffer *and* bind group every frame).
     for mesh_material in &quads {
-        if let Some(mat) = materials.get_mut(&mesh_material.0) {
-            mat.scene = SceneUniforms {
+        gpu_writes.shadow_scene = Some((
+            mesh_material.0.id(),
+            SceneUniforms {
                 cam_pos: eye.extend(0.0),
                 cam_right: right.extend(0.0),
                 cam_up: up.extend(0.0),
@@ -362,8 +366,8 @@ fn update_shadow_material_impl(
                 misc: Vec4::new(aspect, t, shadow_height, 0.0),
                 bounding: scene_state.bounding_sphere,
                 ..SceneUniforms::default()
-            };
-        }
+            },
+        ));
     }
 }
 

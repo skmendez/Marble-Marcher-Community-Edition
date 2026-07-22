@@ -536,6 +536,14 @@ pub struct SceneState {
     /// `MARBLE_BUFFER_BINDING`'s doc), rewritten every frame by
     /// `update_material` from `MarbleState::marbles`.
     pub marbles_buffer: Handle<ShaderStorageBuffer>,
+    /// `marbles_buffer`'s current slot count (`Vec4`s, i.e. marble count) --
+    /// tracked so `update_material` can tell a same-size content update
+    /// (every frame, the overwhelmingly common case: direct-write via
+    /// `direct_gpu_writes`, no reallocation) apart from a size-changing one
+    /// (a player joining/leaving mid-game: must go through the ordinary
+    /// `Assets<ShaderStorageBuffer>::get_mut` reallocating path instead, and
+    /// update this field to match).
+    pub marbles_buffer_len: usize,
     /// The scene's world-space bounding sphere (`object.bounding_sphere`),
     /// packed as `xyz = center, w = radius` (`w <= 0.0` means "no bound" --
     /// `bounding_sphere` returned `None`), computed once here at setup
@@ -784,6 +792,7 @@ pub fn setup(
         material,
         params_buffer,
         marbles_buffer,
+        marbles_buffer_len: marbles.len(),
         bounding_sphere,
     });
 
@@ -897,13 +906,13 @@ pub fn update_material(
     windows: Query<&Window, With<PrimaryWindow>>,
     shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
     scene_state: ResMut<SceneState>,
-    materials: ResMut<Assets<FineMarcherMaterial>>,
     storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    gpu_writes: ResMut<crate::direct_gpu_writes::FrameGpuWrites>,
     mut timings: ResMut<crate::fps_overlay::PhaseTimings>,
 ) {
     let start = web_time::Instant::now();
     update_material_impl(
-        time, orbit, marble_state, windows, shadow_render_target, scene_state, materials, storage_buffers,
+        time, orbit, marble_state, windows, shadow_render_target, scene_state, storage_buffers, gpu_writes,
     );
     timings.record("fine", start.elapsed());
 }
@@ -916,14 +925,29 @@ fn update_material_impl(
     windows: Query<&Window, With<PrimaryWindow>>,
     shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
     mut scene_state: ResMut<SceneState>,
-    mut materials: ResMut<Assets<FineMarcherMaterial>>,
     mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut gpu_writes: ResMut<crate::direct_gpu_writes::FrameGpuWrites>,
 ) {
     let t = time.elapsed_secs();
 
+    // Reset every frame: unlike `fine_scene`/`marbles` below (always set to
+    // *something* this frame), `params` is only conditionally written
+    // (`animate_fractal()`/non-empty `animations`) -- without this reset, a
+    // scene switching from animated to non-animated would leave last
+    // frame's stale `Some(..)` here, and `direct_gpu_writes::
+    // apply_frame_gpu_writes` would re-apply those stale bytes on top of
+    // whatever `apply_pending_scene_sync` legitimately just wrote for the
+    // new scene.
+    gpu_writes.params = None;
+
     // ang1 animation only applies to (and only makes sense for) the Classic
     // fractal tree the Demo scene builds; the static display fractals have
-    // no such parameter.
+    // no such parameter. Never changes `params`' slot *count* -- only ever
+    // nudges an existing slot's value -- so this always takes the
+    // direct-write path (`direct_gpu_writes` module doc); only a full scene
+    // swap (`apply_pending_scene_sync`) can change `params_buffer`'s size,
+    // and that already goes through the ordinary `Assets::get_mut`
+    // reallocating path on its own, separately.
     if animate_fractal() {
         if let SceneHandles::Classic(handles) = &scene_state.handles {
             let ang1 = beware_of_bumps::ANG1 + 0.02 * (0.5 * t).sin();
@@ -938,9 +962,8 @@ fn update_material_impl(
                 beware_of_bumps::COLOR,
                 beware_of_bumps::ITERS,
             );
-            if let Some(buffer) = storage_buffers.get_mut(&scene_state.params_buffer) {
-                buffer.set_data(scene_state.params.slots().to_vec());
-            }
+            gpu_writes.params =
+                Some((scene_state.params_buffer.id(), scene_state.params.slots().to_vec()));
         }
     }
 
@@ -951,11 +974,11 @@ fn update_material_impl(
     // evaluation doesn't happen here). This system just has to get the
     // result onto the GPU every frame; skipped entirely for scenes with no
     // animations (the common case) rather than uploading an unchanged
-    // buffer every frame for no reason.
+    // buffer every frame for no reason. Same size-never-changes reasoning
+    // as the `animate_fractal` branch above.
     if !scene_state.animations.is_empty() {
-        if let Some(buffer) = storage_buffers.get_mut(&scene_state.params_buffer) {
-            buffer.set_data(scene_state.params.slots().to_vec());
-        }
+        gpu_writes.params =
+            Some((scene_state.params_buffer.id(), scene_state.params.slots().to_vec()));
     }
 
     let (aspect, resolution_height) = windows
@@ -969,14 +992,27 @@ fn update_material_impl(
     let (eye, right, up, forward) = orbit.eye_and_basis(target);
 
     // Live marble list -> its storage buffer, every frame (multiplayer
-    // milestone 0 -- mirrors the params-buffer per-frame write pattern just
-    // above, same reasoning: a pure buffer write, no shader recompile).
-    if let Some(buffer) = storage_buffers.get_mut(&scene_state.marbles_buffer) {
-        buffer.set_data(pack_marbles(&marble_state.marbles));
+    // milestone 0). Unlike `params`, this genuinely can change size (a
+    // player joining/leaving mid-game changes the marble count) -- so only
+    // take the cheap direct-write path when the slot count actually matches
+    // what the buffer was last sized for; otherwise fall back to the
+    // ordinary reallocating path once (`direct_gpu_writes` module doc) and
+    // record the new size so subsequent same-size frames go back to
+    // direct-writing.
+    let marbles_slots = pack_marbles(&marble_state.marbles);
+    if marbles_slots.len() == scene_state.marbles_buffer_len {
+        gpu_writes.marbles = Some((scene_state.marbles_buffer.id(), marbles_slots));
+    } else {
+        if let Some(buffer) = storage_buffers.get_mut(&scene_state.marbles_buffer) {
+            buffer.set_data(marbles_slots.clone());
+        }
+        scene_state.marbles_buffer_len = marbles_slots.len();
+        gpu_writes.marbles = None;
     }
 
-    if let Some(mat) = materials.get_mut(&scene_state.material) {
-        mat.scene = SceneUniforms {
+    gpu_writes.fine_scene = Some((
+        scene_state.material.id(),
+        SceneUniforms {
             cam_pos: eye.extend(0.0),
             cam_right: right.extend(0.0),
             cam_up: up.extend(0.0),
@@ -1001,6 +1037,6 @@ fn update_material_impl(
                 0.0,
             ),
             bounding: scene_state.bounding_sphere,
-        };
-    }
+        },
+    ));
 }
