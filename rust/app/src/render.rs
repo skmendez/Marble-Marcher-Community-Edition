@@ -273,7 +273,12 @@ mod scene_uniforms_impl {
         /// diagnostic's runtime override for the fine pass's march step
         /// budget (`perfprobe.rs`; `0.0` means "no override, use the
         /// compile-time `MAX_STEPS`" -- the value every non-probe run ever
-        /// sees), w unused.
+        /// sees), w the marble cubemap's current Y-axis rotation angle in
+        /// radians (fine pass's material only, same as the shadow-LOD/
+        /// perfprobe lanes above -- coarse/shadow don't shade the marble at
+        /// all) -- see `update_frame_data_impl`'s doc for why this is a
+        /// deterministic function of the shared simulation tick, not
+        /// wall-clock time.
         pub misc2: Vec4,
         /// xyz world-space bounding-sphere center, w radius (`<= 0.0` means
         /// "no bound" -- either the scene is genuinely unbounded or this was
@@ -969,6 +974,11 @@ fn animate_fractal() -> bool {
     *ENABLED.get_or_init(|| std::env::var("MM_ANIMATE_FRACTAL").as_deref() == Ok("1"))
 }
 
+/// One full marble-cubemap revolution every 2 seconds at the 60Hz physics
+/// tick (`marble_csg::rollback`'s tick rate) -- `update_frame_data_impl`'s
+/// doc on why this drives the rotation angle instead of wall-clock time.
+const ROTATION_PERIOD_TICKS: u64 = 120;
+
 /// Per-frame system: writes the orbit camera basis (following the local
 /// player's marble), timing, the live marble list, and each pass's own
 /// target-resolution/flag lanes into [`MarcherFrameData`] -- plain CPU data
@@ -1001,6 +1011,21 @@ fn animate_fractal() -> bool {
 /// case the persistent-buffer design has to handle instead of asserting
 /// against.
 ///
+/// Also computes the marble cubemap's Y-axis rotation angle
+/// (`SceneUniforms::misc2.w`) from `MultiplayerSession::sim.current_tick()`
+/// -- *not* `time.elapsed_secs()` -- since this app has a real deterministic
+/// rollback simulation (`marble_csg::rollback::RollbackSim`) and every peer
+/// must render the same marble at the same rotation phase for the same
+/// tick; a wall-clock-driven angle would desync visually the moment two
+/// clients' clocks disagree even slightly (`MultiplayerSession` is always
+/// live, online or offline -- `physics_sys.rs`'s "always-on rollback"
+/// doc -- so `current_tick()` is a single source of truth in both cases).
+/// The tick is reduced modulo the rotation period *before* converting to
+/// `f32` (`ROTATION_PERIOD_TICKS`), not after, so a session running for
+/// hours never loses precision converting an ever-growing tick count --
+/// the visual result is exactly periodic anyway, so only the phase within
+/// one period ever needs representing.
+///
 /// Uses `web_time::Instant`, not `std::time::Instant`: the latter panics
 /// unconditionally on `wasm32-unknown-unknown` ("time not implemented on
 /// this platform" -- no OS clock on that target), which took production
@@ -1013,6 +1038,7 @@ pub fn update_frame_data(
     time: Res<Time>,
     orbit: Res<CameraOrbit>,
     marble_state: Res<MarbleState>,
+    mp: Res<MultiplayerSession>,
     windows: Query<&Window, With<PrimaryWindow>>,
     coarse_render_target: Res<crate::mrrm::CoarseRenderTarget>,
     shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
@@ -1027,6 +1053,7 @@ pub fn update_frame_data(
         time,
         orbit,
         marble_state,
+        mp,
         windows,
         coarse_render_target,
         shadow_render_target,
@@ -1047,11 +1074,12 @@ pub fn update_frame_data(
     timings.record("shadow", elapsed);
 }
 
-#[allow(clippy::too_many_arguments)] // SystemParam count, unchanged from before the timing wrapper split
+#[allow(clippy::too_many_arguments)] // SystemParam count, one more for the marble-rotation tick source
 fn update_frame_data_impl(
     time: Res<Time>,
     orbit: Res<CameraOrbit>,
     marble_state: Res<MarbleState>,
+    mp: Res<MultiplayerSession>,
     windows: Query<&Window, With<PrimaryWindow>>,
     coarse_render_target: Res<crate::mrrm::CoarseRenderTarget>,
     shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
@@ -1110,6 +1138,16 @@ fn update_frame_data_impl(
     let target = marble_state.local_marble().pos;
     let (eye, right, up, forward) = orbit.eye_and_basis(target);
 
+    // Marble cubemap Y-axis rotation, 1 revolution per `ROTATION_PERIOD_TICKS`
+    // (2 seconds at the 60Hz physics tick) -- deterministic function of
+    // `mp.sim.current_tick()`, not wall-clock time, so every peer renders the
+    // same marble at the same phase for the same tick (this fn's own doc).
+    // Reduced modulo the period *before* the `f32` cast, not after, so this
+    // stays numerically exact no matter how long a session runs.
+    let tick_in_period = mp.sim.current_tick() % ROTATION_PERIOD_TICKS;
+    let marble_rotation =
+        tick_in_period as f32 * (std::f32::consts::TAU / ROTATION_PERIOD_TICKS as f32);
+
     let base = SceneUniforms {
         cam_pos: eye.extend(0.0),
         cam_right: right.extend(0.0),
@@ -1133,12 +1171,13 @@ fn update_frame_data_impl(
         // x: the shadow pass's own render-target height (`sample_shadow`'s
         // `sz` computation), y: `MM_SHADOW_LOD` on/off (same
         // A/B-comparability reasoning as MRRM's `misc.w` above), z: the
-        // `?perfprobe=` diagnostic's fine-step-budget override.
+        // `?perfprobe=` diagnostic's fine-step-budget override, w: the
+        // marble cubemap's current Y-axis rotation angle (see above).
         misc2: Vec4::new(
             shadow_render_target.size.y as f32,
             if crate::shadow_pass::shadow_lod_enabled() { 1.0 } else { 0.0 },
             perfprobe.fine_max_steps_override,
-            0.0,
+            marble_rotation,
         ),
         ..base
     };

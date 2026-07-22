@@ -254,7 +254,12 @@ enum Combine {
 /// material, mirroring how `misc.z` is each pass's own resolution -- see
 /// `sample_shadow`'s doc), `misc2.y` is the fine pass's `MM_SHADOW_LOD`
 /// on/off flag (same uniform-flag-not-entity-toggle convention as `misc.w`'s
-/// MRRM flag, for the same A/B-comparability reason); `bounding.xyz` is the
+/// MRRM flag, for the same A/B-comparability reason); `misc2.w` is the
+/// marble cubemap's current Y-axis rotation angle in radians (fine pass's
+/// material only -- deterministic function of the shared simulation tick,
+/// not wall-clock time, so every multiplayer peer renders the same phase
+/// for the same tick; see `render.rs`'s `update_frame_data_impl`'s doc);
+/// `bounding.xyz` is the
 /// scene's world-space bounding-sphere center, `bounding.w` its radius, with
 /// `radius <= 0.0` meaning "no bound" (either the scene is genuinely
 /// unbounded -- `marble_csg::Object::bounding_sphere` returned `None` -- or
@@ -1026,7 +1031,19 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     let hit_marble = marbles[marble_idx];
     let mp = ro + rd * marble_t;
     let mn = normalize(mp - hit_marble.xyz);
-    let marble_tex_sample = textureSample(marble_cubemap, marble_cubemap_sampler, mn).rgb;
+    // Spin the cubemap sample direction around the marble's local Y axis
+    // (`scene.misc2.w`, radians -- this const's own doc on why it's
+    // tick-driven, not wall-clock) rather than the marble itself, so this
+    // is a pure shading effect with no bearing on physics/collision.
+    let rot_a = scene.misc2.w;
+    let rot_cos = cos(rot_a);
+    let rot_sin = sin(rot_a);
+    let mn_rotated = vec3<f32>(
+        mn.x * rot_cos - mn.z * rot_sin,
+        mn.y,
+        mn.x * rot_sin + mn.z * rot_cos,
+    );
+    let marble_tex_sample = textureSample(marble_cubemap, marble_cubemap_sampler, mn_rotated).rgb;
 
     if (marble_hit) {
         let refl = reflect(rd, mn);
