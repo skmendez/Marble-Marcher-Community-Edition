@@ -56,6 +56,25 @@ use std::collections::VecDeque;
 use web_time::Duration;
 
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
+
+/// `?debug=1` (web) / `MM_DEBUG=1` (native) shows this whole overlay (FPS,
+/// camera/touch state, marble positions, CPU phase timings, render
+/// resolution); hidden by default so the deployed URL a player actually
+/// shares/opens is clean. Matches `SceneKind::from_config`'s
+/// query-param-then-env-var layering (`web_config::query_param`); cached in
+/// a `OnceLock` like `mrrm::mrrm_enabled` since it's checked once at
+/// `Startup`, not re-parsed every frame. Default is the opposite polarity
+/// of `mrrm_enabled`/`shadow_lod_enabled` (those default *on*, disabled by
+/// `=0`; this defaults *off*, enabled only by an explicit `=1`) since this
+/// is debug-only UI, not a rendering behavior those toggles A/B-test.
+pub fn debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = crate::web_config::query_param("debug").or_else(|| std::env::var("MM_DEBUG").ok());
+        value.as_deref() == Some("1")
+    })
+}
 
 /// How long a window of recent frame times to average over. Long enough to
 /// smooth both the startup transient and brief camera-pan cost swings;
@@ -83,7 +102,12 @@ impl Plugin for FpsOverlayPlugin {
             .add_systems(Update, (record_frame_time, update_fps_text).chain())
             .add_systems(
                 Update,
-                (update_orbit_debug_text, update_marbles_debug_text, update_phase_timings_text),
+                (
+                    update_orbit_debug_text,
+                    update_marbles_debug_text,
+                    update_phase_timings_text,
+                    update_render_resolution_text,
+                ),
             );
     }
 }
@@ -215,6 +239,9 @@ struct MarblesDebugText;
 struct PhaseTimingsText;
 
 fn spawn_fps_overlay(mut commands: Commands) {
+    if !debug_enabled() {
+        return;
+    }
     commands
         .spawn((
             Node {
@@ -267,7 +294,38 @@ fn spawn_fps_overlay(mut commands: Commands) {
                 TextColor(Color::srgb(0.75, 0.75, 0.75)),
                 PhaseTimingsText,
             ));
+            parent.spawn((
+                Text::new("render: --"),
+                TextFont {
+                    font_size: 12.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.75, 0.75, 0.75)),
+                RenderResolutionText,
+            ));
         });
+}
+
+/// Marker for the `Text` entity showing the fine pass's actual live render
+/// target size -- today always the window's own physical size
+/// (`render.rs:762`'s "no adaptive-resolution render-to-texture
+/// indirection" note), but this line exists now so the upcoming adaptive
+/// resolution work (perf plan milestone 5) has a place to show the real,
+/// possibly-scaled-down render target size instead of just the window size.
+#[derive(Component)]
+struct RenderResolutionText;
+
+fn update_render_resolution_text(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut text: Query<&mut Text, With<RenderResolutionText>>,
+) {
+    let Ok(mut text) = text.single_mut() else {
+        return;
+    };
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    text.0 = format!("render: {}x{}", window.physical_width(), window.physical_height());
 }
 
 fn update_phase_timings_text(

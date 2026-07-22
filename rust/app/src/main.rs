@@ -25,7 +25,7 @@ use bevy::window::WindowResolution;
 use camera::{orbit_camera_input, CameraOrbit};
 use debug_gizmos::draw_thrust_debug;
 use debug_screenshot::DebugScreenshotPlugin;
-use fps_overlay::FpsOverlayPlugin;
+use fps_overlay::{debug_enabled, FpsOverlayPlugin};
 use mrrm::{
     resize_coarse_render_target, setup_mrrm_pipeline, sync_coarse_quad_scale,
     update_coarse_material, CoarseMarcherMaterial,
@@ -132,7 +132,7 @@ fn main() {
                 update_material,
                 update_coarse_material,
                 update_shadow_material,
-                draw_thrust_debug,
+                draw_thrust_debug.run_if(debug_enabled),
                 poll_net_status,
                 update_copy_button_visibility,
                 handle_copy_button_click,
