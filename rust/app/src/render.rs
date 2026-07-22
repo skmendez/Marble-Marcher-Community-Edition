@@ -32,6 +32,7 @@ use bevy::ecs::system::lifetimeless::SRes;
 use bevy::ecs::system::SystemParamItem;
 use bevy::image::Image;
 use bevy::prelude::*;
+use bevy::render::camera::{RenderTarget, Viewport};
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::binding_types::{
     sampler, storage_buffer_read_only, texture_2d, texture_cube, uniform_buffer,
@@ -40,10 +41,11 @@ use bevy::render::render_resource::{
     AsBindGroup, AsBindGroupError, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
     BindGroupLayoutEntry, BindingResources, Extent3d, PreparedBindGroup, SamplerBindingType,
     ShaderRef, ShaderStages, TextureDimension, TextureFormat, TextureSampleType,
-    TextureViewDescriptor, TextureViewDimension, UnpreparedBindGroup,
+    TextureUsages, TextureViewDescriptor, TextureViewDimension, UnpreparedBindGroup,
 };
 use bevy::render::renderer::RenderDevice;
 use bevy::render::texture::GpuImage;
+use bevy::render::view::RenderLayers;
 use bevy::sprite::Material2d;
 use bevy::ui::IsDefaultUiCamera;
 use bevy::window::PrimaryWindow;
@@ -453,6 +455,253 @@ impl Material2d for FineMarcherMaterial {
     }
 }
 
+/// Adaptive-resolution plumbing (GPU perf plan milestone 5) -- stage 1:
+/// the tier-switching decision logic doesn't exist yet (a later, separate
+/// stage), so `active_size` is pinned to `max_size` forever here, but the
+/// full render-to-texture/present-pass architecture is real and live so
+/// that stage can land as a pure logic change with no new Bevy-render
+/// plumbing risk.
+///
+/// A *previous* attempt at this (now fully reverted, see `MarcherCamera`'s
+/// doc) failed for a specific, now-avoided reason: every time its
+/// resolution scale changed, it rebuilt its offscreen render target as a
+/// **new** GPU `Image` -- a heavy operation, done several times over a few
+/// seconds under sustained load, which is what actually read as "visible
+/// jitter" (not a flaw in its hysteresis logic, which was fine). This
+/// design sidesteps that entirely: [`FineRenderTarget`]'s backing `Image`
+/// is allocated once, at the window's native size, and only ever rebuilt
+/// on a genuine window resize (as rare as `mrrm.rs`'s `CoarseRenderTarget`
+/// resize, which uses the identical "build new `Image`, redirect handles"
+/// pattern for the same underlying Bevy render-target-freeze reason). A
+/// resolution *tier* change becomes a `Camera.viewport` mutation -- a
+/// plain component write, not a GPU resource recreation -- confirmed
+/// against Bevy 0.16.1's own source to genuinely restrict fragment-shader
+/// invocation to the viewport's sub-rectangle (a real perf win), not just
+/// apply a cosmetic scissor.
+///
+/// **Load-bearing correctness detail**: Bevy's default `OrthographicProjection`
+/// (`ScalingMode::WindowSize`, `Camera2d`'s default) sizes the visible
+/// world-space area from the camera's *viewport* size, not the render
+/// target's own size. If `MarcherQuad`'s `Transform.scale` and
+/// `MarcherCamera`'s `Camera.viewport.physical_size` ever disagree, even
+/// for one frame, the result is a zoomed-in crop of the frame's center,
+/// not a correctly-framed downsample. `sync_fine_render_target_and_present`
+/// writes both (and the present material's UV crop) together, atomically,
+/// from this resource's own fields, so they can never drift apart.
+#[derive(Resource)]
+pub struct FineRenderTarget {
+    /// The fixed backing texture, allocated at `max_size` and never
+    /// resized except on a genuine window-size change.
+    pub image: Handle<Image>,
+    /// The backing texture's own fixed pixel size (the window's native
+    /// physical size) -- NOT the currently-active tier.
+    pub max_size: UVec2,
+    /// The currently-active tier's pixel size -- what `Camera.viewport`
+    /// restricts rendering to, what `MarcherQuad`'s `Transform.scale`
+    /// must match, and what the fine pass's own `SceneUniforms::misc.z`
+    /// (this pass's own render-target height) should reflect. Stage 1:
+    /// always equal to `max_size`.
+    pub active_size: UVec2,
+}
+
+/// Builds the fine pass's offscreen backing texture. `TextureFormat::
+/// bevy_default()` (`Rgba8UnormSrgb`, confirmed via `bevy_image`'s
+/// `BevyDefault` impl -- 4 bytes/pixel, hence the `[0u8; 4]` fill below),
+/// not `Rgba16Float` like `mrrm.rs`'s coarse target: that HDR format
+/// exists specifically so the coarse pass's raw (negative-capable,
+/// unbounded) hit-distance value survives Bevy's intermediate-texture
+/// blit uncompressed (`CoarseMarcherMaterial`'s doc) -- an entirely
+/// different problem from this one. The fine pass already produces
+/// final, tonemapped display color (`codegen.rs`'s `tonemap()`), so its
+/// target just needs a normal 8-bit-per-channel format, matching what
+/// this pass rendered into (the window's own swapchain format) before
+/// this offscreen indirection existed at all.
+fn make_fine_render_target_image(size: UVec2) -> Image {
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: size.x,
+            height: size.y,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0u8; 4],
+        TextureFormat::bevy_default(),
+        bevy::asset::RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage =
+        TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::RENDER_ATTACHMENT;
+    image
+}
+
+/// All present-pass entities (camera + quad) live on this layer -- layer
+/// `1`, unused since the original (reverted) adaptive-resolution attempt's
+/// own present pass was deleted; distinct from the fine marcher's
+/// (implicit, unmarked) layer 0 so the present camera doesn't also render
+/// the fine quad on top of its own output.
+const PRESENT_LAYER: usize = 1;
+
+/// Fixed weak handle for the present pass's (non-CSG-tree-derived, plain
+/// Bevy blit/crop) shader.
+const PRESENT_SHADER_HANDLE: Handle<Shader> =
+    weak_handle!("9f3c7b5e-2d4a-4e1f-8a6c-1b5d9e7f4c32");
+
+const PRESENT_SHADER_WGSL: &str = r#"
+#import bevy_sprite::mesh2d_vertex_output::VertexOutput
+
+struct PresentUniform {
+    // xy: the active tier's fractional UV coverage of the fixed backing
+    // texture (half-texel-inset against the max size -- see
+    // `sync_fine_render_target_and_present`'s doc for why this exact
+    // formula, not a naive `active/max` ratio). zw unused padding.
+    active_uv_scale: vec4<f32>,
+}
+
+@group(2) @binding(0) var<uniform> present: PresentUniform;
+@group(2) @binding(1) var fine_tex: texture_2d<f32>;
+@group(2) @binding(2) var fine_sampler: sampler;
+
+@fragment
+fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
+    let uv = mesh.uv * present.active_uv_scale.xy;
+    return textureSample(fine_tex, fine_sampler, uv);
+}
+"#;
+
+/// The present pass's material: samples the fine pass's fixed-size
+/// backing texture, cropped to the currently-active tier's sub-rectangle
+/// (`active_uv_scale`) and stretched (bilinear) to fill the real window --
+/// the actual "adaptive resolution" visual effect. A standard derived
+/// `AsBindGroup` (not hand-rolled like `FineMarcherMaterial`'s persistent-
+/// buffer bindings, `gpu.rs`'s module doc): this material only ever
+/// mutates on a resolution-tier change or a window resize, both rare,
+/// throttled events by design -- not the every-single-frame case that
+/// made a hand-rolled persistent-buffer binding necessary for the fine/
+/// coarse/shadow materials' own uniforms.
+#[derive(Asset, TypePath, AsBindGroup, Clone)]
+pub struct PresentMaterial {
+    #[uniform(0)]
+    pub active_uv_scale: Vec4,
+    #[texture(1)]
+    #[sampler(2)]
+    pub image: Handle<Image>,
+}
+
+impl Material2d for PresentMaterial {
+    fn fragment_shader() -> ShaderRef {
+        PRESENT_SHADER_HANDLE.into()
+    }
+}
+
+/// Marker for the present pass's own camera -- the one and only
+/// window-targeting camera now that `MarcherCamera` renders into
+/// [`FineRenderTarget`] instead (see that resource's doc).
+#[derive(Component)]
+pub struct PresentCamera;
+
+/// Marker for the present pass's fullscreen quad.
+#[derive(Component)]
+pub struct PresentQuad;
+
+/// Computes `PresentMaterial::active_uv_scale`'s xy from the fine render
+/// target's current `(active_size, max_size)`: a half-texel inset against
+/// `max_size`, not a naive `active_size / max_size` ratio, so the maximum
+/// sampled UV lands exactly on the last valid rendered texel's center
+/// rather than bilinear-blending in whatever's just past the active
+/// tier's crop boundary (stale content from a previous, larger tier, or
+/// the clear color) -- `ClampToEdge` (the default sampler address mode)
+/// doesn't help here since it only engages *outside* `[0,1]`, and this
+/// crop boundary sits strictly inside it for any real downscale.
+fn fine_active_uv_scale(active_size: UVec2, max_size: UVec2) -> Vec2 {
+    Vec2::new(
+        (active_size.x as f32 - 0.5) / max_size.x as f32,
+        (active_size.y as f32 - 0.5) / max_size.y as f32,
+    )
+}
+
+/// `Update` system: whenever [`FineRenderTarget`] changes (a real window
+/// resize, or -- once a later stage adds tier-switching logic -- a
+/// resolution-tier change), writes `MarcherCamera`'s `Camera.viewport`,
+/// `MarcherQuad`'s `Transform.scale`, and the present material's
+/// `active_uv_scale` together, atomically, all three derived from the
+/// same `(active_size, max_size)` pair -- see [`FineRenderTarget`]'s doc
+/// for why these must never disagree even for one frame. Guarded on
+/// `Res<FineRenderTarget>::is_changed()` (true the frame it's first
+/// inserted, and again only on a genuine subsequent write, not every
+/// frame) rather than a manually-cached previous value, since every write
+/// to this resource already only happens behind its own writer's "did
+/// this actually change" gate (`resize_fine_render_target`'s own guard).
+pub fn sync_fine_render_target_and_present(
+    render_target: Res<FineRenderTarget>,
+    mut fine_cameras: Query<&mut Camera, (With<MarcherCamera>, Without<PresentCamera>)>,
+    mut fine_quads: Query<&mut Transform, (With<MarcherQuad>, Without<PresentQuad>)>,
+    present_quads: Query<&MeshMaterial2d<PresentMaterial>, With<PresentQuad>>,
+    mut present_materials: ResMut<Assets<PresentMaterial>>,
+) {
+    if !render_target.is_changed() {
+        return;
+    }
+    let (w, h) = (render_target.active_size.x, render_target.active_size.y);
+    for mut camera in &mut fine_cameras {
+        camera.viewport = Some(Viewport {
+            physical_position: UVec2::ZERO,
+            physical_size: UVec2::new(w, h),
+            depth: 0.0..1.0,
+        });
+    }
+    for mut transform in &mut fine_quads {
+        transform.scale.x = w as f32;
+        transform.scale.y = h as f32;
+    }
+    let uv_scale = fine_active_uv_scale(render_target.active_size, render_target.max_size);
+    for mesh_material in &present_quads {
+        if let Some(mat) = present_materials.get_mut(&mesh_material.0) {
+            mat.active_uv_scale = uv_scale.extend(0.0).extend(0.0);
+        }
+    }
+}
+
+/// `Update` system: keeps [`FineRenderTarget`]'s backing texture sized to
+/// the window's current native physical size -- only touches the GPU
+/// resource (a new `Image`) when that size actually changed (a real
+/// window resize), mirroring `mrrm.rs`'s `resize_coarse_render_target`
+/// exactly, including the "build a new `Image` and redirect handles
+/// rather than resize in place" freeze-avoidance (that function's doc).
+/// Stage 1: `active_size` tracks `max_size` 1:1 here too (tier pinned at
+/// full resolution) -- a later stage's tier-switching logic will decide
+/// `active_size` independently (never larger than `max_size`).
+pub fn resize_fine_render_target(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut render_target: ResMut<FineRenderTarget>,
+    mut images: ResMut<Assets<Image>>,
+    mut fine_cameras: Query<&mut Camera, With<MarcherCamera>>,
+    present_quads: Query<&MeshMaterial2d<PresentMaterial>, With<PresentQuad>>,
+    mut present_materials: ResMut<Assets<PresentMaterial>>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let native_size = UVec2::new(window.physical_width().max(1), window.physical_height().max(1));
+    if native_size == render_target.max_size {
+        return;
+    }
+
+    let new_handle = images.add(make_fine_render_target_image(native_size));
+
+    for mut camera in &mut fine_cameras {
+        camera.target = RenderTarget::from(new_handle.clone());
+    }
+    for mesh_material in &present_quads {
+        if let Some(mat) = present_materials.get_mut(&mesh_material.0) {
+            mat.image = new_handle.clone();
+        }
+    }
+
+    images.remove(&render_target.image);
+    render_target.image = new_handle;
+    render_target.max_size = native_size;
+    render_target.active_size = native_size;
+}
+
 /// A minimal (1x1 per face) placeholder cube texture, already correctly
 /// `Cube`-dimensioned -- used as `marble_texture`'s initial value in `setup`
 /// while the real `marble_cubemap.png` is still loading. `Handle::default()`
@@ -665,10 +914,12 @@ pub fn setup(
     config: Res<crate::config::Config>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<FineMarcherMaterial>>,
+    mut present_materials: ResMut<Assets<PresentMaterial>>,
     mut shaders: ResMut<Assets<Shader>>,
     mut camera_orbit: ResMut<CameraOrbit>,
     asset_server: Res<AssetServer>,
     mut images: ResMut<Assets<Image>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
 ) {
     let kind = config.scene;
     let mut params = Params::new();
@@ -784,6 +1035,10 @@ pub fn setup(
         MARCHER_SHADER_HANDLE.id(),
         Shader::from_wgsl(wgsl, "generated://marcher.wgsl"),
     );
+    shaders.insert(
+        PRESENT_SHADER_HANDLE.id(),
+        Shader::from_wgsl(PRESENT_SHADER_WGSL, "generated://present.wgsl"),
+    );
 
     let bounding_sphere = pack_bounding_sphere(&object, &params);
 
@@ -845,20 +1100,69 @@ pub fn setup(
         marbles: pack_marbles(&marbles),
     });
 
-    // Renders straight to the primary window (no adaptive-resolution
-    // render-to-texture indirection -- removed after it turned out to cause
-    // visible jitter even throttled way down, not worth the complexity for
-    // now). `IsDefaultUiCamera` pins the FPS overlay (`fps_overlay.rs`) to
-    // this camera explicitly rather than relying on bevy_ui's "highest-order
-    // camera targeting the window" fallback -- there's only one
-    // window-targeting camera now, so the fallback would pick this one
-    // anyway, but being explicit doesn't depend on that staying true.
-    commands.spawn((Camera2d, MarcherCamera, IsDefaultUiCamera));
+    // Renders into `FineRenderTarget`'s fixed-size offscreen texture,
+    // *not* straight to the window -- adaptive-resolution plumbing
+    // (`FineRenderTarget`'s doc). A previous, since-fully-reverted
+    // attempt at this rendered straight to the window with no offscreen
+    // indirection at all; this replaces that.
+    let native_size = windows
+        .single()
+        .map(|w| UVec2::new(w.physical_width().max(1), w.physical_height().max(1)))
+        .unwrap_or(UVec2::new(1280, 720));
+    let fine_image_handle = images.add(make_fine_render_target_image(native_size));
+
+    commands.spawn((
+        Camera2d,
+        Camera {
+            target: RenderTarget::from(fine_image_handle.clone()),
+            ..default()
+        },
+        MarcherCamera,
+    ));
     commands.spawn((
         Mesh2d(meshes.add(Rectangle::new(1.0, 1.0).mesh())),
         MeshMaterial2d(material.clone()),
         Transform::default(),
         MarcherQuad,
+    ));
+    commands.insert_resource(FineRenderTarget {
+        image: fine_image_handle.clone(),
+        max_size: native_size,
+        // Stage 1: tier pinned at full resolution -- see `FineRenderTarget`'s
+        // doc.
+        active_size: native_size,
+    });
+
+    // Present pass: the one and only window-targeting camera now,
+    // stretching `FineRenderTarget`'s (possibly cropped-to-a-smaller-tier)
+    // content to fill the real window (`PresentMaterial`'s doc).
+    // `IsDefaultUiCamera` pins the FPS overlay (`fps_overlay.rs`) to this
+    // camera explicitly rather than relying on bevy_ui's "highest-order
+    // camera targeting the window" fallback -- there's only one
+    // window-targeting camera, so the fallback would pick this one
+    // anyway, but being explicit doesn't depend on that staying true.
+    let present_material = present_materials.add(PresentMaterial {
+        active_uv_scale: fine_active_uv_scale(native_size, native_size).extend(0.0).extend(0.0),
+        image: fine_image_handle,
+    });
+    commands.spawn((
+        Camera2d,
+        Camera {
+            // After the fine pass (default order 0) so this frame's fine
+            // render actually exists by the time this pass samples it.
+            order: 1,
+            ..default()
+        },
+        RenderLayers::layer(PRESENT_LAYER),
+        PresentCamera,
+        IsDefaultUiCamera,
+    ));
+    commands.spawn((
+        Mesh2d(meshes.add(Rectangle::new(1.0, 1.0).mesh())),
+        MeshMaterial2d(present_material),
+        Transform::default(),
+        RenderLayers::layer(PRESENT_LAYER),
+        PresentQuad,
     ));
 
     commands.insert_resource(SceneState { kind, handles, material, bounding_sphere });
@@ -970,14 +1274,20 @@ pub fn apply_pending_scene_sync(
     info!("multiplayer: applied the host's authoritative scene sync");
 }
 
-/// Keeps the fullscreen quad's world size equal to the window's pixel size
-/// (robust across resizes -- DESIGN.md §8). Deref-muts the `Transform` only
-/// when the size actually differs, so change detection (and the transform
-/// propagation + re-extraction it triggers) stays quiet on the vast
-/// majority of frames where the window hasn't resized.
+/// Keeps the present pass's fullscreen quad world size equal to the
+/// window's pixel size (robust across resizes -- DESIGN.md §8). This used
+/// to scale `MarcherQuad` directly, back when the fine pass rendered
+/// straight to the window; now that it renders into `FineRenderTarget`
+/// instead (that resource's own doc), `MarcherQuad`'s scale is driven by
+/// the active tier size instead (`sync_fine_render_target_and_present`),
+/// and the present quad is the one that actually needs to match the
+/// window 1:1. Deref-muts the `Transform` only when the size actually
+/// differs, so change detection (and the transform propagation +
+/// re-extraction it triggers) stays quiet on the vast majority of frames
+/// where the window hasn't resized.
 pub fn sync_quad_scale(
     windows: Query<&Window, With<PrimaryWindow>>,
-    mut quads: Query<&mut Transform, With<MarcherQuad>>,
+    mut quads: Query<&mut Transform, With<PresentQuad>>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -1057,6 +1367,7 @@ pub fn update_frame_data(
     mp: Res<MultiplayerSession>,
     config: Res<crate::config::Config>,
     windows: Query<&Window, With<PrimaryWindow>>,
+    fine_render_target: Res<FineRenderTarget>,
     coarse_render_target: Res<crate::mrrm::CoarseRenderTarget>,
     shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
     perfprobe: Res<crate::perfprobe::PerfProbeState>,
@@ -1073,6 +1384,7 @@ pub fn update_frame_data(
         mp,
         config,
         windows,
+        fine_render_target,
         coarse_render_target,
         shadow_render_target,
         perfprobe,
@@ -1100,6 +1412,7 @@ fn update_frame_data_impl(
     mp: Res<MultiplayerSession>,
     config: Res<crate::config::Config>,
     windows: Query<&Window, With<PrimaryWindow>>,
+    fine_render_target: Res<FineRenderTarget>,
     coarse_render_target: Res<crate::mrrm::CoarseRenderTarget>,
     shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
     perfprobe: Res<crate::perfprobe::PerfProbeState>,
@@ -1130,10 +1443,15 @@ fn update_frame_data_impl(
     }
 
     let t = time.elapsed_secs();
-    let (aspect, resolution_height) = windows
-        .single()
-        .map(|w| (w.width() / w.height().max(1.0), w.physical_height() as f32))
-        .unwrap_or((1.0, 1.0));
+    // `aspect` stays the *window's* aspect for every pass regardless of
+    // each pass's own target size (see this fn's own doc, and
+    // `frame.coarse`'s comment below on why) -- only the fine pass's own
+    // render-target height changed source: `fine_render_target.active_size`
+    // (the active tier -- `FineRenderTarget`'s doc), not the window's
+    // physical height, now that the fine pass renders into its own
+    // fixed-size offscreen target instead of straight to the window.
+    let aspect = windows.single().map(|w| w.width() / w.height().max(1.0)).unwrap_or(1.0);
+    let resolution_height = fine_render_target.active_size.y as f32;
 
     // Every scene has a real marble now (`SceneKind::has_marble`): the
     // camera always follows the local player's.

@@ -38,7 +38,11 @@ use net::{
 };
 use perfprobe::{perfprobe_tick, spawn_perfprobe_overlay, update_perfprobe_overlay_text, PerfProbeState};
 use physics_sys::{marble_physics_tick, PendingSceneSync};
-use render::{apply_pending_scene_sync, finalize_marble_cubemap, setup, sync_quad_scale, update_frame_data, FineMarcherMaterial};
+use render::{
+    apply_pending_scene_sync, finalize_marble_cubemap, resize_fine_render_target, setup,
+    sync_fine_render_target_and_present, sync_quad_scale, update_frame_data, FineMarcherMaterial,
+    PresentMaterial,
+};
 use shadow_pass::{resize_shadow_render_target, setup_shadow_pipeline, sync_shadow_quad_scale, ShadowMarcherMaterial};
 use touch::{touch_camera_input, TouchDebugInfo};
 
@@ -122,6 +126,7 @@ fn main() {
         .add_plugins(Material2dPlugin::<FineMarcherMaterial>::default())
         .add_plugins(Material2dPlugin::<CoarseMarcherMaterial>::default())
         .add_plugins(Material2dPlugin::<ShadowMarcherMaterial>::default())
+        .add_plugins(Material2dPlugin::<PresentMaterial>::default())
         .add_plugins(FpsOverlayPlugin)
         .add_plugins(DebugScreenshotPlugin)
         .insert_resource(Time::<Fixed>::from_hz(60.0))
@@ -163,8 +168,10 @@ fn main() {
             Update,
             (
                 apply_pending_scene_sync,
+                resize_fine_render_target,
                 resize_coarse_render_target,
                 resize_shadow_render_target,
+                sync_fine_render_target_and_present,
                 sync_quad_scale,
                 sync_coarse_quad_scale,
                 sync_shadow_quad_scale,

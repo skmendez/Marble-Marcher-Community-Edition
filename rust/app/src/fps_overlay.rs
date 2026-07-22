@@ -56,7 +56,6 @@ use std::collections::VecDeque;
 use web_time::Duration;
 
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
 
 // `?debug=1`/`MM_DEBUG=1` (`config::Config::debug_enabled`) shows this
 // whole overlay (FPS, camera/touch state, marble positions, CPU phase
@@ -297,31 +296,27 @@ fn spawn_fps_overlay(mut commands: Commands, config: Res<crate::config::Config>)
 }
 
 /// Marker for the `Text` entity showing the fine pass's actual live render
-/// target size -- today always the window's own physical size
-/// (`render.rs:762`'s "no adaptive-resolution render-to-texture
-/// indirection" note), but this line exists now so the upcoming adaptive
-/// resolution work (perf plan milestone 5) has a place to show the real,
-/// possibly-scaled-down render target size instead of just the window size.
-/// Caches the last-seen `(width, height)` so `update_render_resolution_text`
-/// can skip the `format!` call entirely on the (vast majority of) frames
-/// where the resolution hasn't actually changed, not just skip the `Text`
-/// write -- this value only ever changes on a real window resize.
+/// target size -- `FineRenderTarget::active_size` (the currently-active
+/// resolution tier, GPU perf plan milestone 5), not the window's own
+/// physical size, now that the fine pass renders into its own fixed-size
+/// offscreen target instead of straight to the window
+/// (`render::FineRenderTarget`'s doc). Caches the last-seen `(width,
+/// height)` so `update_render_resolution_text` can skip the `format!`
+/// call entirely on the (vast majority of) frames where the resolution
+/// hasn't actually changed, not just skip the `Text` write.
 #[derive(Component, Default)]
 struct RenderResolutionText {
     last_size: Option<(u32, u32)>,
 }
 
 fn update_render_resolution_text(
-    windows: Query<&Window, With<PrimaryWindow>>,
+    fine_render_target: Res<crate::render::FineRenderTarget>,
     mut text: Query<(&mut Text, &mut RenderResolutionText)>,
 ) {
     let Ok((mut text, mut state)) = text.single_mut() else {
         return;
     };
-    let Ok(window) = windows.single() else {
-        return;
-    };
-    let size = (window.physical_width(), window.physical_height());
+    let size = (fine_render_target.active_size.x, fine_render_target.active_size.y);
     if state.last_size == Some(size) {
         return;
     }
