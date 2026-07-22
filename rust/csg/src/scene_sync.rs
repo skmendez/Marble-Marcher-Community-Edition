@@ -1,6 +1,4 @@
-//! Multiplayer join-time scene sync: the whole `Object`/`Fold` tree + its
-//! `Params` slot table + the `(ScalarParam, Expr)` animation table, bundled
-//! and serialized as one atomic unit.
+//! Wire codec for [`crate::Scene`] — multiplayer join-time scene sync.
 //!
 //! **Why this exists**: a joiner's page has no reliable way to know what
 //! scene the host is actually running (`?scene=` is a best-effort initial
@@ -8,40 +6,24 @@
 //! *something* before any network round trip can possibly complete) — the
 //! two could genuinely disagree (host on `menger_oscillating_sphere`, a stale
 //! or absent `?scene=` on the joiner) and nothing before this caught it.
-//! Sending the host's actual, authoritative scene data once at connect and
-//! having the joiner adopt it wholesale (same "authoritative push, no
-//! independent reconstruction" principle as `rollback::RollbackSim::
-//! hard_reset_to`) removes the guess entirely: the joiner ends up physically
-//! simulating and rendering against the literal transmitted tree, not a
-//! same-named-but-possibly-different one built from its own local
-//! `scenes.rs` constructor.
-//!
-//! **A `*Param` handle is only meaningful together with the `Params` it
-//! indexes** (a handle is just a slot index — `lib.rs`'s doc): this bundle
-//! keeps `object`/`params`/`animations` as one atomically-(de)serialized
-//! unit specifically so a decode can never end up with a tree whose handles
-//! don't match the slot table it's paired with.
+//! Sending the host's actual, authoritative `Scene` once at connect and
+//! having the joiner adopt it wholesale removes the guess entirely: the
+//! joiner ends up physically simulating and rendering against the literal
+//! transmitted tree, not a same-named-but-possibly-different one built from
+//! its own local `scenes.rs` constructor.
 //!
 //! **Encoding**: `Object::encode` then `Params::encode` then a `u32` count
 //! followed by each `(ScalarParam, Expr)` pair — every piece here is
 //! already self-delimiting (`Object`/`Fold`/`Expr` recursively, `Params`
-//! length-prefixed), so the bundle itself needs no extra framing beyond
+//! length-prefixed), so `Scene` itself needs no extra framing beyond
 //! sequencing them back to back, same convention as `net.rs`'s tagged
 //! messages.
 
 use crate::expr::Expr;
+use crate::scene::Scene;
 use crate::{Object, Params, ScalarParam};
 
-/// The whole CSG scene + its live parameters + its animation table, as one
-/// unit — see the module doc for why these three travel together.
-#[derive(Clone, Debug)]
-pub struct SceneBundle {
-    pub object: Object,
-    pub params: Params,
-    pub animations: Vec<(ScalarParam, Expr)>,
-}
-
-impl SceneBundle {
+impl Scene {
     pub fn encode(&self, out: &mut Vec<u8>) {
         self.object.encode(out);
         self.params.encode(out);
@@ -61,7 +43,7 @@ impl SceneBundle {
     /// Inverse of [`Self::encode`]/[`Self::to_bytes`] — `None` on any
     /// malformed/truncated input, or leftover bytes after a complete
     /// decode (same reasoning as [`Expr::from_bytes`]).
-    pub fn from_bytes(bytes: &[u8]) -> Option<SceneBundle> {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Scene> {
         let (object, pos) = Object::decode_at(bytes, 0)?;
         let (params, pos) = Params::decode_at(bytes, pos)?;
         let count = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
@@ -74,7 +56,7 @@ impl SceneBundle {
             pos = next;
         }
         if pos == bytes.len() {
-            Some(SceneBundle { object, params, animations })
+            Some(Scene { object, params, animations })
         } else {
             None
         }
@@ -190,29 +172,29 @@ mod tests {
     }
 
     #[test]
-    fn scene_bundle_round_trips_a_real_scene_with_animations() {
+    fn scene_round_trips_a_real_scene_with_animations() {
         let mut params = Params::new();
         let (object, handles) = scenes::menger_oscillating_sphere(&mut params);
         crate::scenes::set_menger_params(&mut params, &handles.menger, 5, Vec3::new(0.9, 0.6, 0.2));
-        let bundle = SceneBundle {
+        let scene = Scene {
             object,
             animations: vec![(handles.radius, handles.radius_anim.clone())],
             params,
         };
-        let bytes = bundle.to_bytes();
-        let decoded = SceneBundle::from_bytes(&bytes).expect("failed to decode a real scene bundle");
-        assert_eq!(decoded.params.slots(), bundle.params.slots());
+        let bytes = scene.to_bytes();
+        let decoded = Scene::from_bytes(&bytes).expect("failed to decode a real scene");
+        assert_eq!(decoded.params.slots(), scene.params.slots());
         assert_eq!(decoded.animations.len(), 1);
-        assert_eq!(decoded.animations[0].1, bundle.animations[0].1);
+        assert_eq!(decoded.animations[0].1, scene.animations[0].1);
         // The tree itself must actually behave the same, not just look the
         // same in `Debug` -- probe `de` at a handful of points.
         for p in [Vec4::new(0.0, 0.0, 0.0, 1.0), Vec4::new(2.0, 1.0, 0.5, 1.0), Vec4::new(-3.0, 2.0, 1.0, 1.0)] {
-            assert_eq!(decoded.object.de(p, &decoded.params), bundle.object.de(p, &bundle.params));
+            assert_eq!(decoded.object.de(p, &decoded.params), scene.object.de(p, &scene.params));
         }
     }
 
     #[test]
-    fn scene_bundle_round_trips_the_demo_scene() {
+    fn scene_round_trips_the_demo_scene() {
         let mut params = Params::new();
         let (object, handles) = scenes::demo_scene(&mut params);
         crate::scenes::set_fractal_params(
@@ -225,21 +207,21 @@ mod tests {
             scenes::beware_of_bumps::COLOR,
             scenes::beware_of_bumps::ITERS,
         );
-        let bundle = SceneBundle { object, params, animations: Vec::new() };
-        let bytes = bundle.to_bytes();
-        let decoded = SceneBundle::from_bytes(&bytes).expect("failed to decode demo_scene bundle");
+        let scene = Scene { object, params, animations: Vec::new() };
+        let bytes = scene.to_bytes();
+        let decoded = Scene::from_bytes(&bytes).expect("failed to decode demo_scene scene");
         for p in [Vec4::new(0.0, 0.0, 0.0, 1.0), Vec4::new(1.0, 0.5, -0.5, 1.0)] {
-            assert_eq!(decoded.object.de(p, &decoded.params), bundle.object.de(p, &bundle.params));
+            assert_eq!(decoded.object.de(p, &decoded.params), scene.object.de(p, &scene.params));
         }
     }
 
     #[test]
-    fn decode_rejects_truncated_bundle() {
-        let bundle = SceneBundle { object: Object::Sphere { radius: ScalarValue::Const(1.0) }, params: Params::new(), animations: Vec::new() };
-        let bytes = bundle.to_bytes();
-        assert!(SceneBundle::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+    fn decode_rejects_truncated_scene() {
+        let scene = Scene { object: Object::Sphere { radius: ScalarValue::Const(1.0) }, params: Params::new(), animations: Vec::new() };
+        let bytes = scene.to_bytes();
+        assert!(Scene::from_bytes(&bytes[..bytes.len() - 1]).is_none());
         let mut extra = bytes.clone();
         extra.push(0);
-        assert!(SceneBundle::from_bytes(&extra).is_none(), "leftover trailing byte");
+        assert!(Scene::from_bytes(&extra).is_none(), "leftover trailing byte");
     }
 }

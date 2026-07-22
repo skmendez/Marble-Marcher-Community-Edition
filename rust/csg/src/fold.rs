@@ -310,7 +310,7 @@ impl Fold {
     /// per node then its fields/operands back to back — same hand-rolled,
     /// self-delimiting convention as [`crate::expr::Expr::encode`] (see its
     /// doc), extended here to a tree with more than one field per node.
-    /// Used by [`crate::scene_sync::SceneBundle`] for multiplayer's join-time
+    /// Used by [`crate::Scene`] for multiplayer's join-time
     /// scene sync.
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {

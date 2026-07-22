@@ -151,12 +151,12 @@ enum NetMessage {
         marbles: Vec<Marble>,
     },
     /// The host's whole CSG scene tree + params + animation table
-    /// (`marble_csg::scene_sync::SceneBundle::to_bytes`), sent once at
+    /// (`marble_csg::Scene::to_bytes`), sent once at
     /// connect (join or reconnect) alongside `ResyncPayload` so the joiner
     /// renders/simulates against the host's actual scene instead of
     /// guessing one from its own `?scene=` (`physics_sys.rs`'s doc on the
     /// join flow). Opaque here — `net.rs` only ever carries these bytes,
-    /// it doesn't decode them (`SceneBundle` is `marble_csg`'s concern, not
+    /// it doesn't decode them (`Scene` is `marble_csg`'s concern, not
     /// the transport's), length-prefixed as a `u32` same as
     /// `ResyncPayload`'s marbles.
     SceneSync {

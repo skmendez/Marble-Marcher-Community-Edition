@@ -151,7 +151,7 @@ impl Object {
     /// Serializes to a compact, tag-prefixed byte encoding — same
     /// hand-rolled, self-delimiting, recursive convention as
     /// [`crate::expr::Expr::encode`]/[`Fold::encode`] (see the former's
-    /// doc for why). Used by [`crate::scene_sync::SceneBundle`] for
+    /// doc for why). Used by [`crate::Scene`] for
     /// multiplayer's join-time scene sync: the host serializes its live
     /// scene tree once at connect and sends it to the joiner, instead of
     /// the joiner building its own scene from a locally-hardcoded

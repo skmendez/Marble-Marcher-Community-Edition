@@ -581,15 +581,15 @@ fn marble_physics_tick_impl(
             if let Some(transport) = mp.transport.as_mut() {
                 transport.send_resync_payload(mp.sim.current_tick(), mp.sim.marbles().to_vec());
                 // The host's whole scene tree, atomically alongside the
-                // tick+state push above -- see `render::SceneBundle`'s
-                // (`marble_csg::scene_sync`) module doc for why a joiner
-                // needs this at all, not just a `?scene=` name.
-                let bundle = marble_csg::scene_sync::SceneBundle {
+                // tick+state push above -- see `marble_csg::Scene`'s
+                // module doc for why a joiner needs this at all, not just
+                // a `?scene=` name.
+                let scene_bundle = marble_csg::Scene {
                     object: scene.object.clone(),
                     params: scene.params.clone(),
                     animations: scene.animations.clone(),
                 };
-                transport.send_scene_sync(bundle.to_bytes());
+                transport.send_scene_sync(scene_bundle.to_bytes());
             }
         }
     }

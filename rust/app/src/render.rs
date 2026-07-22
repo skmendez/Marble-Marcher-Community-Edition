@@ -56,8 +56,7 @@ use marble_csg::scenes::{
     set_fractal_params, set_menger_params, ClassicHandles, MengerHandles,
     MengerOscillatingSphereHandles, MENGER_BITE_MIN_RADIUS,
 };
-use marble_csg::scene_sync::SceneBundle;
-use marble_csg::{Object, Params, ScalarParam};
+use marble_csg::{Object, Params, ScalarParam, Scene};
 
 use crate::camera::CameraOrbit;
 use crate::gpu::{MarcherFrameData, MarcherGpuBuffers};
@@ -908,10 +907,10 @@ pub fn setup(
 /// this frame's material sync already sees the new `bounding_sphere`, not a
 /// stale one.
 ///
-/// A no-op decode failure (`SceneBundle::from_bytes` returning `None`) is
+/// A no-op decode failure (`Scene::from_bytes` returning `None`) is
 /// swallowed with a `warn!` rather than a panic -- same defensive posture as
 /// every other "this arrived over the network from another peer" decode in
-/// this codebase (`net.rs`'s `decode_messages`): a malformed bundle can't
+/// this codebase (`net.rs`'s `decode_messages`): a malformed scene can't
 /// happen between two clients running the same build, but silently ignoring
 /// one is a safer failure mode than trusting corrupt geometry.
 ///
@@ -936,11 +935,11 @@ pub fn apply_pending_scene_sync(
     shadow_quads: Query<&MeshMaterial2d<ShadowMarcherMaterial>, With<ShadowQuad>>,
 ) {
     let Some(bytes) = pending_scene.0.take() else { return };
-    let Some(bundle) = SceneBundle::from_bytes(&bytes) else {
-        warn!("multiplayer: received an undecodable scene-sync bundle -- ignoring it");
+    let Some(scene) = Scene::from_bytes(&bytes) else {
+        warn!("multiplayer: received an undecodable scene-sync payload -- ignoring it");
         return;
     };
-    let SceneBundle { object, params, animations } = bundle;
+    let Scene { object, params, animations } = scene;
 
     let wgsl = generate_shader(&object);
     shaders.insert(MARCHER_SHADER_HANDLE.id(), Shader::from_wgsl(wgsl, "generated://marcher.wgsl"));

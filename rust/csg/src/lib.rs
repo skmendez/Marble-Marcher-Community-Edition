@@ -33,11 +33,13 @@ pub mod expr;
 pub mod fold;
 pub mod object;
 pub mod physics;
+pub mod scene;
 pub mod scene_sync;
 pub mod scenes;
 
 pub use fold::Fold;
 pub use object::Object;
+pub use scene::Scene;
 
 use glam::{Mat2, Vec2, Vec3, Vec4};
 
@@ -208,7 +210,7 @@ impl Params {
 
     /// Serializes the whole slot table as a flat, length-prefixed `f32`
     /// array — multiplayer's join-time scene sync
-    /// (`scene_sync::SceneBundle`) sends this alongside the `Object`/`Fold`
+    /// (`scene::Scene`) sends this alongside the `Object`/`Fold`
     /// tree that indexes into it, since a `*Param` handle is only ever
     /// meaningful together with the slots it indexes.
     pub fn encode(&self, out: &mut Vec<u8>) {
