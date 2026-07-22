@@ -135,39 +135,46 @@ impl SceneKind {
                 rad: beware_of_bumps::MARBLE_RAD,
                 kill_y: beware_of_bumps::KILL_Y,
             },
-            // `Vec3::ZERO` (the original spawn point, deep inside the
-            // sponge's internal void network) has de(origin) ~= 1.4 -- not
-            // embedded, but *occluded*: from the exterior corner view
-            // `setup`'s camera override actually uses, the origin sits
-            // behind the sponge's own outer walls, so the marble was
-            // invisible there no matter how large it was (confirmed: even
-            // `rad = 0.3` at the origin was still fully hidden). This spawn
-            // point instead sits in the open-air pocket just in front of
-            // that same exterior corner, along the camera's default view
-            // ray -- found by probing `Object::de` at points between the
-            // camera's eye and the origin (`rust/csg/examples/spawn_probe.rs`
-            // in git history) for a spot with a comfortable safety margin
-            // (de ~= 0.34, well clear of `rad` below) that's still close
-            // to the visible surface, not floating off in empty sky.
-            // `rad = 0.15` (up from the original 0.05) is sized to read
-            // clearly at the correspondingly closer orbit distance
-            // (`setup`'s Menger camera override, below) rather than for
-            // fitting through the sponge's recursive tunnels, since a
-            // marble spawned outside the structure doesn't need to.
-            // `kill_y = -50.0` is a generous "fell way out of the
-            // structure" bound for if `G` is toggled to `Rolling` mode
-            // while in one of these scenes. Reused as-is for
-            // `MengerOscillatingSphere`: this spawn point's distance from
-            // the origin (~4.92) stays well clear of even
-            // `MENGER_BITE_MAX_RADIUS` (~3.03), so the marble is never
-            // engulfed by the oscillating bite sphere.
-            Self::MengerSponge | Self::MengerSphere | Self::MengerOscillatingSphere => {
-                MarbleSpawn {
-                    start: Vec3::new(3.32, 1.69, 3.22),
-                    rad: 0.15,
-                    kill_y: -50.0,
-                }
-            }
+            // `Vec3::ZERO` (deep inside the sponge's internal void network)
+            // has de(origin) ~= 1.4 -- not embedded, but *occluded*: from
+            // the exterior corner view `setup`'s camera override uses for
+            // these two static scenes, the origin sits behind the sponge's
+            // own outer walls, so the marble was invisible there no matter
+            // how large it was (confirmed: even `rad = 0.3` at the origin
+            // was still fully hidden). This spawn point instead sits in the
+            // open-air pocket just in front of that same exterior corner,
+            // along the camera's default view ray -- found by probing
+            // `Object::de` at points between the camera's eye and the
+            // origin (`rust/csg/examples/spawn_probe.rs` in git history)
+            // for a spot with a comfortable safety margin (de ~= 0.34, well
+            // clear of `rad` below) that's still close to the visible
+            // surface, not floating off in empty sky. `rad = 0.15` (up from
+            // the original 0.05) is sized to read clearly at the
+            // correspondingly closer orbit distance (`setup`'s Menger
+            // camera override, below) rather than for fitting through the
+            // sponge's recursive tunnels, since a marble spawned outside
+            // the structure doesn't need to. `kill_y = -50.0` is a generous
+            // "fell way out of the structure" bound for if `G` is toggled
+            // to `Rolling` mode while in one of these scenes.
+            Self::MengerSponge | Self::MengerSphere => MarbleSpawn {
+                start: Vec3::new(3.32, 1.69, 3.22),
+                rad: 0.15,
+                kill_y: -50.0,
+            },
+            // Center spawn, unlike the two static scenes above: the whole
+            // point of this scene is the oscillating bite sphere hollowing
+            // out the center, so the marble sits right where that's
+            // actually happening rather than off at a corner untouched by
+            // it (verified this session -- de(origin) ~= 1.4 regardless of
+            // bite phase, since the bite sphere only ever *removes*
+            // material, never fills in the sponge's own existing internal
+            // voids, so the origin is safe at every point in the
+            // oscillation, not just at rest). Paired with `setup`'s camera
+            // override pulling in to `distance = 1.2` for this scene too
+            // (was `9.0`, framing the whole exterior instead) -- close and
+            // centered puts the player inside the hollowing-out effect
+            // itself instead of watching it from outside.
+            Self::MengerOscillatingSphere => MarbleSpawn { start: Vec3::ZERO, rad: 0.15, kill_y: -50.0 },
         }
     }
 }
@@ -608,22 +615,15 @@ pub fn setup(
     );
     if is_menger {
         camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35);
-        camera_orbit.distance = if kind == SceneKind::MengerOscillatingSphere {
-            // The other two Menger scenes are static, so `distance = 1.2`'s
-            // tight corner-detail framing (see the doc above) is the right
-            // shot. This scene's entire point is a *global* structural
-            // change -- the center hollowing out while the corners survive
-            // -- which that framing can't show at all: verified visually
-            // (screenshot) that at `distance = 1.2` the same close-up patch
-            // of corner surface renders identically at both bite-radius
-            // extremes, since everything in frame sits well outside even
-            // `MENGER_BITE_MAX_RADIUS`. Pulled back enough to fit the whole
-            // ~6-unit sponge (bounding half-extent `MENGER_BITE_MAX_RADIUS
-            // ~= 3.03`) in frame with margin.
-            9.0
-        } else {
-            1.2
-        };
+        // Same close, marble-centric `distance = 1.2` for all three Menger
+        // scenes now (see the doc above) -- `MengerOscillatingSphere` used
+        // to pull back to `9.0` to frame the whole ~6-unit sponge from
+        // outside, since its old corner spawn point never went anywhere
+        // near the bite sphere's effect. Now that it spawns at the center
+        // instead (`spawn_params`'s doc), close framing is the right shot
+        // again: the marble sits right where the hollowing-out is actually
+        // happening, so there's no need to zoom out to see it happen.
+        camera_orbit.distance = 1.2;
     }
 
     let mut animations: Vec<(ScalarParam, Expr)> = Vec::new();

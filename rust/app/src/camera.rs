@@ -241,6 +241,7 @@ impl CameraOrbit {
 const KEYBOARD_ROLL_RATE: f32 = 1.5;
 
 /// Left-drag to orbit, scroll wheel to zoom, `Q`/`E` to roll.
+#[allow(clippy::too_many_arguments)] // SystemParam count, one more for the marble-radius zoom clamp
 pub fn orbit_camera_input(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
