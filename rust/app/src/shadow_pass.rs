@@ -44,6 +44,7 @@ use marble_csg::codegen::generate_shadow_shader;
 
 use crate::gpu::MarcherGpuBuffers;
 use crate::mrrm::CoarseRenderTarget;
+use crate::physics_sys::MultiplayerSession;
 use crate::render::{SceneState, SceneUniforms};
 
 /// All shadow-pass entities (camera + quad) live on this layer -- distinct
@@ -228,8 +229,9 @@ pub fn setup_shadow_pipeline(
     windows: Query<&Window, With<PrimaryWindow>>,
     scene_state: Res<SceneState>,
     coarse_render_target: Res<CoarseRenderTarget>,
+    mp: Res<MultiplayerSession>,
 ) {
-    let wgsl = generate_shadow_shader(&scene_state.object);
+    let wgsl = generate_shadow_shader(&mp.sim.scene().object);
     shaders.insert(
         SHADOW_MARCHER_SHADER_HANDLE.id(),
         Shader::from_wgsl(wgsl, "generated://marcher_shadow.wgsl"),

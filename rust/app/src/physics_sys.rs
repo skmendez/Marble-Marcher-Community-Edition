@@ -48,7 +48,7 @@ use bevy::prelude::*;
 use crate::fps_overlay::PhaseTimings;
 
 use marble_csg::physics::{GravityMode, Marble, PhysicsConfig, PlayerInput};
-use marble_rollback::{InputTransport, PlayerIndex, RollbackSim};
+use marble_rollback::{InputTransport, PlayerIndex, RollbackSim, Tick};
 
 use crate::camera::CameraOrbit;
 use crate::net::{NetSession, NetStatus, Role, WebRtcTransport, HOST_INDEX};
@@ -194,6 +194,37 @@ pub struct MultiplayerSession {
     /// (same idea `net::NetStatus::Disconnected`'s doc describes for the
     /// old single-joiner case, generalized to a set of indices).
     disconnected_remotes: Vec<PlayerIndex>,
+    /// A resync's tick+marbles, held here instead of applied immediately,
+    /// while this side waits for the *paired* scene bundle the host always
+    /// sends alongside any resync that grew the player count
+    /// (`marble_physics_tick_impl`'s host-side join handling sends
+    /// `ResyncPayload` and `SceneSync` back to back, same tick, same
+    /// reliable channel). `apply_resync_payload` stashes here rather than
+    /// calling `RollbackSim::hard_reset_to` directly whenever it detects
+    /// this call actually grew `num_players()` -- `RollbackSim::set_scene`
+    /// (not `hard_reset_to` alone) is what finally applies it, once
+    /// `render::apply_pending_scene_sync` decodes the matching scene bytes,
+    /// so the tick/marble jump and the scene swap land in the same instant
+    /// rather than one now and the other however many ticks later the
+    /// scene happens to arrive/decode. Getting this wrong doesn't just
+    /// leave a brief "wrong-scene" rendering glitch -- it corrupts
+    /// `RollbackSim`'s rewind window outright: applying the tick/marble
+    /// jump alone via `hard_reset_to` wipes every snapshot older than its
+    /// own tick, but the host has already been broadcasting real per-tick
+    /// input for ticks *between* that jump and whenever this side's own
+    /// clock catches up to it (the host considers itself synced the
+    /// instant it sends the pair, never waits on this side's scene to
+    /// apply first) -- once those in-flight messages are polled, several
+    /// of them land for ticks now older than this side's freshly-reset
+    /// `current_tick` but for which no snapshot survived the reset,
+    /// sending `resim_from` looking for a snapshot that was never kept and
+    /// panicking on the `.expect` that's supposed to be unreachable
+    /// (`RollbackSim::resim_from`'s doc). A plain checksum-mismatch resync
+    /// (`exchange_checksums_and_resync`) never has this problem -- the host
+    /// never sends a scene alongside one, so it never grows `num_players`,
+    /// and `apply_resync_payload` still applies that kind immediately,
+    /// exactly as before.
+    pending_join: Option<(Tick, Vec<Marble>)>,
 }
 
 impl MultiplayerSession {
@@ -206,9 +237,10 @@ impl MultiplayerSession {
     /// for, and `step_marble` never reads `orientation` unless `dx`/`dy`
     /// are nonzero, which they never are for a purely-predicted-forever
     /// player -- see this type's doc.
-    pub fn new_solo(initial_marbles: Vec<Marble>) -> Self {
+    pub fn new_solo(scene: marble_csg::Scene, initial_marbles: Vec<Marble>) -> Self {
         Self {
             sim: RollbackSim::new(
+                scene,
                 initial_marbles,
                 PlayerInput { dx: 0.0, dy: 0.0, orientation: Quat::IDENTITY },
                 ROLLBACK_WINDOW_TICKS,
@@ -219,6 +251,7 @@ impl MultiplayerSession {
             resync_pending: false,
             scene_synced: false,
             disconnected_remotes: Vec::new(),
+            pending_join: None,
         }
     }
 
@@ -231,6 +264,13 @@ impl MultiplayerSession {
     /// it's true.
     pub fn mark_scene_synced(&mut self) {
         self.scene_synced = true;
+    }
+
+    /// Takes whatever join/resync state `apply_resync_payload` stashed
+    /// (`pending_join`'s doc), for `render::apply_pending_scene_sync` to
+    /// apply atomically alongside the scene it just decoded.
+    pub fn take_pending_join(&mut self) -> Option<(Tick, Vec<Marble>)> {
+        self.pending_join.take()
     }
 }
 
@@ -343,6 +383,16 @@ fn exchange_checksums_and_resync(
 /// the time this reads it (this fn's own first-join narrow-down step is
 /// the one place that still needs to *write* it, to `0`, before any
 /// `Welcome` could plausibly have arrived).
+///
+/// Whether the incoming tick/marbles are applied immediately or stashed in
+/// `mp.pending_join` for `render::apply_pending_scene_sync` to apply
+/// atomically with a paired scene depends on whether this call actually
+/// grew `num_players()` -- see `MultiplayerSession::pending_join`'s doc for
+/// why that's the correct, always-available signal for "the host also sent
+/// a `SceneSync` alongside this one:" the host only ever sends a scene
+/// alongside a resync that grows the receiving side's player count
+/// (`marble_physics_tick_impl`'s host-side join handling), never for a
+/// plain checksum-mismatch correction.
 fn apply_resync_payload(mp: &mut MultiplayerSession, marble_state: &mut MarbleState) {
     let Some(transport) = mp.transport.as_mut() else { return };
     let Some((tick, marbles)) = transport.poll_resync_payloads().into_iter().next_back() else {
@@ -359,12 +409,38 @@ fn apply_resync_payload(mp: &mut MultiplayerSession, marble_state: &mut MarbleSt
         mp.joined = true;
     }
     // Grow to match the incoming player count -- a throwaway placeholder
-    // spawn point/radius, since `hard_reset_to` just below overwrites
-    // every player's actual state immediately regardless.
+    // spawn point/radius, since `hard_reset_to`/`set_scene` just below (or
+    // in `render::apply_pending_scene_sync`, once deferred) overwrites
+    // every player's actual state immediately regardless. Whether this
+    // loop actually iterates at least once is exactly the "a paired scene
+    // is in flight" signal `pending_join`'s doc describes.
+    let players_before_growth = mp.sim.num_players();
     while mp.sim.num_players() < marbles.len() {
         let idx = mp.sim.num_players();
         let placeholder_rad = mp.sim.marbles()[0].rad;
         mp.sim.add_player_at(idx, Marble::spawn(Vec3::ZERO, placeholder_rad));
+        // `marble_state.start_positions` must grow in lockstep with
+        // `mp.sim`'s own player count -- `RollbackSim::advance` runs every
+        // tick unconditionally (`marble_physics_tick_impl`'s bottom), and
+        // `step_marbles` asserts one start position per marble
+        // (`marble_csg::physics`'s doc) -- a throwaway placeholder here too,
+        // same reasoning as `add_player_at`'s spawn point above: whichever
+        // of the immediate-apply or deferred-to-`apply_pending_scene_sync`
+        // path runs overwrites this with the real value before it's ever
+        // actually used as a kill-plane respawn reference.
+        marble_state.start_positions.push(Vec3::ZERO);
+    }
+    if mp.sim.num_players() > players_before_growth {
+        // A scene is in flight for this exact resync -- defer the
+        // tick/marble jump until `render::apply_pending_scene_sync` can
+        // apply both atomically via `RollbackSim::set_scene`
+        // (`pending_join`'s doc).
+        info!(
+            "multiplayer: deferring join/resync state from host at tick {tick} until its paired scene sync arrives"
+        );
+        mp.pending_join = Some((tick, marbles));
+        mp.resync_pending = false;
+        return;
     }
     info!("multiplayer: adopting authoritative join/resync state from host at tick {tick}");
     mp.sim.hard_reset_to(tick, marbles);
@@ -423,7 +499,7 @@ pub fn marble_physics_tick(
     keys: Res<ButtonInput<KeyCode>>,
     touches: Res<Touches>,
     orbit: Res<CameraOrbit>,
-    scene: ResMut<SceneState>,
+    scene: Res<SceneState>,
     net: Res<NetSession>,
     mp: ResMut<MultiplayerSession>,
     marble_state: ResMut<MarbleState>,
@@ -440,7 +516,7 @@ fn marble_physics_tick_impl(
     keys: Res<ButtonInput<KeyCode>>,
     touches: Res<Touches>,
     orbit: Res<CameraOrbit>,
-    mut scene: ResMut<SceneState>,
+    scene: Res<SceneState>,
     net: Res<NetSession>,
     mut mp: ResMut<MultiplayerSession>,
     mut marble_state: ResMut<MarbleState>,
@@ -449,13 +525,14 @@ fn marble_physics_tick_impl(
     if !scene.kind.has_marble() {
         return;
     }
-    // A real `&mut SceneState`/`&mut MultiplayerSession` (not `ResMut`'s
-    // `Deref`/`DerefMut`, which go through method calls the borrow checker
-    // can't see through) so their individual fields below can be borrowed
-    // as the disjoint fields they actually are, in one call --
+    // `RollbackSim` now owns the scene itself (`marble_csg::Scene`'s doc),
+    // so `SceneState` no longer needs the disjoint-mutable-field-borrow
+    // trick this used to need alongside `mp` -- it's read-only here
+    // (`scene.kind` only). `mp` still needs it:
     // `exchange_checksums_and_resync` needs `&mut mp.sim` and
-    // `mp.transport.as_mut()` simultaneously, same reasoning as `scene`.
-    let scene = &mut *scene;
+    // `mp.transport.as_mut()` simultaneously, which `ResMut`'s
+    // `Deref`/`DerefMut` (going through method calls the borrow checker
+    // can't see through) wouldn't allow in one call.
     let mp = &mut *mp;
 
     if keys.just_pressed(KeyCode::KeyG) {
@@ -583,13 +660,10 @@ fn marble_physics_tick_impl(
                 // The host's whole scene tree, atomically alongside the
                 // tick+state push above -- see `marble_csg::Scene`'s
                 // module doc for why a joiner needs this at all, not just
-                // a `?scene=` name.
-                let scene_bundle = marble_csg::Scene {
-                    object: scene.object.clone(),
-                    params: scene.params.clone(),
-                    animations: scene.animations.clone(),
-                };
-                transport.send_scene_sync(scene_bundle.to_bytes());
+                // a `?scene=` name. `mp.sim.scene()` is the one
+                // authoritative copy -- no separate clone-and-rebuild
+                // needed, unlike before `RollbackSim` owned it.
+                transport.send_scene_sync(mp.sim.scene().to_bytes());
             }
         }
     }
@@ -689,18 +763,11 @@ fn marble_physics_tick_impl(
 
     let kill_y = marble_state.kill_y;
     let starts = marble_state.start_positions.clone();
-    // `receive_inputs`/`advance` re-evaluate `scene.animations` against
-    // each tick they (re)simulate internally (`RollbackSim`'s own doc) --
-    // this system never calls `apply_animations` itself.
-    if let Err(e) = mp.sim.receive_inputs(
-        &arrivals,
-        &scene.object,
-        &mut scene.params,
-        &scene.animations,
-        &marble_state.cfg,
-        kill_y,
-        &starts,
-    ) {
+    // `receive_inputs`/`advance` re-evaluate the scene's `animations`
+    // against each tick they (re)simulate internally, reading its own
+    // owned `Scene` rather than taking one as a parameter (`RollbackSim`'s
+    // own doc) -- this system never calls `apply_animations` itself.
+    if let Err(e) = mp.sim.receive_inputs(&arrivals, &marble_state.cfg, kill_y, &starts) {
         // Network conditions outran the rewind window. Milestone 2's
         // minimum bar (per the plan) is "don't crash or corrupt the
         // simulation" -- log and keep going with whatever state the
@@ -712,7 +779,7 @@ fn marble_physics_tick_impl(
             e.requested_tick, e.oldest_available
         );
     }
-    mp.sim.advance(&scene.object, &mut scene.params, &scene.animations, &marble_state.cfg, kill_y, &starts);
+    mp.sim.advance(&marble_state.cfg, kill_y, &starts);
     marble_state.marbles = mp.sim.marbles().to_vec();
 
     // Gated on `mp.joined && mp.scene_synced` too: comparing/publishing

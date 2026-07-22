@@ -19,6 +19,18 @@
 //! doc), so the only way this module can go wrong is in its own
 //! bookkeeping, not in the simulation it wraps.
 //!
+//! **[`RollbackSim`] owns its [`Scene`]** (the CSG tree + params +
+//! animation table) rather than taking it fresh as a parameter on every
+//! [`RollbackSim::advance`]/[`RollbackSim::receive_inputs`] call — this is
+//! the actual correctness precondition the guarantee above depends on: a
+//! resim across several ticks is only bit-identical to full-knowledge
+//! replay if every one of those ticks sees the *same* scene, and with
+//! `Scene` owned internally that's structurally guaranteed rather than
+//! resting on every caller happening to always pass the same one. The
+//! only way to change scene is [`RollbackSim::set_scene`], which also
+//! atomically resets marble/tick history (so there's never a tick where
+//! new marble/tick state pairs with an old scene, or vice versa).
+//!
 //! ## Design
 //!
 //! [`RollbackSim`] holds:
@@ -66,9 +78,9 @@ use std::collections::BTreeMap;
 
 use glam::Vec3;
 
-use marble_csg::expr::{apply_animations, Expr};
+use marble_csg::expr::apply_animations;
 use marble_csg::physics::{step_marbles, Marble, PhysicsConfig, PlayerInput, StepEvent};
-use marble_csg::{Object, Params};
+use marble_csg::Scene;
 
 /// Rollback's unit of time — one call to [`step_marbles`], not wall-clock
 /// time. Starts at `0` (the initial state, before any tick has been
@@ -103,6 +115,20 @@ enum InputStatus {
 /// [`step_marbles`]. See the module doc for the design and the correctness
 /// property this exists to guarantee.
 pub struct RollbackSim {
+    /// The one authoritative CSG scene (tree + params + animation table)
+    /// this session simulates against — owned here, not threaded through
+    /// as a parameter on every [`Self::advance`]/[`Self::receive_inputs`]
+    /// call. This is the actual correctness precondition the module doc's
+    /// bit-identical-resimulation guarantee depends on: with `scene` owned
+    /// internally, it's structurally impossible for two different calls to
+    /// simulate against an inconsistent scene (previously this only held by
+    /// convention — every caller happened to always pass the same
+    /// `Object`/`Params`/animations). Replaced only via [`Self::set_scene`],
+    /// which also resets marble/tick history atomically — the same
+    /// wholesale-replace-and-reseed [`Self::hard_reset_to`] already does
+    /// for marble/tick state alone, extended to cover scene too so there's
+    /// never a tick where the two could be inconsistent with each other.
+    scene: Scene,
     /// Live marble state — always exactly `step_marbles`'s output after
     /// simulating through `current_tick` (whether that simulation happened
     /// via [`Self::advance`] or a resimulation triggered by
@@ -201,11 +227,12 @@ impl RollbackSim {
     /// `initial_marbles.len()` (asserted) — same "one slot per player"
     /// convention `step_marbles` itself uses. `default_input` is the
     /// fallback prediction for a player with no confirmed history yet.
-    pub fn new(initial_marbles: Vec<Marble>, default_input: PlayerInput, window: u64) -> Self {
+    pub fn new(scene: Scene, initial_marbles: Vec<Marble>, default_input: PlayerInput, window: u64) -> Self {
         let num_players = initial_marbles.len();
         let mut snapshots = BTreeMap::new();
         snapshots.insert(0, initial_marbles.clone());
         Self {
+            scene,
             marbles: initial_marbles,
             current_tick: 0,
             snapshots,
@@ -223,6 +250,14 @@ impl RollbackSim {
     /// The live marble state, after simulating through `current_tick`.
     pub fn marbles(&self) -> &[Marble] {
         &self.marbles
+    }
+
+    /// The scene this session is currently simulating against (see
+    /// [`Self::scene`]'s field doc). Read this to build an outgoing
+    /// network scene-sync payload instead of reconstructing one from
+    /// separately-tracked geometry/params — there's only ever one to send.
+    pub fn scene(&self) -> &Scene {
+        &self.scene
     }
 
     /// Predicts player `player`'s input for `tick`: their most recent
@@ -260,26 +295,26 @@ impl RollbackSim {
 
     /// Simulates exactly one more tick (`current_tick + 1`), predicting any
     /// player's input that hasn't been confirmed for that tick yet.
-    /// `animations` is evaluated against *this* tick and written into
-    /// `params` before `step_marbles` runs (`expr::apply_animations`'s
-    /// doc — this is the live half of why animated geometry stays in the
-    /// same deterministic domain as marble state; [`Self::resim_from`] is
-    /// the replayed half). Returns that tick's [`StepEvent`]s (same
-    /// meaning as `step_marbles`'s own return — respawns, etc.).
-    #[allow(clippy::too_many_arguments)]
-    pub fn advance(
-        &mut self,
-        obj: &Object,
-        params: &mut Params,
-        animations: &[(marble_csg::ScalarParam, Expr)],
-        cfg: &PhysicsConfig,
-        kill_y: f32,
-        starts: &[Vec3],
-    ) -> Vec<StepEvent> {
+    /// `self.scene.animations` is evaluated against *this* tick and written
+    /// into `self.scene.params` before `step_marbles` runs
+    /// (`expr::apply_animations`'s doc — this is the live half of why
+    /// animated geometry stays in the same deterministic domain as marble
+    /// state; [`Self::resim_from`] is the replayed half). Returns that
+    /// tick's [`StepEvent`]s (same meaning as `step_marbles`'s own return —
+    /// respawns, etc.).
+    pub fn advance(&mut self, cfg: &PhysicsConfig, kill_y: f32, starts: &[Vec3]) -> Vec<StepEvent> {
         let tick = self.current_tick + 1;
-        apply_animations(params, animations, tick);
+        apply_animations(&mut self.scene.params, &self.scene.animations, tick);
         let inputs = self.build_inputs_for_tick(tick);
-        let events = step_marbles(&mut self.marbles, &inputs, obj, params, cfg, kill_y, starts);
+        let events = step_marbles(
+            &mut self.marbles,
+            &inputs,
+            &self.scene.object,
+            &self.scene.params,
+            cfg,
+            kill_y,
+            starts,
+        );
         self.snapshots.insert(tick, self.marbles.clone());
         self.current_tick = tick;
         self.prune();
@@ -310,13 +345,9 @@ impl RollbackSim {
     /// potentially wrong from that point and handle it (a real
     /// implementation would need a full resync from a peer here, not
     /// something this milestone's local-only scope needs to solve).
-    #[allow(clippy::too_many_arguments)]
     pub fn receive_inputs(
         &mut self,
         arrivals: &[(PlayerIndex, Tick, PlayerInput)],
-        obj: &Object,
-        params: &mut Params,
-        animations: &[(marble_csg::ScalarParam, Expr)],
         cfg: &PhysicsConfig,
         kill_y: f32,
         starts: &[Vec3],
@@ -356,7 +387,7 @@ impl RollbackSim {
         }
 
         if let Some(from_tick) = earliest_mismatch {
-            self.resim_from(from_tick, obj, params, animations, cfg, kill_y, starts);
+            self.resim_from(from_tick, cfg, kill_y, starts);
         }
         self.prune();
 
@@ -381,17 +412,7 @@ impl RollbackSim {
     /// Skipping this would silently reintroduce a desync risk one layer
     /// below marble state, exactly the class of bug this whole module
     /// exists to rule out.
-    #[allow(clippy::too_many_arguments)]
-    fn resim_from(
-        &mut self,
-        from_tick: Tick,
-        obj: &Object,
-        params: &mut Params,
-        animations: &[(marble_csg::ScalarParam, Expr)],
-        cfg: &PhysicsConfig,
-        kill_y: f32,
-        starts: &[Vec3],
-    ) {
+    fn resim_from(&mut self, from_tick: Tick, cfg: &PhysicsConfig, kill_y: f32, starts: &[Vec3]) {
         debug_assert!(from_tick >= 1, "tick 0 has no prior tick to have mispredicted");
         let base = from_tick - 1;
         let mut marbles = self
@@ -401,9 +422,17 @@ impl RollbackSim {
             .expect("resim_from called with a tick outside the retained window");
 
         for tick in from_tick..=self.current_tick {
-            apply_animations(params, animations, tick);
+            apply_animations(&mut self.scene.params, &self.scene.animations, tick);
             let inputs = self.build_inputs_for_tick(tick);
-            step_marbles(&mut marbles, &inputs, obj, params, cfg, kill_y, starts);
+            step_marbles(
+                &mut marbles,
+                &inputs,
+                &self.scene.object,
+                &self.scene.params,
+                cfg,
+                kill_y,
+                starts,
+            );
             self.snapshots.insert(tick, marbles.clone());
         }
         self.marbles = marbles;
@@ -527,6 +556,21 @@ impl RollbackSim {
         self.checksum_cache.clear();
     }
 
+    /// Atomically replaces this session's scene *and* does what
+    /// [`Self::hard_reset_to`] already does for marble/tick state
+    /// (wholesale replace + history reseed). Use this — not
+    /// `hard_reset_to` alone followed by a separate scene assignment —
+    /// whenever a marble/tick correction is paired with a genuine scene
+    /// change (multiplayer join-time sync): the whole point is that there
+    /// is never a tick at which this session's marble/tick state reflects
+    /// the new scene while `resim_from` would still replay against the
+    /// old one, or vice versa. `hard_reset_to` itself stays the right call
+    /// for a checksum-mismatch correction, which never changes scene.
+    pub fn set_scene(&mut self, tick: Tick, scene: Scene, marbles: Vec<Marble>) {
+        self.scene = scene;
+        self.hard_reset_to(tick, marbles);
+    }
+
     pub fn num_players(&self) -> usize {
         self.marbles.len()
     }
@@ -590,13 +634,16 @@ impl RollbackSim {
     /// (they were never networked to begin with) — while still preserving
     /// `current_tick` and the real local player's own live state and input
     /// history, the same continuity [`Self::add_player_at`] guarantees for
-    /// the common (non-`Demo`) case.
+    /// the common (non-`Demo`) case. Also carries `scene` through
+    /// unchanged — narrowing never touches scene, only which player slots
+    /// survive.
     pub fn narrow_to(&self, keep: PlayerIndex) -> Self {
         let mut snapshots = BTreeMap::new();
         for (&t, marbles) in &self.snapshots {
             snapshots.insert(t, vec![marbles[keep]]);
         }
         Self {
+            scene: self.scene.clone(),
             marbles: vec![self.marbles[keep]],
             current_tick: self.current_tick,
             snapshots,
@@ -782,8 +829,9 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use marble_csg::expr::Expr;
     use marble_csg::scenes::{demo_scene, set_fractal_params};
-    use marble_csg::{physics::PhysicsConfig, scenes::beware_of_bumps, ScalarParam, ScalarValue};
+    use marble_csg::{physics::PhysicsConfig, scenes::beware_of_bumps, Object, Params, ScalarParam, ScalarValue};
     use glam::Quat;
     use test_support::{InMemoryTransport, JitteredLink};
 
@@ -839,7 +887,7 @@ mod tests {
     /// later).
     #[test]
     fn rollback_replay_matches_full_knowledge_replay_under_constant_delay() {
-        let (object, mut params, marbles, starts) = two_player_setup();
+        let (object, params, marbles, starts) = two_player_setup();
         let cfg = PhysicsConfig::default();
         const TICKS: Tick = 200;
         const DELAY: Tick = 4;
@@ -854,48 +902,24 @@ mod tests {
         // Rollback: player 0's real input for tick T only "arrives"
         // (via receive_inputs) DELAY ticks late -- every tick in between
         // gets simulated on a *predicted* value first.
-        let mut sim = RollbackSim::new(marbles, input(0.0, 0.0), 16);
+        let mut sim = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, marbles, input(0.0, 0.0), 16);
         for tick in 1..=TICKS {
             // Player 1's own input is "confirmed" the instant it's needed
             // (as if it were the local player) -- only player 0 is
             // deliberately delayed, so every tick still exercises a real
             // misprediction-and-correction, not just "everything's late".
-            sim.receive_inputs(
-                &[(1, tick, scripted_input(1, tick))],
-                &object,
-                &mut params,
-                &[],
-                &cfg,
-                -1e6,
-                &starts,
-            )
+            sim.receive_inputs(&[(1, tick, scripted_input(1, tick))], &cfg, -1e6, &starts)
             .expect("within window");
-            sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+            sim.advance(&cfg, -1e6, &starts);
             if tick >= DELAY {
                 let confirm_tick = tick - DELAY + 1;
-                sim.receive_inputs(
-                    &[(0, confirm_tick, scripted_input(0, confirm_tick))],
-                    &object,
-                    &mut params,
-                    &[],
-                    &cfg,
-                    -1e6,
-                    &starts,
-                )
+                sim.receive_inputs(&[(0, confirm_tick, scripted_input(0, confirm_tick))], &cfg, -1e6, &starts)
                 .expect("within window");
             }
         }
         // Flush the remaining in-flight delayed confirmations for player 0.
         for confirm_tick in (TICKS - DELAY + 2)..=TICKS {
-            sim.receive_inputs(
-                &[(0, confirm_tick, scripted_input(0, confirm_tick))],
-                &object,
-                &mut params,
-                &[],
-                &cfg,
-                -1e6,
-                &starts,
-            )
+            sim.receive_inputs(&[(0, confirm_tick, scripted_input(0, confirm_tick))], &cfg, -1e6, &starts)
             .expect("within window");
         }
 
@@ -967,7 +991,7 @@ mod tests {
     /// the straight-through run almost immediately, not eventually.
     #[test]
     fn rollback_replay_with_an_animated_param_matches_full_knowledge_replay() {
-        let (object, mut params, animations, marbles, starts) = animated_sphere_setup();
+        let (object, params, animations, marbles, starts) = animated_sphere_setup();
         let cfg = PhysicsConfig::default();
         const TICKS: Tick = 200;
         const DELAY: Tick = 4;
@@ -988,43 +1012,19 @@ mod tests {
         // exactly the same shape as the plain-input test above, but now
         // every `advance`/`receive_inputs` call also carries the animation
         // table, so each resimulated tick re-evaluates the radius too.
-        let mut sim = RollbackSim::new(marbles, input(0.0, 0.0), 16);
+        let mut sim = RollbackSim::new(Scene { object, params, animations }, marbles, input(0.0, 0.0), 16);
         for tick in 1..=TICKS {
-            sim.receive_inputs(
-                &[(1, tick, scripted_input(1, tick))],
-                &object,
-                &mut params,
-                &animations,
-                &cfg,
-                -1e6,
-                &starts,
-            )
+            sim.receive_inputs(&[(1, tick, scripted_input(1, tick))], &cfg, -1e6, &starts)
             .expect("within window");
-            sim.advance(&object, &mut params, &animations, &cfg, -1e6, &starts);
+            sim.advance(&cfg, -1e6, &starts);
             if tick >= DELAY {
                 let confirm_tick = tick - DELAY + 1;
-                sim.receive_inputs(
-                    &[(0, confirm_tick, scripted_input(0, confirm_tick))],
-                    &object,
-                    &mut params,
-                    &animations,
-                    &cfg,
-                    -1e6,
-                    &starts,
-                )
+                sim.receive_inputs(&[(0, confirm_tick, scripted_input(0, confirm_tick))], &cfg, -1e6, &starts)
                 .expect("within window");
             }
         }
         for confirm_tick in (TICKS - DELAY + 2)..=TICKS {
-            sim.receive_inputs(
-                &[(0, confirm_tick, scripted_input(0, confirm_tick))],
-                &object,
-                &mut params,
-                &animations,
-                &cfg,
-                -1e6,
-                &starts,
-            )
+            sim.receive_inputs(&[(0, confirm_tick, scripted_input(0, confirm_tick))], &cfg, -1e6, &starts)
             .expect("within window");
         }
 
@@ -1064,12 +1064,12 @@ mod tests {
     /// what makes "all inputs are known" true before comparing.
     #[test]
     fn two_independent_clients_over_a_jittered_transport_converge() {
-        let (object, mut params, marbles, starts) = two_player_setup();
+        let (object, params, marbles, starts) = two_player_setup();
         let cfg = PhysicsConfig::default();
         const TICKS: Tick = 150;
 
-        let mut sim_a = RollbackSim::new(marbles.clone(), input(0.0, 0.0), 16);
-        let mut sim_b = RollbackSim::new(marbles, input(0.0, 0.0), 16);
+        let mut sim_a = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, marbles.clone(), input(0.0, 0.0), 16);
+        let mut sim_b = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, marbles, input(0.0, 0.0), 16);
         let mut transport_a = InMemoryTransport::new(0); // client A owns player 0
         let mut transport_b = InMemoryTransport::new(1); // client B owns player 1
         let mut link_a_to_b = JitteredLink::new(3);
@@ -1083,10 +1083,10 @@ mod tests {
             transport_a.send_input(tick, a_input);
             transport_b.send_input(tick, b_input);
             sim_a
-                .receive_inputs(&[(0, tick, a_input)], &object, &mut params, &[], &cfg, -1e6, &starts)
+                .receive_inputs(&[(0, tick, a_input)], &cfg, -1e6, &starts)
                 .unwrap();
             sim_b
-                .receive_inputs(&[(1, tick, b_input)], &object, &mut params, &[], &cfg, -1e6, &starts)
+                .receive_inputs(&[(1, tick, b_input)], &cfg, -1e6, &starts)
                 .unwrap();
 
             // Ferry each side's outgoing message through its jittered link
@@ -1099,18 +1099,18 @@ mod tests {
             let arrived_at_a = transport_a.poll_received();
             if !arrived_at_a.is_empty() {
                 sim_a
-                    .receive_inputs(&arrived_at_a, &object, &mut params, &[], &cfg, -1e6, &starts)
+                    .receive_inputs(&arrived_at_a, &cfg, -1e6, &starts)
                     .unwrap();
             }
             let arrived_at_b = transport_b.poll_received();
             if !arrived_at_b.is_empty() {
                 sim_b
-                    .receive_inputs(&arrived_at_b, &object, &mut params, &[], &cfg, -1e6, &starts)
+                    .receive_inputs(&arrived_at_b, &cfg, -1e6, &starts)
                     .unwrap();
             }
 
-            sim_a.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
-            sim_b.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+            sim_a.advance(&cfg, -1e6, &starts);
+            sim_b.advance(&cfg, -1e6, &starts);
         }
 
         // Drain phase (see this test's doc): no new ticks are simulated,
@@ -1122,13 +1122,13 @@ mod tests {
             let arrived_at_a = transport_a.poll_received();
             if !arrived_at_a.is_empty() {
                 sim_a
-                    .receive_inputs(&arrived_at_a, &object, &mut params, &[], &cfg, -1e6, &starts)
+                    .receive_inputs(&arrived_at_a, &cfg, -1e6, &starts)
                     .unwrap();
             }
             let arrived_at_b = transport_b.poll_received();
             if !arrived_at_b.is_empty() {
                 sim_b
-                    .receive_inputs(&arrived_at_b, &object, &mut params, &[], &cfg, -1e6, &starts)
+                    .receive_inputs(&arrived_at_b, &cfg, -1e6, &starts)
                     .unwrap();
             }
         }
@@ -1154,7 +1154,7 @@ mod tests {
     /// per arrival" property the module doc describes.
     #[test]
     fn simultaneous_multi_player_corrections_in_one_batch_resolve_correctly() {
-        let (object, mut params, marbles, starts) = two_player_setup();
+        let (object, params, marbles, starts) = two_player_setup();
         let cfg = PhysicsConfig::default();
         const TICKS: Tick = 40;
 
@@ -1168,9 +1168,9 @@ mod tests {
         // correcting several players/ticks at once, not about the
         // window-exceeded boundary (that has its own dedicated test) --
         // every tick this batch touches must still be in-window.
-        let mut sim = RollbackSim::new(marbles, input(0.0, 0.0), TICKS);
+        let mut sim = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, marbles, input(0.0, 0.0), TICKS);
         for _tick in 1..=TICKS {
-            sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts); // everything predicted
+            sim.advance(&cfg, -1e6, &starts); // everything predicted
         }
         // Now deliver a single batch correcting BOTH players across a wide,
         // non-contiguous spread of past ticks, all at once.
@@ -1179,7 +1179,7 @@ mod tests {
                 [(0usize, t, scripted_input(0, t)), (1usize, t, scripted_input(1, t))]
             })
             .collect();
-        sim.receive_inputs(&batch, &object, &mut params, &[], &cfg, -1e6, &starts).unwrap();
+        sim.receive_inputs(&batch, &cfg, -1e6, &starts).unwrap();
 
         for (i, (a, b)) in straight.iter().zip(sim.marbles().iter()).enumerate() {
             assert_eq!(a.pos, b.pos, "marble {i} position diverged after batched correction");
@@ -1192,7 +1192,7 @@ mod tests {
     /// still applied correctly -- order within `arrivals` must not matter.
     #[test]
     fn out_of_order_arrivals_within_a_batch_still_converge() {
-        let (object, mut params, marbles, starts) = two_player_setup();
+        let (object, params, marbles, starts) = two_player_setup();
         let cfg = PhysicsConfig::default();
         const TICKS: Tick = 20;
 
@@ -1202,9 +1202,9 @@ mod tests {
             step_marbles(&mut straight, &inputs, &object, &params, &cfg, -1e6, &starts);
         }
 
-        let mut sim = RollbackSim::new(marbles, input(0.0, 0.0), 32);
+        let mut sim = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, marbles, input(0.0, 0.0), 32);
         for _tick in 1..=TICKS {
-            sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+            sim.advance(&cfg, -1e6, &starts);
         }
         // Deliberately shuffled, not ascending, order within the batch.
         let mut batch: Vec<_> = (1..=TICKS).map(|t| (0usize, t, scripted_input(0, t))).collect();
@@ -1214,9 +1214,9 @@ mod tests {
         let (evens, odds): (Vec<_>, Vec<_>) = batch.into_iter().partition(|(_, t, _)| t % 2 == 0);
         let shuffled: Vec<_> = odds.into_iter().chain(evens).collect();
 
-        sim.receive_inputs(&shuffled, &object, &mut params, &[], &cfg, -1e6, &starts).unwrap();
+        sim.receive_inputs(&shuffled, &cfg, -1e6, &starts).unwrap();
         for tick in 1..=TICKS {
-            sim.receive_inputs(&[(1, tick, scripted_input(1, tick))], &object, &mut params, &[], &cfg, -1e6, &starts)
+            sim.receive_inputs(&[(1, tick, scripted_input(1, tick))], &cfg, -1e6, &starts)
                 .unwrap();
         }
 
@@ -1239,7 +1239,7 @@ mod tests {
     /// bug happened to cancel out by the final tick.
     #[test]
     fn correct_prediction_never_causes_a_resim_to_produce_wrong_intermediate_state() {
-        let (object, mut params, marbles, starts) = two_player_setup();
+        let (object, params, marbles, starts) = two_player_setup();
         let cfg = PhysicsConfig::default();
         let steady = input(0.3, -0.2);
         const TICKS: Tick = 60;
@@ -1251,24 +1251,16 @@ mod tests {
             straight_history.push(straight.clone());
         }
 
-        let mut sim = RollbackSim::new(marbles, steady, 16);
+        let mut sim = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, marbles, steady, 16);
         for tick in 1..=TICKS {
             // Confirm one tick behind -- the prediction (repeat last
             // confirmed) is *always* exactly `steady` here, i.e. always
             // correct, so this should never trigger a real resim.
             if tick > 1 {
-                sim.receive_inputs(
-                    &[(0, tick - 1, steady), (1, tick - 1, steady)],
-                    &object,
-                    &mut params,
-                    &[],
-                    &cfg,
-                    -1e6,
-                    &starts,
-                )
+                sim.receive_inputs(&[(0, tick - 1, steady), (1, tick - 1, steady)], &cfg, -1e6, &starts)
                 .unwrap();
             }
-            sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+            sim.advance(&cfg, -1e6, &starts);
             let expected = &straight_history[(tick - 1) as usize];
             for (i, (a, b)) in expected.iter().zip(sim.marbles().iter()).enumerate() {
                 assert_eq!(
@@ -1284,17 +1276,17 @@ mod tests {
     /// state that isn't what full-knowledge replay would have given.
     #[test]
     fn arrival_older_than_the_window_reports_window_exceeded() {
-        let (object, mut params, marbles, starts) = two_player_setup();
+        let (object, params, marbles, starts) = two_player_setup();
         let cfg = PhysicsConfig::default();
-        let mut sim = RollbackSim::new(marbles, input(0.0, 0.0), 4);
+        let mut sim = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, marbles, input(0.0, 0.0), 4);
 
         for tick in 1..=20 {
-            sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+            sim.advance(&cfg, -1e6, &starts);
             let _ = tick;
         }
         // Tick 1 is far outside a window-4 rewind horizon at current_tick=20.
         let result =
-            sim.receive_inputs(&[(0, 1, input(0.5, 0.5))], &object, &mut params, &[], &cfg, -1e6, &starts);
+            sim.receive_inputs(&[(0, 1, input(0.5, 0.5))], &cfg, -1e6, &starts);
         assert!(matches!(result, Err(WindowExceeded { requested_tick: 1, .. })));
     }
 
@@ -1306,18 +1298,18 @@ mod tests {
     /// itself beyond bookkeeping.
     #[test]
     fn advance_with_nothing_ever_confirmed_matches_plain_step_marbles_with_default_input() {
-        let (object, mut params) = setup();
+        let (object, params) = setup();
         let rad = beware_of_bumps::MARBLE_RAD;
         let start = beware_of_bumps::START + Vec3::new(0.0, 0.3, 0.0);
         let cfg = PhysicsConfig::default();
         let default = input(0.1, -0.2);
 
         let mut plain = vec![Marble::spawn(start, rad)];
-        let mut sim = RollbackSim::new(vec![Marble::spawn(start, rad)], default, 8);
+        let mut sim = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, vec![Marble::spawn(start, rad)], default, 8);
 
         for _ in 0..100 {
             step_marbles(&mut plain, &[default], &object, &params, &cfg, -1e6, &[start]);
-            sim.advance(&object, &mut params, &[], &cfg, -1e6, &[start]);
+            sim.advance(&cfg, -1e6, &[start]);
         }
 
         assert_eq!(plain[0].pos, sim.marbles()[0].pos);
@@ -1334,26 +1326,18 @@ mod tests {
     /// point); this is the regression test for that specific bug class.
     #[test]
     fn add_player_at_preserves_tick_and_existing_players_live_state() {
-        let (object, mut params, marbles, starts) = two_player_setup();
+        let (object, params, marbles, starts) = two_player_setup();
         let cfg = PhysicsConfig::default();
 
         // Starts solo -- only player 0, matching the always-on design
         // (physics_sys.rs's doc: single-player is just a session with one
         // confirmed local player and no remote peers ever arriving).
-        let mut sim = RollbackSim::new(vec![marbles[0]], input(0.0, 0.0), 16);
+        let mut sim = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, vec![marbles[0]], input(0.0, 0.0), 16);
         let solo_start = [starts[0]];
         for tick in 1..=50u64 {
-            sim.receive_inputs(
-                &[(0, tick, scripted_input(0, tick))],
-                &object,
-                &mut params,
-                &[],
-                &cfg,
-                -1e6,
-                &solo_start,
-            )
+            sim.receive_inputs(&[(0, tick, scripted_input(0, tick))], &cfg, -1e6, &solo_start)
             .unwrap();
-            sim.advance(&object, &mut params, &[], &cfg, -1e6, &solo_start);
+            sim.advance(&cfg, -1e6, &solo_start);
         }
 
         let tick_before_join = sim.current_tick();
@@ -1373,17 +1357,9 @@ mod tests {
         // Simulating onward with both players now just works, no special
         // post-join casing needed anywhere in this module.
         for tick in (tick_before_join + 1)..=(tick_before_join + 50) {
-            sim.receive_inputs(
-                &[(0, tick, scripted_input(0, tick)), (1, tick, scripted_input(1, tick))],
-                &object,
-                &mut params,
-                &[],
-                &cfg,
-                -1e6,
-                &starts,
-            )
+            sim.receive_inputs(&[(0, tick, scripted_input(0, tick)), (1, tick, scripted_input(1, tick))], &cfg, -1e6, &starts)
             .unwrap();
-            sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+            sim.advance(&cfg, -1e6, &starts);
         }
         assert_eq!(sim.current_tick(), tick_before_join + 50);
     }
@@ -1397,25 +1373,17 @@ mod tests {
     /// some of them.
     #[test]
     fn a_late_correction_for_a_pre_join_tick_still_resimulates_without_panicking() {
-        let (object, mut params, marbles, starts) = two_player_setup();
+        let (object, params, marbles, starts) = two_player_setup();
         let cfg = PhysicsConfig::default();
 
-        let mut sim = RollbackSim::new(vec![marbles[0]], input(0.0, 0.0), 16);
+        let mut sim = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, vec![marbles[0]], input(0.0, 0.0), 16);
         let solo_start = [starts[0]];
         for tick in 1..=10u64 {
             if tick != 5 {
-                sim.receive_inputs(
-                    &[(0, tick, scripted_input(0, tick))],
-                    &object,
-                    &mut params,
-                    &[],
-                    &cfg,
-                    -1e6,
-                    &solo_start,
-                )
+                sim.receive_inputs(&[(0, tick, scripted_input(0, tick))], &cfg, -1e6, &solo_start)
                 .unwrap();
             }
-            sim.advance(&object, &mut params, &[], &cfg, -1e6, &solo_start);
+            sim.advance(&cfg, -1e6, &solo_start);
         }
 
         sim.add_player_at(1, marbles[1]);
@@ -1423,15 +1391,7 @@ mod tests {
         // The real tick-5 input for player 0 finally arrives -- within the
         // window (current_tick=10, window=16), but at a tick that predates
         // the join at tick 10.
-        sim.receive_inputs(
-            &[(0, 5, scripted_input(0, 5))],
-            &object,
-            &mut params,
-            &[],
-            &cfg,
-            -1e6,
-            &starts,
-        )
+        sim.receive_inputs(&[(0, 5, scripted_input(0, 5))], &cfg, -1e6, &starts)
         .unwrap();
 
         assert_eq!(sim.current_tick(), 10);
@@ -1445,21 +1405,13 @@ mod tests {
     /// current tick, discarding everyone else.
     #[test]
     fn narrow_to_keeps_only_the_given_players_live_state_and_tick() {
-        let (object, mut params, marbles, starts) = two_player_setup();
+        let (object, params, marbles, starts) = two_player_setup();
         let cfg = PhysicsConfig::default();
-        let mut sim = RollbackSim::new(marbles, input(0.0, 0.0), 16);
+        let mut sim = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, marbles, input(0.0, 0.0), 16);
         for tick in 1..=20u64 {
-            sim.receive_inputs(
-                &[(0, tick, scripted_input(0, tick)), (1, tick, scripted_input(1, tick))],
-                &object,
-                &mut params,
-                &[],
-                &cfg,
-                -1e6,
-                &starts,
-            )
+            sim.receive_inputs(&[(0, tick, scripted_input(0, tick)), (1, tick, scripted_input(1, tick))], &cfg, -1e6, &starts)
             .unwrap();
-            sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+            sim.advance(&cfg, -1e6, &starts);
         }
         let player1_before = sim.marbles()[1];
         let tick_before = sim.current_tick();
@@ -1469,28 +1421,29 @@ mod tests {
         assert_eq!(narrowed.current_tick(), tick_before);
         assert_eq!(narrowed.marbles()[0].pos, player1_before.pos);
         assert_eq!(narrowed.marbles()[0].vel, player1_before.vel);
+        // `narrow_to` must carry `scene` through unchanged -- easy to miss
+        // since it hand-constructs a fresh `Self` (no `PartialEq` on
+        // `Scene`/`Object`/`Params`, so compare via `Debug`, the existing
+        // pattern this codebase already uses for these types).
+        assert_eq!(
+            format!("{:?}", narrowed.scene()),
+            format!("{:?}", sim.scene()),
+            "narrowing must not lose or alter the session's scene"
+        );
     }
 
     /// [`RollbackSim::respawn`] is only ever safe to call solo (its own
     /// doc) -- this just checks the mechanical reset itself.
     #[test]
     fn respawn_resets_position_and_velocity_in_place() {
-        let (object, mut params, marbles, starts) = two_player_setup();
+        let (object, params, marbles, starts) = two_player_setup();
         let cfg = PhysicsConfig::default();
-        let mut sim = RollbackSim::new(vec![marbles[0]], input(0.0, 0.0), 16);
+        let mut sim = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, vec![marbles[0]], input(0.0, 0.0), 16);
         let solo_start = [starts[0]];
         for tick in 1..=10u64 {
-            sim.receive_inputs(
-                &[(0, tick, scripted_input(0, tick))],
-                &object,
-                &mut params,
-                &[],
-                &cfg,
-                -1e6,
-                &solo_start,
-            )
+            sim.receive_inputs(&[(0, tick, scripted_input(0, tick))], &cfg, -1e6, &solo_start)
             .unwrap();
-            sim.advance(&object, &mut params, &[], &cfg, -1e6, &solo_start);
+            sim.advance(&cfg, -1e6, &solo_start);
         }
         assert_ne!(sim.marbles()[0].vel, Vec3::ZERO, "expected some motion before respawn");
 
@@ -1509,9 +1462,9 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn debug_perturb_position_is_a_direct_position_nudge() {
-        let (_, _, marbles, _) = two_player_setup();
+        let (object, params, marbles, _) = two_player_setup();
         let other_player_pos_before = marbles[1].pos;
-        let mut sim = RollbackSim::new(marbles.clone(), input(0.0, 0.0), 16);
+        let mut sim = RollbackSim::new(Scene { object, params, animations: vec![] }, marbles.clone(), input(0.0, 0.0), 16);
         sim.debug_perturb_position(0, Vec3::new(5.0, 0.0, 0.0));
         assert_eq!(sim.marbles()[0].pos, marbles[0].pos + Vec3::new(5.0, 0.0, 0.0));
         assert_eq!(sim.marbles()[1].pos, other_player_pos_before, "perturbing player 0 must not touch player 1");
@@ -1533,11 +1486,15 @@ mod tests {
         let animations = vec![(radius, anim.clone())];
         let object = Object::Sphere { radius: ScalarValue::Param(radius) };
 
-        let mut sim = RollbackSim::new(vec![marbles[0]], input(0.0, 0.0), 16);
+        // `sim` now owns the only copy of `params` that actually gets
+        // mutated by `advance` (`self.scene.params`) -- the local `params`
+        // above is just the seed value, frozen the instant it's cloned in,
+        // so every assertion below reads through `sim.scene()` instead.
+        let mut sim = RollbackSim::new(Scene { object, params, animations }, vec![marbles[0]], input(0.0, 0.0), 16);
         let solo_start = [starts[0]];
         for tick in 1..=30u64 {
-            sim.advance(&object, &mut params, &animations, &cfg, -1e6, &solo_start);
-            assert_eq!(params.scalar(radius), anim.eval(tick), "tick {tick} animation value diverged pre-join");
+            sim.advance(&cfg, -1e6, &solo_start);
+            assert_eq!(sim.scene().params.scalar(radius), anim.eval(tick), "tick {tick} animation value diverged pre-join");
         }
         let tick_at_join = sim.current_tick();
 
@@ -1545,8 +1502,8 @@ mod tests {
         assert_eq!(sim.current_tick(), tick_at_join, "join must not move the tick the animation is a function of");
 
         for tick in (tick_at_join + 1)..=(tick_at_join + 30) {
-            sim.advance(&object, &mut params, &animations, &cfg, -1e6, &starts);
-            assert_eq!(params.scalar(radius), anim.eval(tick), "tick {tick} animation value diverged post-join");
+            sim.advance(&cfg, -1e6, &starts);
+            assert_eq!(sim.scene().params.scalar(radius), anim.eval(tick), "tick {tick} animation value diverged post-join");
         }
     }
 
@@ -1584,7 +1541,7 @@ mod tests {
     /// tick's checksum along the way instead of just the final live state.
     #[test]
     fn checksum_of_an_eligible_tick_matches_the_full_knowledge_replay() {
-        let (object, mut params, marbles, starts) = two_player_setup();
+        let (object, params, marbles, starts) = two_player_setup();
         let cfg = PhysicsConfig::default();
         const TICKS: Tick = 200;
         const DELAY: Tick = 4;
@@ -1598,43 +1555,19 @@ mod tests {
             straight_history.insert(tick, straight.clone());
         }
 
-        let mut sim = RollbackSim::new(marbles, input(0.0, 0.0), WINDOW);
+        let mut sim = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, marbles, input(0.0, 0.0), WINDOW);
         for tick in 1..=TICKS {
-            sim.receive_inputs(
-                &[(1, tick, scripted_input(1, tick))],
-                &object,
-                &mut params,
-                &[],
-                &cfg,
-                -1e6,
-                &starts,
-            )
+            sim.receive_inputs(&[(1, tick, scripted_input(1, tick))], &cfg, -1e6, &starts)
             .expect("within window");
-            sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+            sim.advance(&cfg, -1e6, &starts);
             if tick >= DELAY {
                 let confirm_tick = tick - DELAY + 1;
-                sim.receive_inputs(
-                    &[(0, confirm_tick, scripted_input(0, confirm_tick))],
-                    &object,
-                    &mut params,
-                    &[],
-                    &cfg,
-                    -1e6,
-                    &starts,
-                )
+                sim.receive_inputs(&[(0, confirm_tick, scripted_input(0, confirm_tick))], &cfg, -1e6, &starts)
                 .expect("within window");
             }
         }
         for confirm_tick in (TICKS - DELAY + 2)..=TICKS {
-            sim.receive_inputs(
-                &[(0, confirm_tick, scripted_input(0, confirm_tick))],
-                &object,
-                &mut params,
-                &[],
-                &cfg,
-                -1e6,
-                &starts,
-            )
+            sim.receive_inputs(&[(0, confirm_tick, scripted_input(0, confirm_tick))], &cfg, -1e6, &starts)
             .expect("within window");
         }
 
@@ -1661,22 +1594,16 @@ mod tests {
     /// module.
     #[test]
     fn hard_reset_to_replaces_live_state_and_reseeds_a_working_window() {
-        let (object, mut params, marbles, starts) = two_player_setup();
+        let (object, params, marbles, starts) = two_player_setup();
         let cfg = PhysicsConfig::default();
-        let mut sim = RollbackSim::new(marbles, input(0.0, 0.0), 16);
+        let mut sim = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, marbles, input(0.0, 0.0), 16);
         for tick in 1..=30u64 {
-            sim.receive_inputs(
-                &[(0, tick, scripted_input(0, tick)), (1, tick, scripted_input(1, tick))],
-                &object,
-                &mut params,
-                &[],
-                &cfg,
-                -1e6,
-                &starts,
-            )
+            sim.receive_inputs(&[(0, tick, scripted_input(0, tick)), (1, tick, scripted_input(1, tick))], &cfg, -1e6, &starts)
             .unwrap();
-            sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+            sim.advance(&cfg, -1e6, &starts);
         }
+
+        let scene_before_reset = format!("{:?}", sim.scene());
 
         let authoritative_tick = 500;
         let authoritative_marbles = vec![
@@ -1689,37 +1616,147 @@ mod tests {
         assert_eq!(sim.marbles()[0].pos, authoritative_marbles[0].pos);
         assert_eq!(sim.marbles()[1].pos, authoritative_marbles[1].pos);
         assert_eq!(sim.marbles()[0].vel, Vec3::ZERO);
+        // `hard_reset_to` must never touch scene -- only `set_scene` does.
+        // This contract matters more now that a sibling method exists that
+        // deliberately does replace scene, so it's worth pinning down
+        // explicitly rather than leaving it implicit.
+        assert_eq!(
+            format!("{:?}", sim.scene()),
+            scene_before_reset,
+            "hard_reset_to must never alter the session's scene"
+        );
 
         // Simulating onward works immediately: a plain advance...
-        sim.receive_inputs(
-            &[(0, authoritative_tick + 1, scripted_input(0, authoritative_tick + 1))],
-            &object,
-            &mut params,
-            &[],
-            &cfg,
-            -1e6,
-            &starts,
-        )
+        sim.receive_inputs(&[(0, authoritative_tick + 1, scripted_input(0, authoritative_tick + 1))], &cfg, -1e6, &starts)
         .unwrap();
-        sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+        sim.advance(&cfg, -1e6, &starts);
         assert_eq!(sim.current_tick(), authoritative_tick + 1);
-        sim.advance(&object, &mut params, &[], &cfg, -1e6, &starts);
+        sim.advance(&cfg, -1e6, &starts);
         assert_eq!(sim.current_tick(), authoritative_tick + 2);
 
         // ...and a late correction landing right after the reset must
         // still trigger a valid rewind/resim against the *reseeded*
         // snapshot chain, not panic against pre-reset history.
-        sim.receive_inputs(
-            &[(0, authoritative_tick + 2, scripted_input(0, authoritative_tick + 2 + 1000))],
-            &object,
-            &mut params,
-            &[],
-            &cfg,
-            -1e6,
-            &starts,
-        )
+        sim.receive_inputs(&[(0, authoritative_tick + 2, scripted_input(0, authoritative_tick + 2 + 1000))], &cfg, -1e6, &starts)
         .unwrap();
         assert_eq!(sim.current_tick(), authoritative_tick + 2);
+    }
+
+    /// [`RollbackSim::set_scene`]'s core guarantee: after swapping to a
+    /// new scene, every subsequently simulated tick uses the *new* scene,
+    /// never a stale mix of new marble/tick state with old geometry --
+    /// the actual atomicity property this method exists to make
+    /// structurally unreachable to violate (see [`RollbackSim::scene`]'s
+    /// doc). Verified two ways: the swapped-in scene's `Debug` output is
+    /// what `scene()` reports immediately after the swap, and (more
+    /// importantly) a straight-through simulation of scene B's own
+    /// marbles from the swap tick forward matches what `sim` itself
+    /// produces afterward -- if `set_scene` left any part of scene A
+    /// behind, this comparison would diverge immediately (scene B's
+    /// geometry, a large sphere, is nothing like scene A's fractal
+    /// terrain).
+    #[test]
+    fn set_scene_swaps_scene_marbles_and_tick_atomically() {
+        let (object_a, params_a, marbles_a, starts_a) = two_player_setup();
+        let cfg = PhysicsConfig::default();
+
+        let mut sim = RollbackSim::new(
+            Scene { object: object_a, params: params_a, animations: vec![] },
+            marbles_a,
+            input(0.0, 0.0),
+            16,
+        );
+        for tick in 1..=10u64 {
+            sim.receive_inputs(
+                &[(0, tick, scripted_input(0, tick)), (1, tick, scripted_input(1, tick))],
+                &cfg,
+                -1e6,
+                &starts_a,
+            )
+            .unwrap();
+            sim.advance(&cfg, -1e6, &starts_a);
+        }
+
+        // Scene B: a completely different geometry (a single large
+        // sphere, nothing like scene A's fractal terrain) with its own
+        // fresh marbles and start positions.
+        let rad = beware_of_bumps::MARBLE_RAD;
+        let mut params_b = Params::new();
+        let sphere_radius = params_b.alloc_scalar(50.0);
+        let object_b = Object::Sphere { radius: ScalarValue::Param(sphere_radius) };
+        let starts_b = vec![Vec3::new(0.0, 50.0 + rad, 0.0), Vec3::new(1.0, 50.0 + rad, 0.0)];
+        let marbles_b: Vec<Marble> = starts_b.iter().map(|s| Marble::spawn(*s, rad)).collect();
+        let scene_b = Scene { object: object_b.clone(), params: params_b.clone(), animations: vec![] };
+
+        let swap_tick = 100;
+        sim.set_scene(swap_tick, scene_b, marbles_b.clone());
+
+        assert_eq!(
+            format!("{:?}", sim.scene()),
+            format!("{:?}", Scene { object: object_b.clone(), params: params_b.clone(), animations: vec![] }),
+            "set_scene must actually install the new scene"
+        );
+        assert_eq!(sim.current_tick(), swap_tick);
+        assert_eq!(sim.marbles()[0].pos, marbles_b[0].pos);
+
+        // Straight-through comparison: simulating scene B's own marbles
+        // from `swap_tick` forward, entirely independent of `sim`, must
+        // match what `sim` itself produces going forward.
+        let mut straight = marbles_b.clone();
+        const TICKS_AFTER: Tick = 60;
+        for t in 1..=TICKS_AFTER {
+            let inputs = vec![scripted_input(0, swap_tick + t), scripted_input(1, swap_tick + t)];
+            step_marbles(&mut straight, &inputs, &object_b, &params_b, &cfg, -1e6, &starts_b);
+        }
+
+        for tick in (swap_tick + 1)..=(swap_tick + TICKS_AFTER) {
+            sim.receive_inputs(
+                &[(0, tick, scripted_input(0, tick)), (1, tick, scripted_input(1, tick))],
+                &cfg,
+                -1e6,
+                &starts_b,
+            )
+            .unwrap();
+            sim.advance(&cfg, -1e6, &starts_b);
+        }
+
+        for (i, (a, b)) in straight.iter().zip(sim.marbles().iter()).enumerate() {
+            assert_eq!(a.pos, b.pos, "marble {i} position diverged after set_scene swap");
+            assert_eq!(a.vel, b.vel, "marble {i} velocity diverged after set_scene swap");
+        }
+    }
+
+    /// The other half of [`RollbackSim::set_scene`]'s atomicity guarantee:
+    /// not just "subsequent ticks use the new scene" (the test above), but
+    /// that it's *structurally impossible* for any correction to ever
+    /// resimulate a pre-swap tick against the new scene, because
+    /// `set_scene` (via [`RollbackSim::hard_reset_to`]) discards every
+    /// snapshot that could have made such a resim possible. A correction
+    /// for a tick before the swap must report [`WindowExceeded`], not
+    /// silently succeed (or panic) against history that no longer exists.
+    #[test]
+    fn a_correction_for_a_pre_set_scene_tick_is_rejected() {
+        let (object, params, marbles, starts) = two_player_setup();
+        let cfg = PhysicsConfig::default();
+        let mut sim =
+            RollbackSim::new(Scene { object, params, animations: vec![] }, marbles.clone(), input(0.0, 0.0), 16);
+        for _tick in 1..=20u64 {
+            sim.advance(&cfg, -1e6, &starts);
+        }
+
+        let swap_tick = 100;
+        let scene_b = Scene {
+            object: Object::Sphere { radius: ScalarValue::Const(5.0) },
+            params: Params::new(),
+            animations: vec![],
+        };
+        sim.set_scene(swap_tick, scene_b, marbles);
+
+        // Tick 10 is well before the swap at tick 100 -- long since
+        // discarded by the reseed -- so this must be WindowExceeded, not
+        // a silent (or panicking) resim against nonexistent history.
+        let result = sim.receive_inputs(&[(0, 10, scripted_input(0, 10))], &cfg, -1e6, &starts);
+        assert!(matches!(result, Err(WindowExceeded { requested_tick: 10, .. })));
     }
 
     /// The end-to-end scenario the whole feature exists for: two
@@ -1733,31 +1770,23 @@ mod tests {
     /// agree afterward.
     #[test]
     fn a_deliberately_corrupted_peer_is_detected_by_checksum_and_recovered_by_hard_reset() {
-        let (object, mut params, marbles, starts) = two_player_setup();
+        let (object, params, marbles, starts) = two_player_setup();
         let cfg = PhysicsConfig::default();
         const WINDOW: Tick = 16;
-        let mut authoritative = RollbackSim::new(marbles.clone(), input(0.0, 0.0), WINDOW);
-        let mut corrupted = RollbackSim::new(marbles, input(0.0, 0.0), WINDOW);
+        let mut authoritative = RollbackSim::new(Scene { object: object.clone(), params: params.clone(), animations: vec![] }, marbles.clone(), input(0.0, 0.0), WINDOW);
+        let mut corrupted = RollbackSim::new(Scene { object, params, animations: vec![] }, marbles, input(0.0, 0.0), WINDOW);
 
-        let feed = |sim: &mut RollbackSim, params: &mut Params, tick: Tick| {
-            sim.receive_inputs(
-                &[(0, tick, scripted_input(0, tick)), (1, tick, scripted_input(1, tick))],
-                &object,
-                params,
-                &[],
-                &cfg,
-                -1e6,
-                &starts,
-            )
+        let feed = |sim: &mut RollbackSim, tick: Tick| {
+            sim.receive_inputs(&[(0, tick, scripted_input(0, tick)), (1, tick, scripted_input(1, tick))], &cfg, -1e6, &starts)
             .unwrap();
-            sim.advance(&object, params, &[], &cfg, -1e6, &starts);
+            sim.advance(&cfg, -1e6, &starts);
         };
 
         // Both sides agree for a while, exactly like two real peers
         // exchanging identical confirmed input over a healthy connection.
         for tick in 1..=40u64 {
-            feed(&mut authoritative, &mut params, tick);
-            feed(&mut corrupted, &mut params, tick);
+            feed(&mut authoritative, tick);
+            feed(&mut corrupted, tick);
         }
         let agree_tick = authoritative.latest_checksum_tick().unwrap();
         assert_eq!(
@@ -1777,8 +1806,8 @@ mod tests {
         // propagates forward through `corrupted`'s own physics from here
         // on, exactly like a real silent divergence would.
         for tick in 41..=(40 + WINDOW + 10) {
-            feed(&mut authoritative, &mut params, tick);
-            feed(&mut corrupted, &mut params, tick);
+            feed(&mut authoritative, tick);
+            feed(&mut corrupted, tick);
         }
 
         let mismatch_tick = authoritative.latest_checksum_tick().unwrap();
@@ -1801,8 +1830,8 @@ mod tests {
         // symptom for one tick, it left both sides in a state that keeps
         // agreeing going forward.
         for tick in (corrupted.current_tick() + 1)..=(corrupted.current_tick() + WINDOW + 10) {
-            feed(&mut authoritative, &mut params, tick);
-            feed(&mut corrupted, &mut params, tick);
+            feed(&mut authoritative, tick);
+            feed(&mut corrupted, tick);
         }
         let recovered_tick = authoritative.latest_checksum_tick().unwrap();
         assert_eq!(

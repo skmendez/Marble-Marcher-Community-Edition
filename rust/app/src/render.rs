@@ -618,20 +618,6 @@ const MENGER_OSCILLATING_SPHERE_COLOR: Vec3 = Vec3::new(0.75, 0.25, 0.85);
 #[derive(Resource)]
 pub struct SceneState {
     pub kind: SceneKind,
-    /// The scene tree, queried each physics tick by
-    /// `physics_sys::marble_physics_tick` against every scene's marble.
-    pub object: Object,
-    pub params: Params,
-    /// Every `(param, expr)` this scene wants re-evaluated once per
-    /// simulated tick (`crate::expr` module doc) -- written by
-    /// `physics_sys::marble_physics_tick_impl` (offline path directly,
-    /// connected path via `RollbackSim::advance`/`receive_inputs`), read
-    /// here only to decide whether to re-upload `params` to the GPU this
-    /// frame. Empty for every scene except
-    /// [`SceneKind::MengerOscillatingSphere`] today, but any future scene
-    /// that wants an animated param just needs to populate this instead of
-    /// adding another one-off `SceneHandles` match arm to `update_frame_data`.
-    pub animations: Vec<(ScalarParam, Expr)>,
     /// Not read anywhere now (see [`SceneHandles`]'s own doc on why) --
     /// kept alongside its variants for the same future-per-scene-toggle
     /// reason.
@@ -875,17 +861,17 @@ pub fn setup(
         MarcherQuad,
     ));
 
-    commands.insert_resource(SceneState {
-        kind,
-        object,
-        params,
-        animations,
-        handles,
-        material,
-        bounding_sphere,
-    });
+    commands.insert_resource(SceneState { kind, handles, material, bounding_sphere });
 
-    commands.insert_resource(MultiplayerSession::new_solo(marbles.clone()));
+    // `RollbackSim` (inside `MultiplayerSession`) owns the one
+    // authoritative `Scene` from here on -- see `marble_csg::Scene`'s doc
+    // for why that's the actual correctness precondition rollback
+    // determinism depends on. `object`/`params`/`animations` were only
+    // ever borrowed above (shader generation, `pack_bounding_sphere`,
+    // `MarcherFrameData`'s initial upload), so moving them here doesn't
+    // disturb anything already done with them.
+    let scene = Scene { object, params, animations };
+    commands.insert_resource(MultiplayerSession::new_solo(scene, marbles.clone()));
 
     commands.insert_resource(MarbleState {
         marbles,
@@ -921,11 +907,21 @@ pub fn setup(
 /// module doc) -- cheap and correct to do unconditionally here since a scene
 /// resync already forces a full shader regen (pipeline recompile) regardless,
 /// unlike the per-frame path this would be wasteful on.
+///
+/// Applies `mp.pending_join`'s stashed tick/marbles atomically alongside the
+/// scene via `RollbackSim::set_scene`, rather than reusing whatever tick/
+/// marbles `mp.sim` currently happens to hold (`MultiplayerSession::
+/// pending_join`'s doc on why the latter corrupts the rewind window). A
+/// scene bundle without a paired `pending_join` shouldn't happen on the
+/// current wire protocol (the host only ever sends one alongside a
+/// growing resync, `apply_resync_payload`'s doc) -- logged loudly rather
+/// than silently guessed at if it ever does.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_pending_scene_sync(
     mut pending_scene: ResMut<PendingSceneSync>,
     mut scene_state: ResMut<SceneState>,
     mut mp: ResMut<MultiplayerSession>,
+    mut marble_state: ResMut<MarbleState>,
     mut shaders: ResMut<Assets<Shader>>,
     mut frame: ResMut<MarcherFrameData>,
     mut fine_materials: ResMut<Assets<FineMarcherMaterial>>,
@@ -939,16 +935,28 @@ pub fn apply_pending_scene_sync(
         warn!("multiplayer: received an undecodable scene-sync payload -- ignoring it");
         return;
     };
-    let Scene { object, params, animations } = scene;
 
-    let wgsl = generate_shader(&object);
+    let wgsl = generate_shader(&scene.object);
     shaders.insert(MARCHER_SHADER_HANDLE.id(), Shader::from_wgsl(wgsl, "generated://marcher.wgsl"));
     frame.params.clear();
-    frame.params.extend_from_slice(params.slots());
-    scene_state.bounding_sphere = pack_bounding_sphere(&object, &params);
-    scene_state.object = object;
-    scene_state.params = params;
-    scene_state.animations = animations;
+    frame.params.extend_from_slice(scene.params.slots());
+    scene_state.bounding_sphere = pack_bounding_sphere(&scene.object, &scene.params);
+    match mp.take_pending_join() {
+        Some((tick, marbles)) => {
+            mp.sim.set_scene(tick, scene, marbles.clone());
+            marble_state.start_positions = marbles.iter().map(|m| m.pos).collect();
+            marble_state.marbles = marbles;
+        }
+        None => {
+            error!(
+                "multiplayer: scene sync arrived with no paired join/resync state pending -- \
+                 applying it to the current tick/marbles as a fallback, but this should be unreachable"
+            );
+            let current_tick = mp.sim.current_tick();
+            let current_marbles = mp.sim.marbles().to_vec();
+            mp.sim.set_scene(current_tick, scene, current_marbles);
+        }
+    }
 
     fine_materials.get_mut(&scene_state.material);
     for mesh_material in &coarse_quads {
@@ -1101,24 +1109,24 @@ fn update_frame_data_impl(
 ) {
     // Scene-agnostic animated-param upload: `physics_sys::
     // marble_physics_tick_impl` already wrote this tick's evaluated values
-    // straight into `scene_state.params` (offline path directly, connected
-    // path via `RollbackSim` -- see `SceneState::animations`'s doc for why
-    // evaluation doesn't happen here). This system just has to get the
-    // result into `frame.params`; skipped entirely for scenes with no
-    // animations (the common case) rather than re-copying an unchanged
-    // slice every frame for no reason. (The `Demo` scene's older
-    // wall-clock-driven `ang1` wobble that used to live here was removed --
-    // it was already dead on the deployed web build (native-`env::var`-only,
-    // no query-param path), and reviving it would've meant giving a
-    // non-deterministic, desync-prone animation mechanism a live path to
-    // the actual deployed multiplayer game, the opposite direction from
-    // this session's `Expr`/tick-driven animation work. `menger_oscillating_
-    // sphere` is the real, shipped, deterministic way to get animated
-    // geometry now.)
-    let params_changed = !scene_state.animations.is_empty();
+    // straight into `mp.sim.scene().params` (offline path directly,
+    // connected path via `RollbackSim::advance`/`receive_inputs`, which
+    // read/write the same owned `Scene` -- `marble_csg::Scene`'s doc).
+    // This system just has to get the result into `frame.params`; skipped
+    // entirely for scenes with no animations (the common case) rather
+    // than re-copying an unchanged slice every frame for no reason. (The
+    // `Demo` scene's older wall-clock-driven `ang1` wobble that used to
+    // live here was removed -- it was already dead on the deployed web
+    // build (native-`env::var`-only, no query-param path), and reviving
+    // it would've meant giving a non-deterministic, desync-prone
+    // animation mechanism a live path to the actual deployed multiplayer
+    // game, the opposite direction from this session's `Expr`/tick-driven
+    // animation work. `menger_oscillating_sphere` is the real, shipped,
+    // deterministic way to get animated geometry now.)
+    let params_changed = !mp.sim.scene().animations.is_empty();
     if params_changed {
         frame.params.clear();
-        frame.params.extend_from_slice(scene_state.params.slots());
+        frame.params.extend_from_slice(mp.sim.scene().params.slots());
     }
 
     let t = time.elapsed_secs();

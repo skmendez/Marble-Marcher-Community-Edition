@@ -57,6 +57,7 @@ use bevy::window::PrimaryWindow;
 use marble_csg::codegen::generate_coarse_shader;
 
 use crate::gpu::MarcherGpuBuffers;
+use crate::physics_sys::MultiplayerSession;
 use crate::render::{SceneState, SceneUniforms};
 
 /// All MRRM coarse-pass entities (camera + quad) live on this layer --
@@ -283,8 +284,9 @@ pub fn setup_mrrm_pipeline(
     mut images: ResMut<Assets<Image>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     scene_state: Res<SceneState>,
+    mp: Res<MultiplayerSession>,
 ) {
-    let wgsl = generate_coarse_shader(&scene_state.object);
+    let wgsl = generate_coarse_shader(&mp.sim.scene().object);
     shaders.insert(
         COARSE_MARCHER_SHADER_HANDLE.id(),
         Shader::from_wgsl(wgsl, "generated://marcher_coarse.wgsl"),
