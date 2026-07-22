@@ -349,9 +349,12 @@ pub mod beware_of_bumps {
     /// Raw (pre-normalization) sun direction from the level file.
     const SUN_DIR_RAW: Vec3 = Vec3::new(0.637, 0.771, 0.017);
 
-    /// Unit sun direction (toward the sun).
+    /// Unit sun direction (toward the sun). Cached: called twice per frame
+    /// (fine + shadow pass uniforms in `render.rs`), and `Vec3::normalize`
+    /// on a compile-time-constant input is pure wasted work to repeat.
     pub fn sun_dir() -> Vec3 {
-        SUN_DIR_RAW.normalize()
+        static SUN_DIR: std::sync::OnceLock<Vec3> = std::sync::OnceLock::new();
+        *SUN_DIR.get_or_init(|| SUN_DIR_RAW.normalize())
     }
 }
 

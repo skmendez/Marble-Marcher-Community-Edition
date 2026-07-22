@@ -325,7 +325,10 @@ fn update_render_resolution_text(
     let Ok(window) = windows.single() else {
         return;
     };
-    text.0 = format!("render: {}x{}", window.physical_width(), window.physical_height());
+    let new_text = format!("render: {}x{}", window.physical_width(), window.physical_height());
+    if text.0 != new_text {
+        text.0 = new_text;
+    }
 }
 
 fn update_phase_timings_text(
@@ -343,7 +346,10 @@ fn update_phase_timings_text(
         .iter()
         .filter_map(|(name, window)| window.averaged().map(|(_, ms)| format!("{name}={ms:.2}ms")))
         .collect();
-    text.0 = format!("cpu phases: {}", parts.join(" "));
+    let new_text = format!("cpu phases: {}", parts.join(" "));
+    if text.0 != new_text {
+        text.0 = new_text;
+    }
 }
 
 fn update_orbit_debug_text(
@@ -369,13 +375,16 @@ fn update_orbit_debug_text(
         ),
         _ => format!("touches: {}", touch_debug.active_count),
     };
-    text.0 = format!(
+    let new_text = format!(
         "twist: {:.1}deg forward: ({:.3}, {:.3}, {:.3})\n{touch_line}",
         twist_debug.0.to_degrees(),
         f.x,
         f.y,
         f.z
     );
+    if text.0 != new_text {
+        text.0 = new_text;
+    }
 }
 
 /// See [`MarblesDebugText`]'s doc for why this exists. One line per marble:
@@ -400,7 +409,10 @@ fn update_marbles_debug_text(
             m.vel.length()
         ));
     }
-    text.0 = lines.join("\n");
+    let new_text = lines.join("\n");
+    if text.0 != new_text {
+        text.0 = new_text;
+    }
 }
 
 fn update_fps_text(window: Res<FrameTimeWindow>, mut text: Query<&mut Text, With<FpsText>>) {
@@ -410,7 +422,10 @@ fn update_fps_text(window: Res<FrameTimeWindow>, mut text: Query<&mut Text, With
     let Some((fps, frame_ms)) = window.averaged() else {
         return;
     };
-    text.0 = format!("FPS: {fps:.1} ({frame_ms:.1}ms)");
+    let new_text = format!("FPS: {fps:.1} ({frame_ms:.1}ms)");
+    if text.0 != new_text {
+        text.0 = new_text;
+    }
 }
 
 #[cfg(test)]

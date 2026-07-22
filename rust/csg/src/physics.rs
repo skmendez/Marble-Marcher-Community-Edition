@@ -193,6 +193,11 @@ pub fn collide(
     let mut on_ground = false;
     let mut crushed = false;
     let mut pos = body_pos;
+    // Reused across every contacting sample below instead of letting
+    // `nearest_point` allocate a fresh fold-history `Vec` per call --
+    // `nearest_point_scratch`'s own doc guarantees it's left empty after
+    // each call, so it's always safe to reuse as-is for the next one.
+    let mut hist = Vec::new();
 
     for sample in samples {
         let rad = sample.radius;
@@ -209,7 +214,7 @@ pub fn collide(
             break; // C++ returns immediately on crush; no further samples matter.
         }
 
-        let np = obj.nearest_point(sample_pos.extend(1.0), params);
+        let np = obj.nearest_point_scratch(sample_pos.extend(1.0), params, &mut hist);
         let d = np - sample_pos;
         let dn = d.normalize();
         let dv = vel.dot(dn);

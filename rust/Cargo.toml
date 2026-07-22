@@ -28,3 +28,14 @@ codegen-units = 1  # required for LTO to fully inline/dedupe across crates
 panic = "abort"    # drop unwinding tables; nothing in this codebase catches
                    # panics (no catch_unwind/std::panic use anywhere in rust/)
 strip = true       # drop symbols/debuginfo; not needed for a shipped build
+
+# marble-csg's inner loops (physics substeps, CSG tree DE/nearest_point
+# evaluation, rollback resimulation) are real Rust-side execution speed on
+# the *native* build specifically -- `opt-level = "z"` above suppresses
+# inlining/vectorization there for a size win that only matters for the
+# wasm deploy artifact this package isn't part of (it's linked into the
+# native binary too, but native binary size isn't the same constraint).
+# Negligible size cost, real math-speed win for anyone running the native
+# build; doesn't affect the wasm/deployed build's size at all.
+[profile.release.package.marble-csg]
+opt-level = 3

@@ -47,9 +47,29 @@ impl Object {
     }
 
     /// Nearest point on the surface to `p`, in the same space as `p.xyz`.
-    /// `Fractal` allocates one history `Vec` per call (fold → base lookup →
-    /// unfold); other variants are allocation-free (aside from recursion).
+    /// Allocates its own history `Vec` for the `Fractal` case -- fine for
+    /// occasional callers, but see [`Self::nearest_point_scratch`] for a
+    /// hot-path variant that reuses a caller-owned buffer instead.
     pub fn nearest_point(&self, p: Vec4, params: &Params) -> Vec3 {
+        let mut hist = Vec::new();
+        self.nearest_point_scratch(p, params, &mut hist)
+    }
+
+    /// Same as [`Self::nearest_point`], but takes a caller-owned scratch
+    /// buffer for the `Fractal` case's fold history instead of allocating a
+    /// fresh `Vec` per call -- for hot paths that call this repeatedly
+    /// (`physics::collide`, once per contacting sample per substep; rollback
+    /// resimulation multiplies this further), the caller can reuse the same
+    /// buffer across calls instead of paying a fresh heap allocation each
+    /// time. Requires `hist` to already be empty on entry (the caller's
+    /// responsibility -- a fresh `Vec::new()`, or a buffer proven empty by a
+    /// prior call's own `debug_assert!` below) and guarantees it's empty
+    /// again on return. **Deliberately does not clear `hist` itself**: a
+    /// `Fractal` node's `base` can itself be a nested `Fractal`, which must
+    /// share (not reset) this same buffer as a proper push/pop stack across
+    /// the whole recursion -- clearing on entry would wipe an outer, still
+    /// in-progress fold's history before its own `unfold` ever consumes it.
+    pub fn nearest_point_scratch(&self, p: Vec4, params: &Params, hist: &mut Vec<Vec4>) -> Vec3 {
         match self {
             Object::Sphere { radius } => p.truncate().normalize() * radius.get(params),
             Object::Cuboid { half_extent } => {
@@ -58,34 +78,33 @@ impl Object {
             }
             Object::Fractal { fold, base } => {
                 let mut pp = p;
-                let mut hist = Vec::new();
-                fold.fold_with_history(&mut pp, &mut hist, params);
-                let mut n = base.nearest_point(pp, params);
-                fold.unfold(&mut hist, &mut n, params);
+                fold.fold_with_history(&mut pp, hist, params);
+                let mut n = base.nearest_point_scratch(pp, params, hist);
+                fold.unfold(hist, &mut n, params);
                 debug_assert!(hist.is_empty(), "fold history not fully consumed");
                 n
             }
             Object::Union(left, right) => {
                 if left.de(p, params) < right.de(p, params) {
-                    left.nearest_point(p, params)
+                    left.nearest_point_scratch(p, params, hist)
                 } else {
-                    right.nearest_point(p, params)
+                    right.nearest_point_scratch(p, params, hist)
                 }
             }
             Object::Intersect(left, right) => {
                 if left.de(p, params) > right.de(p, params) {
-                    left.nearest_point(p, params)
+                    left.nearest_point_scratch(p, params, hist)
                 } else {
-                    right.nearest_point(p, params)
+                    right.nearest_point_scratch(p, params, hist)
                 }
             }
             Object::Difference(left, right) => {
                 let left_dist = left.de(p, params);
                 let right_dist = -right.de(p, params);
                 if left_dist > right_dist {
-                    left.nearest_point(p, params)
+                    left.nearest_point_scratch(p, params, hist)
                 } else {
-                    right.nearest_point(p, params)
+                    right.nearest_point_scratch(p, params, hist)
                 }
             }
         }
