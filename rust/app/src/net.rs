@@ -1,5 +1,5 @@
 //! Multiplayer milestone 2: real cross-machine transport for
-//! [`marble_csg::rollback::InputTransport`], over WebRTC via PeerJS.
+//! [`marble_rollback::InputTransport`], over WebRTC via PeerJS.
 //!
 //! All the actual `Peer`/`DataConnection` object/callback handling lives in
 //! `rust/web/net.js` (loaded before the wasm module — see `index.html`),
@@ -28,14 +28,14 @@
 //! behavior. A session always starts hosting in the background (creating a
 //! `Peer` costs nothing if nobody ever uses the resulting link), but
 //! `physics_sys.rs` only switches from its existing direct `step_marbles`
-//! call to a [`RollbackSim`](marble_csg::rollback::RollbackSim)-driven one
+//! call to a [`RollbackSim`](marble_rollback::RollbackSim)-driven one
 //! once a real `DataConnection` actually opens — never just because a
 //! `Peer` exists.
 
 use bevy::prelude::*;
 
 use marble_csg::physics::{Marble, PlayerInput};
-use marble_csg::rollback::{InputTransport, PlayerIndex, Tick};
+use marble_rollback::{InputTransport, PlayerIndex, Tick};
 
 use crate::web_config::query_param;
 

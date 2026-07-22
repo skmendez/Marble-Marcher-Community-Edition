@@ -1,7 +1,10 @@
 //! Multiplayer milestone 1: rollback netcode around
-//! [`physics::step_marbles`] — pure logic, no bevy (same reasoning as
-//! `physics.rs`: this needs to be unit-testable without spinning up an ECS,
-//! and nothing here touches anything bevy-specific).
+//! [`marble_csg::physics::step_marbles`] — pure logic, no bevy (same
+//! reasoning as `marble-csg`'s own `physics.rs`: this needs to be
+//! unit-testable without spinning up an ECS, and nothing here touches
+//! anything bevy-specific). Split into its own crate from `marble-csg`
+//! since this is real-time netcode, not CSG geometry — depends on
+//! `marble-csg`'s public API only, never the reverse.
 //!
 //! The one property everything below exists to guarantee: **simulating a
 //! tick range with rollback (predicting missing inputs, then rewinding and
@@ -63,9 +66,9 @@ use std::collections::BTreeMap;
 
 use glam::Vec3;
 
-use crate::expr::{apply_animations, Expr};
-use crate::physics::{step_marbles, Marble, PhysicsConfig, PlayerInput, StepEvent};
-use crate::{Object, Params};
+use marble_csg::expr::{apply_animations, Expr};
+use marble_csg::physics::{step_marbles, Marble, PhysicsConfig, PlayerInput, StepEvent};
+use marble_csg::{Object, Params};
 
 /// Rollback's unit of time — one call to [`step_marbles`], not wall-clock
 /// time. Starts at `0` (the initial state, before any tick has been
@@ -74,11 +77,11 @@ use crate::{Object, Params};
 /// fixed-timestep schedule (`FixedUpdate`, matching `physics_sys.rs`'s
 /// existing convention) gets ticks that line up with real 60Hz frames for
 /// free, but this module itself has no notion of wall-clock time at all.
-/// Re-exported from the crate root (`Tick`'s doc there) — defined at the
-/// crate root now, not here, since `expr` needs it too and this module
-/// needs `expr::Expr`; kept re-exported under this path unchanged so
-/// existing `rollback::Tick` references don't need updating.
-pub use crate::Tick;
+/// Defined in `marble_csg`'s crate root (its own `expr` module needs it
+/// too), re-exported here so existing `rollback::Tick`-style references
+/// (now `marble_rollback::Tick`) don't need to reach into `marble_csg`
+/// directly for a type this module uses constantly.
+pub use marble_csg::Tick;
 
 /// A stable index identifying which [`PlayerInput`]/[`Marble`] slot belongs
 /// to which player — the exact same convention [`step_marbles`] already
@@ -268,7 +271,7 @@ impl RollbackSim {
         &mut self,
         obj: &Object,
         params: &mut Params,
-        animations: &[(crate::ScalarParam, Expr)],
+        animations: &[(marble_csg::ScalarParam, Expr)],
         cfg: &PhysicsConfig,
         kill_y: f32,
         starts: &[Vec3],
@@ -313,7 +316,7 @@ impl RollbackSim {
         arrivals: &[(PlayerIndex, Tick, PlayerInput)],
         obj: &Object,
         params: &mut Params,
-        animations: &[(crate::ScalarParam, Expr)],
+        animations: &[(marble_csg::ScalarParam, Expr)],
         cfg: &PhysicsConfig,
         kill_y: f32,
         starts: &[Vec3],
@@ -384,7 +387,7 @@ impl RollbackSim {
         from_tick: Tick,
         obj: &Object,
         params: &mut Params,
-        animations: &[(crate::ScalarParam, Expr)],
+        animations: &[(marble_csg::ScalarParam, Expr)],
         cfg: &PhysicsConfig,
         kill_y: f32,
         starts: &[Vec3],
@@ -537,7 +540,7 @@ impl RollbackSim {
     /// building a fresh 2-player one — `current_tick`, every already-live
     /// player's simulated state, and their confirmed input history all
     /// carry through completely unbroken (no snapshot/rewind discontinuity,
-    /// and critically for [`crate::expr`]-driven animated params, no reset
+    /// and critically for [`marble_csg::expr`]-driven animated params, no reset
     /// of the tick an animation is a function of either — the fractal
     /// doesn't visibly jump/restart the moment someone joins).
     ///
@@ -779,8 +782,8 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scenes::{demo_scene, set_fractal_params};
-    use crate::{physics::PhysicsConfig, scenes::beware_of_bumps, ScalarParam, ScalarValue};
+    use marble_csg::scenes::{demo_scene, set_fractal_params};
+    use marble_csg::{physics::PhysicsConfig, scenes::beware_of_bumps, ScalarParam, ScalarValue};
     use glam::Quat;
     use test_support::{InMemoryTransport, JitteredLink};
 
@@ -1515,7 +1518,7 @@ mod tests {
     }
 
     /// The animation half of continuity: since [`Expr::eval`] is a pure
-    /// function of `Tick` alone (`crate::expr`'s module doc), and joining
+    /// function of `Tick` alone (`marble_csg::expr`'s module doc), and joining
     /// never resets the tick (this test module's `add_player_at_*` test
     /// above), an animated param's value right before and right after a
     /// join must be *identical* if evaluated at the same tick -- there is

@@ -1,0 +1,10 @@
+[package]
+name = "marble-rollback"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Deterministic rollback netcode (snapshot/rewind/resimulate) around marble-csg's physics"
+
+[dependencies]
+glam = "0.29"
+marble-csg = { path = "../csg" }

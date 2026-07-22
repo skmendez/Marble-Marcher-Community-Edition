@@ -7,6 +7,7 @@ description = "Ray-marched CSG renderer port of Marble Marcher CE's fractal fram
 
 [dependencies]
 marble-csg = { path = "../csg" }
+marble-rollback = { path = "../rollback" }
 bevy = { version = "0.16", default-features = false, features = [
     "std",
     "bevy_asset",

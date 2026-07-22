@@ -18,19 +18,21 @@
 //!  - `scenes`   (M2): prebuilt scenes (classic Marble Marcher fractal, etc.)
 //!  - `codegen`  (M3): WGSL generation from an `Object` tree
 //!  - `physics`  (M5): marble/collider simulation against an `Object`
-//!  - `rollback` (multiplayer milestone 1): input buffering + snapshot/
-//!    rewind/resimulate rollback netcode around `physics::step_marbles`
 //!  - `expr`     (animated fractals): a small deterministic, serializable
 //!    expression tree for driving a `Param` from the shared `Tick` clock —
-//!    see its module doc for why this has to share `rollback`'s tick
-//!    domain, not just happen to use the same integer type
+//!    see its module doc for why this has to share the rollback crate's
+//!    tick domain, not just happen to use the same integer type
+//!
+//! Rollback netcode (input buffering + snapshot/rewind/resimulate around
+//! `physics::step_marbles`) lives in the separate `marble-rollback` crate,
+//! not here — real-time netcode, not CSG geometry, even though it depends
+//! on this crate's public API.
 
 pub mod codegen;
 pub mod expr;
 pub mod fold;
 pub mod object;
 pub mod physics;
-pub mod rollback;
 pub mod scene_sync;
 pub mod scenes;
 
@@ -40,10 +42,12 @@ pub use object::Object;
 use glam::{Mat2, Vec2, Vec3, Vec4};
 
 /// Rollback/animation's shared unit of time — one simulated physics tick,
-/// *not* wall-clock time. Defined here (not in `rollback`, despite that
-/// being where it was first introduced) because `expr` needs it too and
-/// `rollback` needs `expr::Expr`; re-exported from `rollback` unchanged so
-/// existing `marble_csg::rollback::Tick` references don't need updating.
+/// *not* wall-clock time. Lives here (not in the separate `marble-rollback`
+/// crate, despite that being where it was first introduced) because `expr`
+/// needs it too and `marble-rollback` needs `expr::Expr` — re-exported from
+/// `marble_rollback` unchanged so existing `rollback::Tick`-style
+/// references (now `marble_rollback::Tick`) don't need to reach into this
+/// crate directly.
 pub type Tick = u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,7 +208,7 @@ impl Params {
 
     /// Serializes the whole slot table as a flat, length-prefixed `f32`
     /// array — multiplayer's join-time scene sync
-    /// (`rollback::SceneBundle`) sends this alongside the `Object`/`Fold`
+    /// (`scene_sync::SceneBundle`) sends this alongside the `Object`/`Fold`
     /// tree that indexes into it, since a `*Param` handle is only ever
     /// meaningful together with the slots it indexes.
     pub fn encode(&self, out: &mut Vec<u8>) {

@@ -2349,9 +2349,18 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "marble-csg",
+ "marble-rollback",
  "wasm-bindgen",
  "web-sys",
  "web-time",
+]
+
+[[package]]
+name = "marble-rollback"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "marble-csg",
 ]
 
 [[package]]

@@ -984,7 +984,7 @@ pub fn sync_quad_scale(
 }
 
 /// One full marble-cubemap revolution every 2 seconds at the 60Hz physics
-/// tick (`marble_csg::rollback`'s tick rate) -- `update_frame_data_impl`'s
+/// tick (`marble_rollback`'s tick rate) -- `update_frame_data_impl`'s
 /// doc on why this drives the rotation angle instead of wall-clock time.
 const ROTATION_PERIOD_TICKS: u64 = 120;
 
@@ -1023,7 +1023,7 @@ const ROTATION_PERIOD_TICKS: u64 = 120;
 /// Also computes the marble cubemap's Y-axis rotation angle
 /// (`SceneUniforms::misc2.w`) from `MultiplayerSession::sim.current_tick()`
 /// -- *not* `time.elapsed_secs()` -- since this app has a real deterministic
-/// rollback simulation (`marble_csg::rollback::RollbackSim`) and every peer
+/// rollback simulation (`marble_rollback::RollbackSim`) and every peer
 /// must render the same marble at the same rotation phase for the same
 /// tick; a wall-clock-driven angle would desync visually the moment two
 /// clients' clocks disagree even slightly (`MultiplayerSession` is always

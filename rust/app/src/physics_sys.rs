@@ -48,7 +48,7 @@ use bevy::prelude::*;
 use crate::fps_overlay::PhaseTimings;
 
 use marble_csg::physics::{GravityMode, Marble, PhysicsConfig, PlayerInput};
-use marble_csg::rollback::{InputTransport, PlayerIndex, RollbackSim};
+use marble_rollback::{InputTransport, PlayerIndex, RollbackSim};
 
 use crate::camera::CameraOrbit;
 use crate::net::{NetSession, NetStatus, Role, WebRtcTransport, HOST_INDEX};
