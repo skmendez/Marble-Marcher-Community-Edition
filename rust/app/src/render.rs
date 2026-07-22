@@ -118,25 +118,6 @@ impl SceneKind {
         }
     }
 
-    /// The `?scene=`/`MM_SCENE` string that round-trips back to `self`
-    /// through [`Self::from_config`] -- used by `net.rs` to stamp the
-    /// host's actual current scene onto the shareable join link (`&scene=`
-    /// alongside `?join=`), so a joiner lands on the same scene the host is
-    /// running instead of silently falling back to their own URL's
-    /// (usually absent) `?scene=` guess. `MengerOscillatingSphere` gets an
-    /// explicit value here even though it's also `from_config`'s fallback --
-    /// a join link should always say what it means, not lean on a default
-    /// happening to agree on both ends.
-    pub fn query_value(self) -> &'static str {
-        match self {
-            Self::Demo => "demo",
-            Self::ClassicOnly => "classic_only",
-            Self::MengerSponge => "menger_sponge",
-            Self::MengerSphere => "menger_sphere",
-            Self::MengerOscillatingSphere => "menger_oscillating_sphere",
-        }
-    }
-
     /// Every scene has a marble now (matching the original MMCE, where
     /// every playable level does) — kept as a named method rather than
     /// inlining `true` everywhere in case a genuinely marble-less preview

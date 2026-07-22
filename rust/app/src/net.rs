@@ -423,13 +423,17 @@ pub fn poll_net_status(mut session: ResMut<NetSession>) {
     if session.role == Role::Host && session.hosted_join_suffix.is_none() {
         let id = js_bridge::hosted_id();
         if !id.is_empty() {
-            // Stamp this host's actual current scene onto the link too --
-            // `?join=` alone told a joiner nothing about which scene to
-            // load, so they'd resolve `?scene=` from their own (usually
-            // absent) URL and silently land on the default scene instead
-            // of the host's (`SceneKind::query_value`'s doc).
-            let scene = crate::render::SceneKind::from_config().query_value();
-            session.hosted_join_suffix = Some(format!("?join={id}&scene={scene}"));
+            // Deliberately just `?join=<id>` -- no `&scene=` hint. The
+            // host's actual scene (tree + params + animations) is sent
+            // over WebRTC itself (`NetMessage::SceneSync`, applied by
+            // `render::apply_pending_scene_sync`), which is the only
+            // copy that's ever authoritative; a URL-carried scene name
+            // would just be a second, redundant source that could disagree
+            // with it (a joiner opening a stale/shared link after the host
+            // switched scenes, for instance) with no way to ever be
+            // "wrong" about it -- not worth that divergence risk for what
+            // was only ever a cosmetic pre-sync guess.
+            session.hosted_join_suffix = Some(format!("?join={id}"));
         }
     }
     let err = js_bridge::take_error();
