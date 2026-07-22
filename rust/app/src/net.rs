@@ -555,7 +555,10 @@ pub fn spawn_net_ui(mut commands: Commands) {
 /// hasn't received its id yet, has nothing useful to copy.
 pub fn update_copy_button_visibility(session: Res<NetSession>, mut node: Query<&mut Node, With<CopyLinkButton>>) {
     let Ok(mut node) = node.single_mut() else { return };
-    node.display = if session.current_link().is_some() { Display::Flex } else { Display::None };
+    let display = if session.current_link().is_some() { Display::Flex } else { Display::None };
+    if node.display != display {
+        node.display = display;
+    }
 }
 
 /// `Update` system: the actual copy action. `Interaction` is driven by
@@ -625,9 +628,24 @@ pub fn update_copy_feedback(
 /// `Update` system: renders [`NetSession`]'s current state into
 /// [`NetStatusText`] — the one place a human (not just `net.rs` itself)
 /// finds out there's an invite link to share, or that a peer connected.
+///
+/// Compares before assigning: writing through `Text`'s `DerefMut` marks the
+/// component `Changed` unconditionally, regardless of whether the new value
+/// actually differs (Bevy's change detection triggers on the mutable
+/// access itself, not a value-equality check) — this system runs every
+/// frame, and `session.status` sits at the same value (`Idle`, i.e.
+/// "connecting...") for the entire time a peer hasn't connected, so an
+/// unconditional write here was re-triggering bevy_text/bevy_ui's glyph
+/// reshaping and GPU bind-group upload every single frame for no reason.
+/// Confirmed directly this session: with the marcher's own (unrelated,
+/// separately fixed) GPU buffer leak eliminated and `as_bind_group` on all
+/// three marcher materials verified to fire zero times after startup, this
+/// was the actual remaining source of ongoing `createBindGroup` growth
+/// (measured in production, present even with the debug overlay disabled
+/// — this UI panel is always visible, unlike that overlay).
 pub fn sync_net_ui_text(session: Res<NetSession>, mut text: Query<&mut Text, With<NetStatusText>>) {
     let Ok(mut text) = text.single_mut() else { return };
-    text.0 = match session.status {
+    let new_text = match session.status {
         NetStatus::Idle => "connecting...".to_string(),
         NetStatus::Hosting => match session.current_link() {
             Some(link) => format!("Share this link to play together:\n{link}"),
@@ -637,6 +655,9 @@ pub fn sync_net_ui_text(session: Res<NetSession>, mut text: Query<&mut Text, Wit
         NetStatus::Disconnected => "Other player disconnected — still playing solo.".to_string(),
         NetStatus::Error => format!("Network error: {}", session.last_error),
     };
+    if text.0 != new_text {
+        text.0 = new_text;
+    }
 }
 
 /// [`InputTransport`] over the live WebRTC data channel, extended to also
