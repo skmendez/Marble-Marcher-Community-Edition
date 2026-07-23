@@ -957,33 +957,44 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     // field to keep in sync. Inactive slots (`w <= 0.0`) are skipped, same
     // \"hidden\" convention the old single-marble uniform used.
     //
-    // `outline_t`/`outline_idx` track the nearest hit against each marble's
-    // *inflated* (radius + OUTLINE_WIDTH) sphere, independently of the real
-    // hit above -- a ray can hit the inflated sphere while missing the real
-    // one (exactly the thin annulus just outside a marble's own silhouette,
-    // where the outline actually shows -- see the outline branch below for
-    // why this is enough to draw a clean ring with no extra geometry).
-    // Tracked across *all* marbles the same way the real hit is, not just
-    // the one that won the real-hit search above, so a marble whose real
-    // surface isn't the nearest thing on screen can still show its own
-    // outline in front of it.
-    var marble_t = -1.0;
-    var marble_idx = 0u;
-    var outline_t = -1.0;
-    var outline_idx = 0u;
+    // Each marble contributes exactly one candidate surface to this
+    // reduction: its real body if the ray hits it, otherwise its *inflated*
+    // (radius + OUTLINE_WIDTH) shell if the ray hits that instead (the thin
+    // annulus just outside its own silhouette, where its outline ring
+    // shows) -- a marble's own outline is only ever considered where its
+    // own body missed, so a marble's body always wins over its own
+    // outline. Every marble's body-or-outline pick is then reduced to a
+    // single nearest-wins minimum together (`best_t`/`best_is_outline`/
+    // `best_idx`), not as two separate per-category minimums each compared
+    // only against terrain: that two-minimum approach let a farther
+    // marble's outline shell beat a nearer marble's real body (or vice
+    // versa) with no depth check between the two categories at all, since
+    // neither minimum ever looked at the other -- reported live as a
+    // farther marble's outline rendering in front of a nearer marble's
+    // body. This single unified reduction fixes that: every candidate
+    // (every marble's pick, plus terrain below) is depth-compared against
+    // every other one, not just against terrain.
+    var best_t = -1.0;
+    var best_is_outline = false;
+    var best_idx = 0u;
     let marble_count = arrayLength(&marbles);
     for (var mi = 0u; mi < marble_count; mi++) {
         let m = marbles[mi];
         if (m.w > 0.0) {
             let mt = sphere_hit(ro, rd, m.xyz, m.w);
-            if (mt > 0.0 && (marble_t < 0.0 || mt < marble_t)) {
-                marble_t = mt;
-                marble_idx = mi;
-            }
-            let ot = sphere_hit(ro, rd, m.xyz, m.w + m.w * OUTLINE_WIDTH_FRACTION);
-            if (ot > 0.0 && (outline_t < 0.0 || ot < outline_t)) {
-                outline_t = ot;
-                outline_idx = mi;
+            if (mt > 0.0) {
+                if (best_t < 0.0 || mt < best_t) {
+                    best_t = mt;
+                    best_is_outline = false;
+                    best_idx = mi;
+                }
+            } else {
+                let ot = sphere_hit(ro, rd, m.xyz, m.w + m.w * OUTLINE_WIDTH_FRACTION);
+                if (ot > 0.0 && (best_t < 0.0 || ot < best_t)) {
+                    best_t = ot;
+                    best_is_outline = true;
+                    best_idx = mi;
+                }
             }
         }
     }
@@ -1056,7 +1067,12 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         iters = march.iters;
     }
 
-    let marble_hit = marble_t > 0.0 && (!hit_frac || marble_t < t);
+    // The globally-nearest candidate (across every marble's own body-or-
+    // outline pick, see the reduction loop above) wins over terrain, same
+    // nearer-than-terrain check the old two-branch version used for each
+    // category separately -- now applied once, to the single winner.
+    let candidate_hit = best_t > 0.0 && (!hit_frac || best_t < t);
+    let marble_hit = candidate_hit && !best_is_outline;
 
     // `textureSample` (unlike every other texture read in this shader --
     // `coarse_tex`/`shadow_tex` are both `textureLoad`) implicitly computes
@@ -1075,13 +1091,13 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     // in-place-image-mutation fix alone wasn't sufficient to resolve it.
     // Fix: sample unconditionally, every pixel, in the shader's own uniform
     // top-level flow, and only *use* the result inside the conditional --
-    // `marble_idx` defaults to `0u` and `marbles` is always non-empty
+    // `best_idx` defaults to `0u` and `marbles` is always non-empty
     // whenever a scene has a marble at all, so this is safe (if physically
     // meaningless) to evaluate even for pixels that hit no marble; the
     // wasted work on those pixels is a minor, acceptable cost for a
     // correctness requirement, not a bug.
-    let hit_marble = marbles[marble_idx];
-    let mp = ro + rd * marble_t;
+    let hit_marble = marbles[best_idx];
+    let mp = ro + rd * best_t;
     let mn = normalize(mp - hit_marble.xyz);
     // Spin the cubemap sample direction around the marble's local Y axis
     // (`scene.misc2.w`, radians -- this const's own doc on why it's
@@ -1100,12 +1116,12 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     if (marble_hit) {
         let refl = reflect(rd, mn);
         let fresnel = pow(1.0 - max(dot(-rd, mn), 0.0), 5.0);
-        // `apply_tint(.., marble_idx % 4u)` recolors the cubemap sample per
+        // `apply_tint(.., best_idx % 4u)` recolors the cubemap sample per
         // marble (HSV hue/sat/val shift, `TINTS`'s doc) so multiple marbles
         // still read as distinct bodies -- the outline branch below applies
         // the exact same tint index to `OUTLINE_COLOR`, so a marble's ring
         // and body always read as one consistent color family.
-        let base_col = apply_tint(marble_tex_sample, marble_idx % 4u);
+        let base_col = apply_tint(marble_tex_sample, best_idx % 4u);
         let ambient = 0.3;
         let diffuse = max(dot(mn, scene.sun.xyz), 0.0);
         let shaded = base_col * (ambient + (1.0 - ambient) * diffuse);
@@ -1114,19 +1130,20 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(tonemap(marble_col), 1.0);
     }
 
-    // Solid outline ring (`OUTLINE_WIDTH_FRACTION`'s doc): only relevant
-    // where the real marble didn't already win above -- a ray that hits a
-    // marble's *inflated* sphere but misses its real one is, by
-    // construction, in the thin annulus just outside that marble's own
-    // on-screen silhouette (the inflated sphere's silhouette is only
-    // slightly larger), which is exactly where an outline ring belongs; a
-    // ray that also hits the real marble is handled entirely by the branch
-    // above instead, regardless of what this test says, since the real
-    // surface is always in front of its own outline shell from the
-    // camera's side. Same terrain-occlusion check `marble_hit` already
-    // uses (`!hit_frac || outline_t < t`), so the ring doesn't draw through
-    // solid geometry the marble is embedded in.
-    let outline_visible = outline_t > 0.0 && (!hit_frac || outline_t < t);
+    // Solid outline ring (`OUTLINE_WIDTH_FRACTION`'s doc): reached only
+    // when the globally-nearest candidate across every marble (and
+    // terrain) is specifically an outline pick, not a body -- `candidate_hit`
+    // already folded in the terrain-occlusion check above, and
+    // `!best_is_outline` already ruled out the body case in `marble_hit`,
+    // so this is exactly its complement: the winner exists, is nearer than
+    // terrain, and is an outline. Because the reduction above compares
+    // every marble's body-or-outline pick against every other one (not
+    // just against terrain), a nearer marble's real body correctly beats a
+    // farther marble's outline here, and a nearer marble's own outline
+    // (in the annulus where its body missed) correctly beats a farther
+    // marble's body too -- the cross-marble depth check that was missing
+    // before this fix.
+    let outline_visible = candidate_hit && best_is_outline;
     if (outline_visible) {
         // Deliberately *not* run through `tonemap()`: that Reinhard+gamma
         // curve is calibrated for lit HDR surface values (which is why the
@@ -1138,7 +1155,7 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         // (lit, then tonemapped) dark colors looked right. Returning the
         // tinted color directly is what actually displays the requested hex
         // value (modulo the per-marble tint, which is the point).
-        return vec4<f32>(apply_tint(OUTLINE_COLOR, outline_idx % 4u), 1.0);
+        return vec4<f32>(apply_tint(OUTLINE_COLOR, best_idx % 4u), 1.0);
     }
 
     if (hit_frac) {
