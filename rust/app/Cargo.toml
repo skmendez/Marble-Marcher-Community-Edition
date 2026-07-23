@@ -60,6 +60,18 @@ bevy = { version = "0.16", default-features = false, features = [
 # a transparent re-export of real `std::time` on every other target, so it
 # belongs in the regular (not wasm32-only) dependency block below.
 web-time = "1"
+# GPU timestamp-query profiling (`gpu_profile.rs`): `QuerySetDescriptor`/
+# `QueryType`/`RenderPassTimestampWrites` aren't among the wgpu types
+# `bevy::render::render_resource` re-exports -- pinned to the same major
+# version `bevy_render` itself depends on (confirmed via its own
+# `Cargo.toml`, resolves to the same already-locked 24.0.5, not a second
+# copy), `default-features = false` since only the type definitions are
+# needed here, not a second copy of any backend.
+wgpu = { version = "24", default-features = false }
+# Same readback-channel shape `bevy_render::gpu_readback` uses internally
+# (confirmed via its source) -- pinned to the same version `bevy_render`
+# itself depends on, so Cargo unifies onto the already-locked copy.
+async-channel = "2.3.0"
 
 [features]
 default = []

@@ -51,6 +51,12 @@ pub struct Config {
     /// the adaptive-resolution plumbing (`render::oscillate_fine_resolution_tier`'s
     /// doc), independent of and not gated on `debug_enabled`. Default off.
     pub res_oscillate_enabled: bool,
+    /// `?gpuprofile=1`/`MM_GPUPROFILE=1` enables GPU timestamp-query
+    /// profiling of each render pass, surfaced via the HTML/JS overlay in
+    /// `web/index.html` -- default off (a diagnostic tool; also a true
+    /// no-op on hardware/browsers without `wgpu::Features::TIMESTAMP_QUERY`,
+    /// see `gpu_profile.rs`'s module doc).
+    pub gpu_profile_enabled: bool,
 }
 
 impl Config {
@@ -66,6 +72,8 @@ impl Config {
             debug_enabled: query_value("debug", "MM_DEBUG").as_deref() == Some("1"),
             vsync_off: query_value("vsync", "MM_VSYNC").as_deref() == Some("off"),
             res_oscillate_enabled: query_value("res_oscillate", "MM_RES_OSCILLATE").as_deref()
+                == Some("1"),
+            gpu_profile_enabled: query_value("gpuprofile", "MM_GPUPROFILE").as_deref()
                 == Some("1"),
         }
     }
@@ -89,6 +97,7 @@ mod tests {
         assert!(value != Some("1")); // debug
         assert!(value != Some("off")); // vsync
         assert!(value != Some("1")); // res_oscillate
+        assert!(value != Some("1")); // gpuprofile
     }
 
     #[test]

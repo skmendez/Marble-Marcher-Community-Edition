@@ -12,6 +12,7 @@ mod debug_gizmos;
 mod debug_screenshot;
 mod fps_overlay;
 mod gpu;
+mod gpu_profile;
 mod mrrm;
 mod net;
 mod perfprobe;
@@ -31,6 +32,7 @@ use debug_gizmos::draw_thrust_debug;
 use debug_screenshot::DebugScreenshotPlugin;
 use fps_overlay::FpsOverlayPlugin;
 use gpu::MarcherGpuPlugin;
+use gpu_profile::GpuProfilePlugin;
 use mrrm::{resize_coarse_render_target, setup_mrrm_pipeline, sync_coarse_quad_scale, CoarseMarcherMaterial};
 use net::{
     handle_copy_button_click, poll_net_status, setup_networking, spawn_net_ui, sync_net_ui_text,
@@ -123,6 +125,11 @@ fn main() {
         // material plugins so the buffers resource exists whenever a
         // material prepare system first runs.
         .add_plugins(MarcherGpuPlugin)
+        // Registers a replacement render-graph node for the fine pass's
+        // GPU timestamp queries (`?gpuprofile=1`) -- see `gpu_profile.rs`'s
+        // module doc for why this needs its own node rather than Bevy's
+        // built-in render diagnostics.
+        .add_plugins(GpuProfilePlugin)
         .add_plugins(Material2dPlugin::<FineMarcherMaterial>::default())
         .add_plugins(Material2dPlugin::<CoarseMarcherMaterial>::default())
         .add_plugins(Material2dPlugin::<ShadowMarcherMaterial>::default())

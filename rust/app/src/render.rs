@@ -1207,6 +1207,10 @@ pub fn setup(
             ..default()
         },
         MarcherCamera,
+        // Stage 3 GPU-timestamp-profiling proof of concept (`gpu_profile.rs`)
+        // -- the fine pass only for now, the other 3 named passes are a
+        // later stage.
+        crate::gpu_profile::GpuProfiledPass(crate::gpu_profile::FINE_PASS_NAME),
     ));
     commands.spawn((
         Mesh2d(meshes.add(Rectangle::new(1.0, 1.0).mesh())),

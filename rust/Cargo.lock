@@ -2347,12 +2347,14 @@ dependencies = [
 name = "marble-marcher-bevy"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "bevy",
  "marble-csg",
  "marble-rollback",
  "wasm-bindgen",
  "web-sys",
  "web-time",
+ "wgpu",
 ]
 
 [[package]]
