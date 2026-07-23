@@ -72,6 +72,12 @@ wgpu = { version = "24", default-features = false }
 # (confirmed via its source) -- pinned to the same version `bevy_render`
 # itself depends on, so Cargo unifies onto the already-locked copy.
 async-channel = "2.3.0"
+# `step_data.rs`'s cumulative-step-count estimate reads back an `Rgba16Float`
+# render target, whose 4 `f16` channels need decoding to `f32` on the CPU
+# side -- pinned to the same version `bevy_render` itself already depends on
+# (confirmed via its own `Cargo.toml`), so Cargo unifies onto the
+# already-locked copy rather than resolving a second one.
+half = "2"
 
 [features]
 default = []

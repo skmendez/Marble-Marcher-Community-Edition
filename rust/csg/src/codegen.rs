@@ -1269,6 +1269,69 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
 }
 ";
 
+/// A small auxiliary pass (`rust/app/src/step_data.rs`) that runs the exact
+/// same terrain march the fine pass (`MARCHER`) does -- same MRRM warm-start
+/// (reading the *same* `coarse_tex`, the *same* `scene.misc.w` flag, the
+/// *same* shared `fine_scene` uniform buffer), same `fine_max_steps` budget
+/// -- but into a tiny fixed-size render target, writing the raw step count
+/// (`f32(iters)`) as data instead of a shaded/heatmap color. `?gpuprofile=1`'s
+/// overlay reads this small target back to the CPU and averages it as a
+/// statistical estimate of the real fine pass's per-pixel step-count
+/// distribution (`rust/app/src/step_data.rs`'s module doc has the full
+/// design/tradeoff rationale -- this constant is deliberately just the
+/// march itself, stripped of every fine-pass concern that doesn't affect
+/// `iters`: no marble/outline hit-testing, no shading, no `?stepheat=1`
+/// coloring, none of which change how many steps the terrain march takes).
+/// A ray that misses the bounding sphere entirely (`clip.x > clip.y`, the
+/// march block below never runs) naturally reports `0` -- correct, since no
+/// march step was ever spent on it, same as `MARCHER`'s own `var iters = 0;`
+/// default for that case.
+const STEPDATA_MARCHER: &str = "\
+@fragment
+fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
+    let ndc = vec2<f32>(mesh.uv.x * 2.0 - 1.0, 1.0 - mesh.uv.y * 2.0);
+    let aspect = scene.misc.x;
+    let ro = scene.cam_pos.xyz;
+    let rd = normalize(
+        scene.cam_right.xyz * ndc.x * aspect
+        + scene.cam_up.xyz * ndc.y
+        + scene.cam_forward.xyz * scene.cam_forward.w
+    );
+    let half_fov = atan(1.0 / scene.cam_forward.w);
+    let pixel_angle = 2.0 * half_fov / max(scene.misc.z, 1.0);
+
+    let clip = ray_sphere_clip(ro, rd, scene.bounding.xyz, scene.bounding.w);
+
+    var iters = 0;
+    if (clip.x <= clip.y) {
+        // Identical MRRM warm-start to `MARCHER`'s own -- see that
+        // fragment's doc for the exact reasoning behind the backoff
+        // formula; kept byte-for-byte the same here so this pass is a
+        // faithful proxy for the real fine pass's step count, not an
+        // approximation of it.
+        var t0 = clip.x;
+        if (scene.misc.w > 0.5) {
+            let coarse_dims = vec2<i32>(textureDimensions(coarse_tex));
+            let texel = clamp(
+                vec2<i32>(mesh.uv * vec2<f32>(coarse_dims)),
+                vec2<i32>(0),
+                coarse_dims - vec2<i32>(1),
+            );
+            let coarse_t = textureLoad(coarse_tex, texel, 0).r;
+            if (coarse_t > 0.0) {
+                let coarse_pixel_angle = 2.0 * half_fov / max(f32(coarse_dims.y), 1.0);
+                t0 = max(t0, coarse_t - coarse_t * coarse_pixel_angle);
+            }
+        }
+        let fine_max_steps = select(FINE_MAX_STEPS, i32(scene.misc2.z), scene.misc2.z > 0.5);
+        let march = march_scene(ro, rd, t0, pixel_angle, clip.y, fine_max_steps);
+        iters = march.iters;
+    }
+
+    return vec4<f32>(f32(iters), 0.0, 0.0, 1.0);
+}
+";
+
 /// Bindings decl + helpers, nothing else (DESIGN.md §5).
 pub fn generate_library() -> String {
     let b = bindings();
@@ -1345,6 +1408,31 @@ pub fn generate_shader(obj: &Object) -> String {
     s.push_str(SHADING_CORE);
     s.push('\n');
     s.push_str(MARCHER);
+    s
+}
+
+/// Full fragment shader for the small auxiliary step-count-data pass
+/// (`rust/app/src/step_data.rs`, `?gpuprofile=1`'s cumulative-step-count
+/// estimate): import line, bindings, the MRRM coarse-texture binding (needs
+/// `coarse_tex` -- must warm-start identically to the fine pass), the *full
+/// fidelity* scene functions (`generate_scene_functions`, divisor 1, NOT
+/// `COARSE_ITERATION_DIVISOR` -- this pass exists to proxy the *fine* pass's
+/// step count, not the coarse pass's own reduced-detail march), shared march
+/// core, and the `STEPDATA_MARCHER` entry. No shadow-texture/marble-buffer/
+/// marble-cubemap bindings -- none of those affect step count, so this
+/// pass's bind-group layout is deliberately smaller than the fine pass's.
+pub fn generate_stepdata_shader(obj: &Object) -> String {
+    let mut s = String::new();
+    s.push_str("#import bevy_sprite::mesh2d_vertex_output::VertexOutput\n\n");
+    s.push_str(&generate_library());
+    s.push('\n');
+    s.push_str(COARSE_TEXTURE_BINDING);
+    s.push('\n');
+    s.push_str(&generate_scene_functions(obj));
+    s.push_str("\n\n");
+    s.push_str(MARCH_CORE);
+    s.push('\n');
+    s.push_str(STEPDATA_MARCHER);
     s
 }
 
@@ -1471,6 +1559,18 @@ struct VertexOutput {
         shader.replacen(import_line, VERTEX_OUTPUT_STRUCT, 1)
     }
 
+    /// Same substitution as [`full_source`], for the auxiliary step-count-
+    /// data pass shader (`generate_stepdata_shader`, `?gpuprofile=1`).
+    fn full_stepdata_source(obj: &Object) -> String {
+        let shader = generate_stepdata_shader(obj);
+        let import_line = "#import bevy_sprite::mesh2d_vertex_output::VertexOutput\n";
+        assert!(
+            shader.contains(import_line),
+            "expected stepdata shader to start with the bevy_sprite import line"
+        );
+        shader.replacen(import_line, VERTEX_OUTPUT_STRUCT, 1)
+    }
+
     /// Parse + validate `source` with naga; panic with the naga error
     /// (naga errors carry line/column) and the full source on failure, so
     /// test failures are debuggable without weakening validation.
@@ -1537,6 +1637,13 @@ struct VertexOutput {
         let mut params = Params::new();
         let (obj, _handles) = scenes::menger_oscillating_sphere(&mut params);
         validate_wgsl(&full_source(&obj));
+    }
+
+    #[test]
+    fn stepdata_shader_validates() {
+        let mut params = Params::new();
+        let (obj, _handles) = scenes::demo_scene(&mut params);
+        validate_wgsl(&full_stepdata_source(&obj));
     }
 
     #[test]
@@ -1677,6 +1784,22 @@ struct VertexOutput {
         assert!(generate_shader(&obj).contains("var<storage, read> marbles"));
         assert!(!generate_coarse_shader(&obj).contains("marbles"));
         assert!(!generate_shadow_shader(&obj).contains("marbles"));
+        assert!(!generate_stepdata_shader(&obj).contains("marbles"));
+    }
+
+    #[test]
+    fn stepdata_shader_has_coarse_texture_binding_but_no_shadow_or_marble_bindings() {
+        // The stepdata pass must warm-start identically to the fine pass
+        // (needs `coarse_tex`), but doesn't shade anything, so it must not
+        // reference the shadow texture or marble cubemap bindings either --
+        // referencing either would be a real bind-group-layout mismatch
+        // (`step_data::StepDataMaterial` declares neither).
+        let mut params = Params::new();
+        let (obj, _handles) = scenes::demo_scene(&mut params);
+        let src = generate_stepdata_shader(&obj);
+        assert!(src.contains("coarse_tex"), "stepdata shader must reference coarse_tex:\n{src}");
+        assert!(!src.contains("shadow_tex"), "stepdata shader must not reference shadow_tex:\n{src}");
+        assert!(!src.contains("marble_cubemap"), "stepdata shader must not reference marble_cubemap:\n{src}");
     }
 
     #[test]

@@ -344,6 +344,15 @@ pub(crate) mod js_bridge {
         // one established Rust->JS bridge, not a second mechanism.
         #[wasm_bindgen(js_namespace = mmNet, js_name = reportPassTimings)]
         pub fn report_pass_timings(supported: bool, coarse_ms: f64, shadow_ms: f64, fine_ms: f64, present_ms: f64);
+        // Cumulative ray-march step-count estimate (`step_data.rs`) --
+        // `avg_iters_per_px`/`estimated_total_steps` are `-1.0` sentinels
+        // for "no reading yet" (same convention as `report_pass_timings`'s
+        // `-1.0`), not "unsupported" -- this estimate has no adapter
+        // capability question of its own (it's an ordinary render + texture
+        // readback, not a `wgpu::Features::TIMESTAMP_QUERY` dependency), so
+        // there's no separate `supported` flag to thread through here.
+        #[wasm_bindgen(js_namespace = mmNet, js_name = reportStepData)]
+        pub fn report_step_data(avg_iters_per_px: f64, estimated_total_steps: f64);
     }
 }
 
@@ -383,6 +392,7 @@ pub(crate) mod js_bridge {
         0
     }
     pub fn report_pass_timings(_supported: bool, _coarse_ms: f64, _shadow_ms: f64, _fine_ms: f64, _present_ms: f64) {}
+    pub fn report_step_data(_avg_iters_per_px: f64, _estimated_total_steps: f64) {}
 }
 
 /// This client's role in the current (at most 2-player) session, mirroring

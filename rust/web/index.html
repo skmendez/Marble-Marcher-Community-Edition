@@ -182,7 +182,6 @@
       panel.style.font = "12px/1.4 monospace";
       panel.style.whiteSpace = "pre";
       panel.style.zIndex = "999";
-      panel.textContent = "GPU pass timings: waiting for first frame...";
       document.body.appendChild(panel);
 
       // `ms < 0` is the "no reading yet" sentinel (net.rs's js_bridge doc) --
@@ -190,17 +189,39 @@
       // never produce real numbers here at all.
       const fmt = (ms) => (ms < 0 ? "  --  " : ms.toFixed(2).padStart(6) + "ms");
 
+      // Cumulative ray-march step-count estimate (`step_data.rs`) -- a
+      // separate `reportStepData` call, independent of `reportPassTimings`
+      // above (both gate on the same `?gpuprofile=1` flag on the Rust side,
+      // but neither depends on the other having landed first, so this
+      // panel tracks each one's own "no reading yet" state separately
+      // rather than assuming they arrive together).
+      let lastTimingsLine = "GPU pass timings: waiting for first frame...";
+      let lastStepDataLine = "step count: waiting for first frame...";
+      const render = () => {
+        panel.textContent = `${lastTimingsLine}\n${lastStepDataLine}`;
+      };
+      render();
+
       window.mmNet.reportPassTimings = function (supported, coarseMs, shadowMs, fineMs, presentMs) {
         if (!supported) {
-          panel.textContent = "GPU pass timings: unsupported on this backend (no wgpu::Features::TIMESTAMP_QUERY)";
-          return;
+          lastTimingsLine = "GPU pass timings: unsupported on this backend (no wgpu::Features::TIMESTAMP_QUERY)";
+        } else {
+          lastTimingsLine =
+            "GPU pass timings\n" +
+            `  coarse:  ${fmt(coarseMs)}\n` +
+            `  shadow:  ${fmt(shadowMs)}\n` +
+            `  fine:    ${fmt(fineMs)}\n` +
+            `  present: ${fmt(presentMs)}`;
         }
-        panel.textContent =
-          "GPU pass timings\n" +
-          `  coarse:  ${fmt(coarseMs)}\n` +
-          `  shadow:  ${fmt(shadowMs)}\n` +
-          `  fine:    ${fmt(fineMs)}\n` +
-          `  present: ${fmt(presentMs)}`;
+        render();
+      };
+
+      window.mmNet.reportStepData = function (avgItersPerPx, estimatedTotalSteps) {
+        lastStepDataLine =
+          avgItersPerPx < 0
+            ? "step count: waiting for first frame..."
+            : `est. total steps: ${Math.round(estimatedTotalSteps).toLocaleString()}  (avg ${avgItersPerPx.toFixed(1)}/px)`;
+        render();
       };
     })();
   </script>

@@ -19,6 +19,7 @@ mod perfprobe;
 mod physics_sys;
 mod render;
 mod shadow_pass;
+mod step_data;
 mod touch;
 mod web_config;
 
@@ -46,6 +47,7 @@ use render::{
     update_frame_data, FineMarcherMaterial, PresentMaterial,
 };
 use shadow_pass::{resize_shadow_render_target, setup_shadow_pipeline, sync_shadow_quad_scale, ShadowMarcherMaterial};
+use step_data::{setup_step_data_pipeline, StepDataMaterial, StepDataPlugin};
 use touch::{touch_camera_input, TouchDebugInfo};
 
 /// `MM_WINDOW_SIZE=WxH` overrides the window's starting resolution — mainly
@@ -130,10 +132,18 @@ fn main() {
         // module doc for why this needs its own node rather than Bevy's
         // built-in render diagnostics.
         .add_plugins(GpuProfilePlugin)
+        // Cumulative ray-march step-count estimate (`?gpuprofile=1`'s
+        // companion feature, `step_data.rs`) -- registers the
+        // `EstimatedSteps` resource and its JS-reporting system. Does NOT add
+        // `bevy_render`'s `GpuReadbackPlugin` itself: `DefaultPlugins`
+        // already adds that unconditionally (`step_data.rs`'s `StepDataPlugin`
+        // doc), so doing so again here would panic at startup.
+        .add_plugins(StepDataPlugin)
         .add_plugins(Material2dPlugin::<FineMarcherMaterial>::default())
         .add_plugins(Material2dPlugin::<CoarseMarcherMaterial>::default())
         .add_plugins(Material2dPlugin::<ShadowMarcherMaterial>::default())
         .add_plugins(Material2dPlugin::<PresentMaterial>::default())
+        .add_plugins(Material2dPlugin::<StepDataMaterial>::default())
         .add_plugins(FpsOverlayPlugin)
         .add_plugins(DebugScreenshotPlugin)
         .insert_resource(Time::<Fixed>::from_hz(60.0))
@@ -158,12 +168,17 @@ fn main() {
         // `SceneState` and `setup_mrrm_pipeline`'s `CoarseRenderTarget`
         // (this pass's own warm-start source), and corrects `setup`'s
         // placeholder `FineMarcherMaterial::shadow` handle in turn.
+        // `setup_step_data_pipeline` (step_data.rs) also needs
+        // `setup_mrrm_pipeline`'s `CoarseRenderTarget` (this pass warm-starts
+        // identically to the fine pass) -- a true no-op (spawns nothing) if
+        // `?gpuprofile=1` is off.
         .add_systems(
             Startup,
             (
                 setup,
                 setup_mrrm_pipeline,
                 setup_shadow_pipeline,
+                setup_step_data_pipeline,
                 setup_networking,
                 spawn_net_ui,
                 spawn_perfprobe_overlay,

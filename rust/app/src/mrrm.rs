@@ -367,6 +367,7 @@ pub fn setup_mrrm_pipeline(
 /// enough, back when one existed for adaptive resolution, to be worth
 /// avoiding here too even though this system fires far less often now that
 /// it only reacts to real window resizes).
+#[allow(clippy::too_many_arguments)]
 pub fn resize_coarse_render_target(
     windows: Query<&Window, With<PrimaryWindow>>,
     mut coarse_render_target: ResMut<CoarseRenderTarget>,
@@ -374,6 +375,13 @@ pub fn resize_coarse_render_target(
     mut coarse_cameras: Query<&mut Camera, With<CoarseCamera>>,
     fine_quads: Query<&MeshMaterial2d<crate::render::FineMarcherMaterial>, With<crate::render::MarcherQuad>>,
     mut fine_materials: ResMut<Assets<crate::render::FineMarcherMaterial>>,
+    // `step_data.rs`'s pass also warm-starts from the coarse target (same
+    // reasoning as the fine pass above) -- this query is simply empty
+    // whenever `?gpuprofile=1` is off (that pass's quad never spawns), so
+    // this stays a true no-op in that case, just like the rest of this
+    // system already is when no resize has happened.
+    step_data_quads: Query<&MeshMaterial2d<crate::step_data::StepDataMaterial>, With<crate::step_data::StepDataQuad>>,
+    mut step_data_materials: ResMut<Assets<crate::step_data::StepDataMaterial>>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -392,6 +400,11 @@ pub fn resize_coarse_render_target(
     }
     for mesh_material in &fine_quads {
         if let Some(mat) = fine_materials.get_mut(&mesh_material.0) {
+            mat.coarse = new_handle.clone();
+        }
+    }
+    for mesh_material in &step_data_quads {
+        if let Some(mat) = step_data_materials.get_mut(&mesh_material.0) {
             mat.coarse = new_handle.clone();
         }
     }
