@@ -841,6 +841,7 @@ pub(crate) struct MarbleCubemap {
 pub fn finalize_marble_cubemap(
     mut cubemap: ResMut<MarbleCubemap>,
     mut images: ResMut<Assets<Image>>,
+    asset_server: Res<AssetServer>,
     fine_quads: Query<&MeshMaterial2d<FineMarcherMaterial>, With<MarcherQuad>>,
     mut fine_materials: ResMut<Assets<FineMarcherMaterial>>,
 ) {
@@ -848,6 +849,28 @@ pub fn finalize_marble_cubemap(
         return;
     }
     let Some(loaded) = images.get(&cubemap.loading) else {
+        // A still-loading asset and a *failed* load both leave
+        // `Assets<Image>` empty for this handle forever -- without this
+        // check, a missing/404'd `marble_cubemap.png` silently leaves the
+        // marble on its white placeholder cubemap with no indication
+        // anything is wrong (exactly how it ships when serving `rust/web/`
+        // without the README's `cp -r rust/app/assets rust/web/assets` step
+        // -- `web/assets/` is gitignored -- or when running the native
+        // binary directly instead of via `cargo run`, which resolves
+        // `assets/` next to the executable; `BEVY_ASSET_ROOT` fixes that,
+        // see scripts/headless_screenshot.sh).
+        if let Some(bevy::asset::LoadState::Failed(err)) =
+            asset_server.get_load_state(&cubemap.loading)
+        {
+            error!(
+                "marble cubemap failed to load; marble will keep its plain white \
+                 placeholder texture: {err} (if serving rust/web/, did you copy \
+                 rust/app/assets in? if running the binary directly, is \
+                 BEVY_ASSET_ROOT set?)"
+            );
+            // Stop polling -- the load will never complete.
+            cubemap.done = true;
+        }
         return;
     };
 
@@ -1572,7 +1595,16 @@ fn update_frame_data_impl(
 
     frame.shadow = SceneUniforms {
         sun: beware_of_bumps::sun_dir().extend(0.0),
-        misc: Vec4::new(aspect, t, shadow_render_target.size.y as f32, 0.0),
+        // w: the same MRRM flag the fine pass gets -- the shadow shader's
+        // own coarse warm-start read is gated on it too (`marble_csg::codegen`'s
+        // `SHADOW_MARCHER`), so `?mrrm=0` disables the coarse-guess data
+        // flow in *every* consumer, not just the fine pass.
+        misc: Vec4::new(
+            aspect,
+            t,
+            shadow_render_target.size.y as f32,
+            if config.mrrm_enabled { 1.0 } else { 0.0 },
+        ),
         ..base
     };
 

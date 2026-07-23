@@ -682,16 +682,26 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     var t0 = clip.x;
-    let coarse_dims = vec2<i32>(textureDimensions(coarse_tex));
-    let texel = clamp(
-        vec2<i32>(mesh.uv * vec2<f32>(coarse_dims)),
-        vec2<i32>(0),
-        coarse_dims - vec2<i32>(1),
-    );
-    let coarse_t = textureLoad(coarse_tex, texel, 0).r;
-    if (coarse_t > 0.0) {
-        let coarse_pixel_angle = 2.0 * half_fov / max(f32(coarse_dims.y), 1.0);
-        t0 = max(t0, coarse_t - coarse_t * coarse_pixel_angle);
+    // Gated behind the same `misc.w` MRRM flag as the fine pass's own
+    // warm-start read (`MARCHER`'s `fragment`), for the same two reasons:
+    // `?mrrm=0` should mean \"no pass consumes the coarse guess\" (the
+    // documented pre-MRRM-behavior fallback), and executing a
+    // texture-fetch-derived value into `march_scene`'s starting `t` is the
+    // exact data flow that segfaults llvmpipe's shader JIT
+    // (`COARSE_TEXTURE_BINDING`'s doc) -- the runtime skip is what makes
+    // headless/software-Vulkan runs of this pass possible at all.
+    if (scene.misc.w > 0.5) {
+        let coarse_dims = vec2<i32>(textureDimensions(coarse_tex));
+        let texel = clamp(
+            vec2<i32>(mesh.uv * vec2<f32>(coarse_dims)),
+            vec2<i32>(0),
+            coarse_dims - vec2<i32>(1),
+        );
+        let coarse_t = textureLoad(coarse_tex, texel, 0).r;
+        if (coarse_t > 0.0) {
+            let coarse_pixel_angle = 2.0 * half_fov / max(f32(coarse_dims.y), 1.0);
+            t0 = max(t0, coarse_t - coarse_t * coarse_pixel_angle);
+        }
     }
 
     let march = march_scene(ro, rd, t0, pixel_angle, clip.y, MAX_STEPS);
