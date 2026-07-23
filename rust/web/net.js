@@ -39,6 +39,11 @@ window.mmNet = (function () {
 
   let hostedId = "";
   let lastError = "";
+  // Joiner role only: pending timeout for the current join attempt, if
+  // any -- cleared from every path that can resolve it (see
+  // `clearJoinTimeout`'s doc for why this needs to be shared/module-scope
+  // rather than local to just one of those paths).
+  let joinTimeoutId = null;
   // 0 idle, 1 hosting (waiting for a peer to connect), 2 connected,
   // 3 disconnected (was connected, now isn't), 4 error. For the host this
   // reflects "at least one joiner has ever connected" -- per-joiner detail
@@ -46,17 +51,9 @@ window.mmNet = (function () {
   let status = 0;
   let clipboardStatus = 0;
 
-  // A joiner reported getting stuck on a black screen indefinitely until
-  // the host closed its tab, at which point it "instantly" got a
-  // peer-unavailable error -- i.e. neither `open` nor `error` ever fired on
-  // the stalled connection attempt itself; only the host disconnecting
-  // later gave the signaling broker something to resolve the pending
-  // attempt against. 15s is deliberately generous: real WebRTC/ICE
-  // negotiation over PeerJS's default (STUN-only) config can legitimately
-  // take several seconds, especially a first attempt against a given
-  // NAT/network path, and the same report noted retries on the same setup
-  // sometimes succeed -- this should only fire for a connection that's
-  // genuinely stuck, not one that's merely slow.
+  // How long a joiner waits for its connection to the host to resolve
+  // (`open` or `error`) before giving up -- see `join`'s doc for why 15s
+  // and why this needs watching from more than one event path.
   const JOIN_TIMEOUT_MS = 15000;
 
   // Diagnostic instrumentation only -- logs ICE connection/gathering state
@@ -91,23 +88,29 @@ window.mmNet = (function () {
     tryAttach();
   }
 
+  // Cancels the current join attempt's pending timeout, if any -- called
+  // from every path that counts as "this attempt is resolved, one way or
+  // another": `hostConn`'s own `open`/`error`, *and* the top-level `peer`'s
+  // own `error` (see `join`'s doc: PeerJS reports at least one real
+  // failure mode -- an unreachable/unregistered host id -- as a
+  // `peer.on("error")` with type `peer-unavailable`, never as an event on
+  // the `DataConnection` object at all, so a timeout that only listened on
+  // `hostConn` would never get cancelled for that case and would fire a
+  // second, less-specific error 15s after the real one already arrived --
+  // caught live, this exact sequence, before this fix).
+  function clearJoinTimeout() {
+    if (joinTimeoutId !== null) {
+      clearTimeout(joinTimeoutId);
+      joinTimeoutId = null;
+    }
+  }
+
   function setupJoinerConnection(c) {
     hostConn = c;
     const connectStartedAt = Date.now();
     attachIceDiagnostics("joiner->host", c);
-    const timeoutId = setTimeout(() => {
-      console.log(
-        `[net] joiner->host: timed out waiting for open/error after ${JOIN_TIMEOUT_MS}ms ` +
-        `(hostConn.open=${!!(hostConn && hostConn.open)})`
-      );
-      // Distinct from PeerJS's own `peer-unavailable` error text, so a
-      // future report can tell "this side's own attempt never got a
-      // response at all" apart from "the broker/peer actively rejected it".
-      lastError = `timed out waiting for host connection after ${(JOIN_TIMEOUT_MS / 1000).toFixed(0)}s`;
-      status = 4;
-    }, JOIN_TIMEOUT_MS);
     hostConn.on("open", () => {
-      clearTimeout(timeoutId);
+      clearJoinTimeout();
       console.log(`[net] joiner->host: open after ${Date.now() - connectStartedAt}ms`);
       status = 2;
     });
@@ -119,7 +122,7 @@ window.mmNet = (function () {
       if (status === 2) status = 3;
     });
     hostConn.on("error", (err) => {
-      clearTimeout(timeoutId);
+      clearJoinTimeout();
       console.log(`[net] joiner->host: error after ${Date.now() - connectStartedAt}ms: ${err && err.message ? err.message : err}`);
       lastError = String(err && err.message ? err.message : err);
       status = 4;
@@ -193,14 +196,43 @@ window.mmNet = (function () {
     // Creates this client's own (unshared) Peer, then connects to
     // `hostId` once it's ready -- call once, at startup, only when a
     // `?join=` id was present in the URL.
+    //
+    // A joiner reported getting stuck on a black screen indefinitely until
+    // the host closed its tab, at which point it "instantly" got a
+    // peer-unavailable error -- i.e. neither `open` nor `error` ever fired
+    // on the stalled connection attempt itself; only the host disconnecting
+    // later gave the signaling broker something to resolve the pending
+    // attempt against. `JOIN_TIMEOUT_MS` (15s) is deliberately generous:
+    // real WebRTC/ICE negotiation over PeerJS's default (STUN-only) config
+    // can legitimately take several seconds, especially a first attempt
+    // against a given NAT/network path, and the same report noted retries
+    // on the same setup sometimes succeed -- this should only fire for a
+    // connection that's genuinely stuck, not one that's merely slow. Set
+    // here (not inside `setupJoinerConnection`) so it also covers the gap
+    // between calling `connect()` and `setupJoinerConnection` actually
+    // running its own `hostConn.on(...)` registration.
     join: function (hostId) {
       peer = new Peer();
       console.log(`[net] join: creating own Peer, will connect to host ${hostId}`);
       peer.on("open", (ownId) => {
         console.log(`[net] join: own Peer opened as ${ownId}, calling connect(${hostId})`);
+        joinTimeoutId = setTimeout(() => {
+          joinTimeoutId = null;
+          console.log(
+            `[net] join: timed out waiting for open/error after ${JOIN_TIMEOUT_MS}ms ` +
+            `(hostConn.open=${!!(hostConn && hostConn.open)})`
+          );
+          // Distinct from PeerJS's own `peer-unavailable` error text below,
+          // so a future report can tell "this side's own attempt never got
+          // a response at all" apart from "the broker/peer actively
+          // rejected it".
+          lastError = `timed out waiting for host connection after ${(JOIN_TIMEOUT_MS / 1000).toFixed(0)}s`;
+          status = 4;
+        }, JOIN_TIMEOUT_MS);
         setupJoinerConnection(peer.connect(hostId, { reliable: true, serialization: "binary" }));
       });
       peer.on("error", (err) => {
+        clearJoinTimeout();
         console.log(`[net] join: own Peer reported error: ${err && err.message ? err.message : err}`);
         lastError = String(err && err.message ? err.message : err);
         status = 4;
