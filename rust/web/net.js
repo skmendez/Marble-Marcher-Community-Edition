@@ -46,18 +46,81 @@ window.mmNet = (function () {
   let status = 0;
   let clipboardStatus = 0;
 
+  // A joiner reported getting stuck on a black screen indefinitely until
+  // the host closed its tab, at which point it "instantly" got a
+  // peer-unavailable error -- i.e. neither `open` nor `error` ever fired on
+  // the stalled connection attempt itself; only the host disconnecting
+  // later gave the signaling broker something to resolve the pending
+  // attempt against. 15s is deliberately generous: real WebRTC/ICE
+  // negotiation over PeerJS's default (STUN-only) config can legitimately
+  // take several seconds, especially a first attempt against a given
+  // NAT/network path, and the same report noted retries on the same setup
+  // sometimes succeed -- this should only fire for a connection that's
+  // genuinely stuck, not one that's merely slow.
+  const JOIN_TIMEOUT_MS = 15000;
+
+  // Diagnostic instrumentation only -- logs ICE connection/gathering state
+  // transitions for `c` (prefixed `[net]` so a real console transcript is
+  // easy to grep/paste back), to help distinguish *why* a connection
+  // attempt stalls (e.g. stuck in "checking" vs. "failed" vs.
+  // "disconnected") the next time this is reproduced live. PeerJS creates
+  // the underlying RTCPeerConnection synchronously inside `connect()`, but
+  // exposes it as `c.peerConnection` which can be momentarily undefined
+  // right after construction on some PeerJS versions -- poll briefly
+  // rather than assume it's there immediately.
+  function attachIceDiagnostics(label, c) {
+    let attempts = 0;
+    const tryAttach = () => {
+      const pc = c.peerConnection;
+      if (!pc) {
+        if (++attempts < 25) setTimeout(tryAttach, 200); // ~5s total
+        else console.log(`[net] ${label}: RTCPeerConnection never became available for diagnostics`);
+        return;
+      }
+      console.log(
+        `[net] ${label}: RTCPeerConnection acquired, iceConnectionState=${pc.iceConnectionState} ` +
+        `iceGatheringState=${pc.iceGatheringState}`
+      );
+      pc.addEventListener("iceconnectionstatechange", () => {
+        console.log(`[net] ${label}: iceConnectionState -> ${pc.iceConnectionState}`);
+      });
+      pc.addEventListener("icegatheringstatechange", () => {
+        console.log(`[net] ${label}: iceGatheringState -> ${pc.iceGatheringState}`);
+      });
+    };
+    tryAttach();
+  }
+
   function setupJoinerConnection(c) {
     hostConn = c;
+    const connectStartedAt = Date.now();
+    attachIceDiagnostics("joiner->host", c);
+    const timeoutId = setTimeout(() => {
+      console.log(
+        `[net] joiner->host: timed out waiting for open/error after ${JOIN_TIMEOUT_MS}ms ` +
+        `(hostConn.open=${!!(hostConn && hostConn.open)})`
+      );
+      // Distinct from PeerJS's own `peer-unavailable` error text, so a
+      // future report can tell "this side's own attempt never got a
+      // response at all" apart from "the broker/peer actively rejected it".
+      lastError = `timed out waiting for host connection after ${(JOIN_TIMEOUT_MS / 1000).toFixed(0)}s`;
+      status = 4;
+    }, JOIN_TIMEOUT_MS);
     hostConn.on("open", () => {
+      clearTimeout(timeoutId);
+      console.log(`[net] joiner->host: open after ${Date.now() - connectStartedAt}ms`);
       status = 2;
     });
     hostConn.on("data", (data) => {
       received.push(new Uint8Array(data));
     });
     hostConn.on("close", () => {
+      console.log(`[net] joiner->host: close event (status was ${status})`);
       if (status === 2) status = 3;
     });
     hostConn.on("error", (err) => {
+      clearTimeout(timeoutId);
+      console.log(`[net] joiner->host: error after ${Date.now() - connectStartedAt}ms: ${err && err.message ? err.message : err}`);
       lastError = String(err && err.message ? err.message : err);
       status = 4;
     });
@@ -66,7 +129,9 @@ window.mmNet = (function () {
   function setupHostConnection(idx, c) {
     joinerConns[idx] = c;
     receivedByIndex[idx] = [];
+    attachIceDiagnostics(`host->joiner${idx}`, c);
     c.on("open", () => {
+      console.log(`[net] host->joiner${idx}: open`);
       connectedSet.add(idx);
       newlyConnected.push(idx);
       status = 2;
@@ -75,12 +140,14 @@ window.mmNet = (function () {
       receivedByIndex[idx].push(new Uint8Array(data));
     });
     c.on("close", () => {
+      console.log(`[net] host->joiner${idx}: close event`);
       if (connectedSet.has(idx)) {
         connectedSet.delete(idx);
         newlyDisconnected.push(idx);
       }
     });
     c.on("error", (err) => {
+      console.log(`[net] host->joiner${idx}: error: ${err && err.message ? err.message : err}`);
       lastError = String(err && err.message ? err.message : err);
     });
   }
@@ -128,10 +195,13 @@ window.mmNet = (function () {
     // `?join=` id was present in the URL.
     join: function (hostId) {
       peer = new Peer();
-      peer.on("open", () => {
+      console.log(`[net] join: creating own Peer, will connect to host ${hostId}`);
+      peer.on("open", (ownId) => {
+        console.log(`[net] join: own Peer opened as ${ownId}, calling connect(${hostId})`);
         setupJoinerConnection(peer.connect(hostId, { reliable: true, serialization: "binary" }));
       });
       peer.on("error", (err) => {
+        console.log(`[net] join: own Peer reported error: ${err && err.message ? err.message : err}`);
         lastError = String(err && err.message ? err.message : err);
         status = 4;
       });
