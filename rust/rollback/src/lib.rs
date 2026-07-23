@@ -158,6 +158,26 @@ pub struct RollbackSim {
     /// exactly the property this whole module exists to guarantee, so
     /// silently violating it would be worse than failing loudly.
     window: u64,
+    /// The oldest tick [`Self::resim_from`] can safely rewind to, tracked
+    /// independently of `window`'s pure arithmetic distance from
+    /// `current_tick`. Starts at `0` (nothing to floor yet). [`Self::hard_reset_to`]
+    /// sets this to `tick + 1` (not `tick`) every time it reseeds history:
+    /// after a reset, `snapshots` holds exactly one entry, at `tick` itself,
+    /// so the earliest tick with a valid resim *base* (`resim_from`'s
+    /// `snapshots[from_tick - 1]`) is `tick + 1`, not `tick` — a correction
+    /// for the reset tick itself has no earlier snapshot to rewind to and
+    /// must be rejected as [`WindowExceeded`], the same as any other
+    /// too-old tick, rather than reaching for a snapshot that was never
+    /// there. Before this field existed, [`Self::oldest_available`] only
+    /// knew `window`'s arithmetic distance from `current_tick`, which
+    /// stayed unaware that `hard_reset_to` had just collapsed the actually
+    /// retained history down to one entry — a confirmed input for a tick
+    /// numerically "in window" by that stale arithmetic but at/before the
+    /// reset point would pass [`Self::receive_inputs`]'s check and then
+    /// panic inside `resim_from` reaching for a wiped snapshot.
+    /// [`Self::narrow_to`] carries this forward unchanged (same "hand-builds
+    /// a fresh `Self`, easy to forget a field" risk `scene` already hit).
+    history_floor: Tick,
     /// Checksums of every tick that has become eligible for cross-peer
     /// comparison (`tick <= current_tick - window` — the same boundary
     /// [`Self::oldest_available`] computes for [`Self::receive_inputs`]),
@@ -239,6 +259,7 @@ impl RollbackSim {
             inputs: vec![BTreeMap::new(); num_players],
             default_input,
             window,
+            history_floor: 0,
             checksum_cache: BTreeMap::new(),
         }
     }
@@ -363,6 +384,16 @@ impl RollbackSim {
             if tick > self.current_tick {
                 continue; // not simulated yet -- `advance` will pick this up naturally.
             }
+            if tick == 0 {
+                // Genesis: no prior tick exists for `resim_from` to rewind
+                // to (`resim_from`'s `from_tick - 1` would underflow), and
+                // there's nothing to have mispredicted anyway -- `advance`
+                // never simulates tick 0, `RollbackSim::new` just seeds it
+                // directly as the starting snapshot. Recording the input
+                // above still happens (harmless bookkeeping), but it can
+                // never trigger a resim or a `WindowExceeded`.
+                continue;
+            }
             if tick < oldest_available {
                 window_exceeded.get_or_insert(WindowExceeded {
                     requested_tick: tick,
@@ -469,8 +500,13 @@ impl RollbackSim {
     /// "mismatch" from perfectly ordinary prediction-then-correction, not
     /// real divergence. One computation, reused for both purposes rather
     /// than risking two independently-written copies drifting apart.
+    ///
+    /// Floored at `history_floor`, not just `current_tick - window`'s pure
+    /// arithmetic: [`Self::hard_reset_to`] can collapse the actually
+    /// retained snapshot history to far less than `window` deep, and this
+    /// must reflect that (`history_floor`'s field doc).
     fn oldest_available(&self) -> Tick {
-        self.current_tick.saturating_sub(self.window)
+        self.current_tick.saturating_sub(self.window).max(self.history_floor)
     }
 
     /// Computes and caches the checksum for whichever tick just became
@@ -554,6 +590,13 @@ impl RollbackSim {
             log.clear();
         }
         self.checksum_cache.clear();
+        // `tick + 1`, not `tick`: only one snapshot (`tick` itself) exists
+        // right after a reset, so the earliest tick `resim_from` can
+        // actually rewind to is `tick + 1` (needs `snapshots[tick]` as its
+        // base) -- a correction for `tick` itself has no earlier snapshot
+        // to resim from and must be rejected as `WindowExceeded` instead of
+        // panicking (`history_floor`'s field doc).
+        self.history_floor = tick.saturating_add(1);
     }
 
     /// Atomically replaces this session's scene *and* does what
@@ -634,9 +677,9 @@ impl RollbackSim {
     /// (they were never networked to begin with) — while still preserving
     /// `current_tick` and the real local player's own live state and input
     /// history, the same continuity [`Self::add_player_at`] guarantees for
-    /// the common (non-`Demo`) case. Also carries `scene` through
-    /// unchanged — narrowing never touches scene, only which player slots
-    /// survive.
+    /// the common (non-`Demo`) case. Also carries `scene` and
+    /// `history_floor` through unchanged — narrowing never touches scene or
+    /// retained history, only which player slots survive.
     pub fn narrow_to(&self, keep: PlayerIndex) -> Self {
         let mut snapshots = BTreeMap::new();
         for (&t, marbles) in &self.snapshots {
@@ -650,6 +693,10 @@ impl RollbackSim {
             inputs: vec![self.inputs[keep].clone()],
             default_input: self.default_input,
             window: self.window,
+            // Carried over unchanged, same reasoning as `scene`: narrowing
+            // doesn't touch retained history, so the oldest resimulatable
+            // tick doesn't change either.
+            history_floor: self.history_floor,
             // Not carried over: every cached entry was computed over the
             // *old*, wider marble set, a different shape than anything
             // this narrowed session will ever checksum again. Harmless
@@ -1398,6 +1445,27 @@ mod tests {
         assert_eq!(sim.num_players(), 2);
     }
 
+    /// A confirmed arrival for tick 0 (genesis -- `RollbackSim::new` seeds
+    /// it directly, `advance` never simulates it) must never attempt a
+    /// resim: `resim_from`'s `from_tick - 1` would underflow (`u64::MAX` in
+    /// a release build, since the guarding `debug_assert!` is compiled
+    /// out), reachable via a single `Input { tick: 0, .. }` message with no
+    /// reset or timing race needed at all. A fresh session has no prior
+    /// confirmed entry for tick 0 either, so before this guard existed,
+    /// *any* tick-0 arrival registered as a "mismatch" against `None` and
+    /// triggered `resim_from(0, ..)` unconditionally.
+    #[test]
+    fn a_tick_zero_arrival_never_triggers_a_resim() {
+        let (object, params, marbles, starts) = two_player_setup();
+        let cfg = PhysicsConfig::default();
+        let mut sim = RollbackSim::new(Scene { object, params, animations: vec![] }, marbles, input(0.0, 0.0), 16);
+
+        let result = sim.receive_inputs(&[(0, 0, scripted_input(0, 0))], &cfg, -1e6, &starts);
+
+        assert!(result.is_ok(), "a tick-0 arrival must not be reported as WindowExceeded either: {result:?}");
+        assert_eq!(sim.current_tick(), 0, "a tick-0 arrival must not advance or otherwise disturb current_tick");
+    }
+
     /// [`RollbackSim::narrow_to`]: the rare edge case of a solo session
     /// that already had more than one marble (`Demo`'s decorative extras,
     /// `render::setup`'s doc) gaining a real second player -- narrowing
@@ -1413,6 +1481,17 @@ mod tests {
             .unwrap();
             sim.advance(&cfg, -1e6, &starts);
         }
+        // Exercise a nonzero `history_floor` too, not just the default `0`
+        // every fresh session starts with -- `hard_reset_to` sets it, and
+        // `narrow_to` must carry it through unchanged just like `scene`
+        // (same "hand-builds a fresh `Self`, easy to forget a field" risk).
+        let reset_tick = 500;
+        let reset_marbles = vec![
+            Marble::spawn(starts[0], beware_of_bumps::MARBLE_RAD),
+            Marble::spawn(starts[1], beware_of_bumps::MARBLE_RAD),
+        ];
+        sim.hard_reset_to(reset_tick, reset_marbles);
+
         let player1_before = sim.marbles()[1];
         let tick_before = sim.current_tick();
 
@@ -1429,6 +1508,10 @@ mod tests {
             format!("{:?}", narrowed.scene()),
             format!("{:?}", sim.scene()),
             "narrowing must not lose or alter the session's scene"
+        );
+        assert_eq!(
+            narrowed.history_floor, sim.history_floor,
+            "narrowing must not lose or alter the session's history_floor"
         );
     }
 
@@ -1586,12 +1669,15 @@ mod tests {
         assert!(checked_any, "expected at least one cached checksum to have been produced");
     }
 
-    /// [`RollbackSim::hard_reset_to`]'s mechanical contract in isolation
-    /// (no mismatch scenario yet — that's the next test): live state and
-    /// `current_tick` are fully replaced, and the reseeded window supports
-    /// simulating onward immediately, including a same-tick-as-the-reset
-    /// rewind/resim, with no special-casing needed anywhere else in this
-    /// module.
+    /// [`RollbackSim::hard_reset_to`]'s mechanical contract in isolation:
+    /// live state and `current_tick` are fully replaced, a correction for
+    /// the reset tick itself (or any tick at/before it) is rejected as
+    /// [`WindowExceeded`] rather than panicking (there's no earlier
+    /// snapshot to resim from right after a reset — the actual
+    /// history-floor regression test), and the reseeded window supports
+    /// simulating onward immediately, including a correction shortly after
+    /// the reset that *does* have a valid resim base, with no
+    /// special-casing needed anywhere else in this module.
     #[test]
     fn hard_reset_to_replaces_live_state_and_reseeds_a_working_window() {
         let (object, params, marbles, starts) = two_player_setup();
@@ -1624,6 +1710,42 @@ mod tests {
             format!("{:?}", sim.scene()),
             scene_before_reset,
             "hard_reset_to must never alter the session's scene"
+        );
+
+        // A mismatching correction for the reset tick itself -- or any tick
+        // at/before it -- has no earlier snapshot to resim from (right
+        // after a reset, only `authoritative_tick`'s own snapshot exists)
+        // and must be rejected as `WindowExceeded` rather than panicking
+        // reaching for a snapshot that was never there. This is the actual
+        // regression test for the history-floor fix: before it existed,
+        // `oldest_available` only knew `window`'s (16-tick) arithmetic
+        // distance from `current_tick`, so a correction for
+        // `authoritative_tick` itself -- numerically far inside that
+        // window -- would pass this check and panic inside `resim_from`
+        // instead of being rejected here.
+        let result = sim.receive_inputs(
+            &[(0, authoritative_tick, scripted_input(0, authoritative_tick + 2000))],
+            &cfg,
+            -1e6,
+            &starts,
+        );
+        assert!(
+            matches!(result, Err(WindowExceeded { requested_tick, .. }) if requested_tick == authoritative_tick),
+            "a correction for the reset tick itself must be rejected as WindowExceeded, not panic: {result:?}"
+        );
+        assert_eq!(sim.current_tick(), authoritative_tick, "a rejected correction must not change current_tick");
+
+        // Same for a tick strictly before the reset point -- also numerically
+        // well inside the 16-tick window by the old (pre-fix) arithmetic.
+        let result = sim.receive_inputs(
+            &[(0, authoritative_tick - 5, scripted_input(0, authoritative_tick - 5 + 2000))],
+            &cfg,
+            -1e6,
+            &starts,
+        );
+        assert!(
+            matches!(result, Err(WindowExceeded { .. })),
+            "a correction for a pre-reset tick must be rejected as WindowExceeded, not panic: {result:?}"
         );
 
         // Simulating onward works immediately: a plain advance...
