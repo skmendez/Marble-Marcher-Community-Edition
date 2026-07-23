@@ -1043,9 +1043,15 @@ fn marble_physics_tick_impl(
     // owned `Scene` rather than taking one as a parameter (`RollbackSim`'s
     // own doc) -- this system never calls `apply_animations` itself.
     if let Err(e) = mp.sim.receive_inputs(&arrivals, &marble_state.cfg, kill_y, &starts) {
+        // Live 2-peer verification caught this: a host can hit this same
+        // branch too (e.g. a very late/delayed relayed input), but a host
+        // never requests a resync from anyone (host-authoritative
+        // convention) -- `request_resync_on_window_exceeded` correctly
+        // no-ops for it, so the log text must say so too instead of always
+        // claiming a request was made.
+        let action = if net.role == Role::Joiner { "requesting a full resync" } else { "host is authoritative, no action taken" };
         warn!(
-            "multiplayer: rollback window exceeded (tick {}, oldest available {}) -- \
-             requesting a full resync",
+            "multiplayer: rollback window exceeded (tick {}, oldest available {}) -- {action}",
             e.requested_tick, e.oldest_available
         );
         request_resync_on_window_exceeded(mp, net.role);
