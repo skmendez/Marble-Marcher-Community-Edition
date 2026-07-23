@@ -35,6 +35,115 @@
        connection, not for gameplay traffic once connected. -->
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <script src="./net.js"></script>
+  <!-- Debug/config panel: a dat.gui control per existing `?key=value` toggle
+       (see rust/app/src/config.rs's `Config::from_env` -- this table must
+       stay in sync with that function's flags, encodings, and defaults by
+       hand, since there's no shared source of truth across the wasm
+       boundary). Deliberately reload-on-change, not a live in-place update:
+       every flag here is only ever read once, at startup
+       (`Config::from_env`), so a reload is what actually applies a change
+       regardless of which flag it is -- no need to special-case flags that
+       "happen to" get re-read every frame vs. ones that don't. This is
+       purely a faster alternative to hand-editing the URL; every link built
+       by editing `?key=value` directly (shared links, this project's CDP
+       test scripts) is completely unaffected. -->
+  <script src="https://unpkg.com/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+  <script>
+    (function setUpConfigPanel() {
+      const params = new URLSearchParams(location.search);
+
+      // One entry per `Config::from_env` flag. `key`: the query-param name.
+      // `type`: 'bool' (dat.gui checkbox) or 'enum' (dat.gui dropdown).
+      // `parse`: query string -> current JS value, mirroring that flag's
+      // exact default/encoding in config.rs. `serialize`: JS value -> query
+      // string value to write back (only present where it differs from
+      // `String(value)`, e.g. a bool that encodes as "0"/"1" rather than
+      // "false"/"true"). `options`: dropdown choices for 'enum' fields
+      // (`SceneKind::from_value`'s exact accepted strings, render.rs).
+      const FIELDS = [
+        {
+          key: "scene",
+          type: "enum",
+          options: ["menger_oscillating_sphere", "demo", "classic_only", "menger_sponge", "menger_sphere"],
+          parse: (v) => (v === null ? "menger_oscillating_sphere" : v),
+        },
+        {
+          key: "mrrm",
+          type: "bool",
+          parse: (v) => v !== "0", // absent/anything-but-"0" => on (default on)
+          serialize: (v) => (v ? "1" : "0"),
+        },
+        {
+          key: "shadowlod",
+          type: "bool",
+          parse: (v) => v !== "0", // default on
+          serialize: (v) => (v ? "1" : "0"),
+        },
+        {
+          key: "perfprobe",
+          type: "bool",
+          parse: (v) => v === "1" || v === "true", // default off
+          serialize: (v) => (v ? "1" : "0"),
+        },
+        {
+          key: "debug",
+          type: "bool",
+          parse: (v) => v === "1", // default off
+          serialize: (v) => (v ? "1" : "0"),
+        },
+        {
+          key: "vsync",
+          type: "bool",
+          // Config's own field is `vsync_off` (true means vsync is OFF), but
+          // the panel shows the checkbox as "vsync" (checked = vsync ON, the
+          // default) so its polarity matches every other checkbox here
+          // (checked = feature enabled) instead of a double-negative.
+          parse: (v) => v !== "off",
+          serialize: (v) => (v ? "on" : "off"), // any non-"off" value falls back to AutoVsync (main.rs's present_mode), "on" is just the readable choice
+        },
+        {
+          key: "res_oscillate",
+          type: "bool",
+          parse: (v) => v === "1", // default off
+          serialize: (v) => (v ? "1" : "0"),
+        },
+      ];
+
+      const state = {};
+      for (const field of FIELDS) {
+        state[field.key] = field.parse(params.get(field.key));
+      }
+
+      function applyChange() {
+        const next = new URLSearchParams(location.search);
+        for (const field of FIELDS) {
+          const value = state[field.key];
+          const serialized = field.serialize ? field.serialize(value) : String(value);
+          next.set(field.key, serialized);
+        }
+        // Assigning `location.search` navigates on its own (confirmed) --
+        // no separate `location.reload()` call needed.
+        location.search = next.toString();
+      }
+
+      const gui = new dat.GUI();
+      // dat.gui's own default position (fixed top-right) collides with the
+      // networking status/copy-link panel (net.rs's spawn_net_ui, also
+      // top-right) -- move to the bottom-right corner instead, clear of
+      // that panel and of the debug overlay (fps_overlay.rs, top-left).
+      gui.domElement.style.position = "fixed";
+      gui.domElement.style.bottom = "6px";
+      gui.domElement.style.right = "6px";
+      gui.domElement.style.top = "";
+      gui.domElement.parentElement.style.zIndex = "1000";
+
+      for (const field of FIELDS) {
+        const controller =
+          field.type === "enum" ? gui.add(state, field.key, field.options) : gui.add(state, field.key);
+        controller.onFinishChange(applyChange);
+      }
+    })();
+  </script>
   <script type="module">
     import init from "./marble-marcher.js";
     init().catch((e) => {
