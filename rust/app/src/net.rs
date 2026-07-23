@@ -225,6 +225,18 @@ fn encode_message(msg: &NetMessage) -> Vec<u8> {
 /// fixed size, or a length prefix for `ResyncPayload`) to know exactly
 /// where it ends, so no *additional* outer framing is needed even though
 /// messages now vary in length between kinds.
+///
+/// Every body read goes through `bytes.get(range)` rather than direct
+/// index/slice syntax, and a `None` (not enough bytes remaining, or — for
+/// `ResyncPayload`'s attacker/bug-controlled `count` — an overflowing
+/// `count * MARBLE_LEN`) stops decoding immediately and returns whatever
+/// full messages were already parsed. A truncated or malformed tail on an
+/// otherwise-trusted peer's stream is still possible (a dropped byte, a
+/// build mismatch, or genuinely hostile input on this P2P WebRTC channel —
+/// nothing here assumes the remote is running the exact same build) and
+/// this is the difference between silently losing the tail of one
+/// `takeReceived` batch and a hard `panic = "abort"` process crash on the
+/// very next `bytes[i]`.
 fn decode_messages(bytes: &[u8]) -> Vec<NetMessage> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -233,38 +245,49 @@ fn decode_messages(bytes: &[u8]) -> Vec<NetMessage> {
         i += 1;
         match tag {
             TAG_INPUT => {
-                let (tick, input) = unpack(&bytes[i..i + RECORD_LEN]);
+                let Some(body) = bytes.get(i..i + RECORD_LEN) else { break };
+                let (tick, input) = unpack(body);
                 i += RECORD_LEN;
                 out.push(NetMessage::Input { tick, input });
             }
             TAG_CHECKSUM => {
-                let tick = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
-                let hash = u64::from_le_bytes(bytes[i + 8..i + 16].try_into().unwrap());
+                let Some(body) = bytes.get(i..i + 16) else { break };
+                let tick = u64::from_le_bytes(body[0..8].try_into().unwrap());
+                let hash = u64::from_le_bytes(body[8..16].try_into().unwrap());
                 i += 16;
                 out.push(NetMessage::Checksum { tick, hash });
             }
             TAG_RESYNC_REQUEST => {
-                let tick = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+                let Some(body) = bytes.get(i..i + 8) else { break };
+                let tick = u64::from_le_bytes(body.try_into().unwrap());
                 i += 8;
                 out.push(NetMessage::ResyncRequest { tick });
             }
             TAG_RESYNC_PAYLOAD => {
-                let tick = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
-                let count = u32::from_le_bytes(bytes[i + 8..i + 12].try_into().unwrap()) as usize;
+                let Some(header) = bytes.get(i..i + 12) else { break };
+                let tick = u64::from_le_bytes(header[0..8].try_into().unwrap());
+                let count = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
                 i += 12;
-                let marbles = bytes[i..i + count * MARBLE_LEN].chunks_exact(MARBLE_LEN).map(unpack_marble).collect();
-                i += count * MARBLE_LEN;
+                let Some(needed) = count.checked_mul(MARBLE_LEN) else { break };
+                let Some(end) = i.checked_add(needed) else { break };
+                let Some(body) = bytes.get(i..end) else { break };
+                let marbles = body.chunks_exact(MARBLE_LEN).map(unpack_marble).collect();
+                i = end;
                 out.push(NetMessage::ResyncPayload { tick, marbles });
             }
             TAG_SCENE_SYNC => {
-                let len = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
+                let Some(header) = bytes.get(i..i + 4) else { break };
+                let len = u32::from_le_bytes(header.try_into().unwrap()) as usize;
                 i += 4;
-                let payload = bytes[i..i + len].to_vec();
-                i += len;
+                let Some(end) = i.checked_add(len) else { break };
+                let Some(body) = bytes.get(i..end) else { break };
+                let payload = body.to_vec();
+                i = end;
                 out.push(NetMessage::SceneSync { bytes: payload });
             }
             TAG_WELCOME => {
-                let index = bytes[i] as PlayerIndex;
+                let Some(&b) = bytes.get(i) else { break };
+                let index = b as PlayerIndex;
                 i += 1;
                 out.push(NetMessage::Welcome { index });
             }
@@ -1112,5 +1135,76 @@ mod tests {
         assert_eq!(payload_marble_count, 3);
         assert_eq!(scene_sync_len, 37);
         assert!(decoded.iter().any(|m| matches!(m, NetMessage::ResyncRequest { tick: 13 })));
+    }
+
+    /// Fix 2 regression test: a valid message followed by a truncated tail
+    /// (fewer bytes than the tag promises) must not panic — the truncated
+    /// tail is silently dropped and everything decoded before it is kept.
+    /// Pre-fix, this would panic on the out-of-bounds slice for whichever
+    /// tag's fixed body length exceeded what's left in `bytes`.
+    #[test]
+    fn decode_messages_stops_cleanly_on_a_truncated_trailing_message_instead_of_panicking() {
+        let mut bytes = Vec::new();
+        bytes.extend(encode_message(&NetMessage::Checksum { tick: 10, hash: 1 }));
+        // A `TAG_INPUT` byte with only 3 of the required 32 body bytes
+        // actually present.
+        bytes.push(TAG_INPUT);
+        bytes.extend_from_slice(&[1, 2, 3]);
+
+        let decoded = decode_messages(&bytes);
+        assert_eq!(decoded.len(), 1);
+        assert!(matches!(decoded[0], NetMessage::Checksum { tick: 10, hash: 1 }));
+    }
+
+    /// Fix 2 regression test: a `ResyncPayload` whose wire-supplied `count`
+    /// claims far more marbles than actually follow in the buffer must not
+    /// panic. Pre-fix, `bytes[i..i + count * MARBLE_LEN]` would either
+    /// panic on an out-of-bounds slice (small buffers) or attempt to
+    /// multiply-overflow / index with a huge `count`; both are unreachable
+    /// after the fix, which validates the needed length against what's
+    /// actually left before ever slicing.
+    #[test]
+    fn decode_messages_rejects_a_resync_payload_whose_count_exceeds_the_buffer() {
+        let mut bytes = Vec::new();
+        bytes.push(TAG_RESYNC_PAYLOAD);
+        bytes.extend_from_slice(&55u64.to_le_bytes()); // tick
+        bytes.extend_from_slice(&1000u32.to_le_bytes()); // count -- wildly more than 0 marbles follow
+        // No marble bytes actually present.
+        let decoded = decode_messages(&bytes);
+        assert!(decoded.is_empty(), "a malformed ResyncPayload must decode to nothing, not panic");
+
+        // Also confirm a `count` near `u32::MAX` (which would overflow
+        // `count * MARBLE_LEN` in a naive `usize` multiply on a 32-bit
+        // target, and is a many-terabyte request regardless) is rejected
+        // the same way rather than panicking or attempting to allocate.
+        let mut overflow_bytes = Vec::new();
+        overflow_bytes.push(TAG_RESYNC_PAYLOAD);
+        overflow_bytes.extend_from_slice(&1u64.to_le_bytes());
+        overflow_bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        let decoded_overflow = decode_messages(&overflow_bytes);
+        assert!(decoded_overflow.is_empty());
+    }
+
+    /// Fix 2 regression test: same as the `ResyncPayload` case above but for
+    /// `SceneSync`'s wire-supplied `len` prefix.
+    #[test]
+    fn decode_messages_rejects_a_scene_sync_whose_len_exceeds_the_buffer() {
+        let mut bytes = Vec::new();
+        bytes.push(TAG_SCENE_SYNC);
+        bytes.extend_from_slice(&9999u32.to_le_bytes()); // len -- nothing close to this follows
+        bytes.extend_from_slice(&[1, 2, 3]);
+        let decoded = decode_messages(&bytes);
+        assert!(decoded.is_empty(), "a malformed SceneSync must decode to nothing, not panic");
+    }
+
+    /// Fix 2 regression test: a stream that ends exactly after a tag byte
+    /// (no body bytes at all, including `Welcome`'s single-byte index) must
+    /// not panic on `bytes[i]`.
+    #[test]
+    fn decode_messages_stops_cleanly_when_stream_ends_right_after_a_tag_byte() {
+        for tag in [TAG_INPUT, TAG_CHECKSUM, TAG_RESYNC_REQUEST, TAG_RESYNC_PAYLOAD, TAG_SCENE_SYNC, TAG_WELCOME] {
+            let decoded = decode_messages(&[tag]);
+            assert!(decoded.is_empty(), "tag {tag} with zero body bytes must decode to nothing, not panic");
+        }
     }
 }
