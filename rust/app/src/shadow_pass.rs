@@ -272,6 +272,8 @@ pub fn setup_shadow_pipeline(
         Msaa::Off,
         RenderLayers::layer(SHADOW_LAYER),
         ShadowCamera,
+        // GPU-timestamp-query profiling (`gpu_profile.rs`).
+        crate::gpu_profile::GpuProfiledPass(crate::gpu_profile::SHADOW_PASS_NAME),
     ));
 
     commands.spawn((

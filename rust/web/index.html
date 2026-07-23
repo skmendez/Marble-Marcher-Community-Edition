@@ -150,6 +150,54 @@
       }
     })();
   </script>
+  <!-- GPU per-pass timestamp profiling overlay (gpu_profile.rs). Only
+       created when `?gpuprofile=1` is present (mirrors the config panel's
+       own `parse` convention for this flag above) -- zero DOM cost
+       otherwise. `window.mmNet.reportPassTimings` is called once per frame
+       from Rust via net.rs's `js_bridge` once profiling is active there
+       too (both sides gate independently on the same flag, by design --
+       neither depends on the other having read it first). Positioned
+       bottom-left: bottom-right is the config panel above, top-left is
+       the Bevy-UI debug overlay (fps_overlay.rs, `?debug=1`), top-right is
+       the networking status panel (net.rs's spawn_net_ui). -->
+  <script>
+    (function setUpGpuProfileOverlay() {
+      const params = new URLSearchParams(location.search);
+      if (params.get("gpuprofile") !== "1") return;
+
+      const panel = document.createElement("pre");
+      panel.style.position = "fixed";
+      panel.style.bottom = "6px";
+      panel.style.left = "6px";
+      panel.style.margin = "0";
+      panel.style.padding = "6px 10px";
+      panel.style.background = "rgba(0, 0, 0, 0.55)";
+      panel.style.color = "#9cf";
+      panel.style.font = "12px/1.4 monospace";
+      panel.style.whiteSpace = "pre";
+      panel.style.zIndex = "999";
+      panel.textContent = "GPU pass timings: waiting for first frame...";
+      document.body.appendChild(panel);
+
+      // `ms < 0` is the "no reading yet" sentinel (net.rs's js_bridge doc) --
+      // distinct from `supported === false`, which means this adapter will
+      // never produce real numbers here at all.
+      const fmt = (ms) => (ms < 0 ? "  --  " : ms.toFixed(2).padStart(6) + "ms");
+
+      window.mmNet.reportPassTimings = function (supported, coarseMs, shadowMs, fineMs, presentMs) {
+        if (!supported) {
+          panel.textContent = "GPU pass timings: unsupported on this backend (no wgpu::Features::TIMESTAMP_QUERY)";
+          return;
+        }
+        panel.textContent =
+          "GPU pass timings\n" +
+          `  coarse:  ${fmt(coarseMs)}\n` +
+          `  shadow:  ${fmt(shadowMs)}\n` +
+          `  fine:    ${fmt(fineMs)}\n` +
+          `  present: ${fmt(presentMs)}`;
+      };
+    })();
+  </script>
   <script type="module">
     import init from "./marble-marcher.js";
     init().catch((e) => {

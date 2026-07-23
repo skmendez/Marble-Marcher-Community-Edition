@@ -303,7 +303,7 @@ fn decode_messages(bytes: &[u8]) -> Vec<NetMessage> {
 }
 
 #[cfg(target_arch = "wasm32")]
-mod js_bridge {
+pub(crate) mod js_bridge {
     use wasm_bindgen::prelude::*;
 
     #[wasm_bindgen]
@@ -334,6 +334,16 @@ mod js_bridge {
         pub fn copy_to_clipboard(text: &str);
         #[wasm_bindgen(js_namespace = mmNet, js_name = takeClipboardStatus)]
         pub fn take_clipboard_status() -> i32;
+        // GPU-timestamp-query profiling (`gpu_profile.rs`) -- reports the
+        // last-resolved duration (milliseconds, `-1.0` sentinel for "not
+        // yet available") for each of the 4 named passes, plus whether
+        // this adapter supports GPU profiling at all (distinct from "no
+        // reading yet" -- `supported == false` means it never will).
+        // Namespaced under `mmNet` like every other bridge call here, even
+        // though this isn't strictly networking -- that's just this app's
+        // one established Rust->JS bridge, not a second mechanism.
+        #[wasm_bindgen(js_namespace = mmNet, js_name = reportPassTimings)]
+        pub fn report_pass_timings(supported: bool, coarse_ms: f64, shadow_ms: f64, fine_ms: f64, present_ms: f64);
     }
 }
 
@@ -342,7 +352,7 @@ mod js_bridge {
 /// no-op/idle value — native always behaves as if it's permanently
 /// offline, which is exactly today's (pre-milestone-2) native behavior.
 #[cfg(not(target_arch = "wasm32"))]
-mod js_bridge {
+pub(crate) mod js_bridge {
     pub fn host() {}
     pub fn join(_host_id: &str) {}
     pub fn send(_bytes: &[u8]) {}
@@ -372,6 +382,7 @@ mod js_bridge {
     pub fn take_clipboard_status() -> i32 {
         0
     }
+    pub fn report_pass_timings(_supported: bool, _coarse_ms: f64, _shadow_ms: f64, _fine_ms: f64, _present_ms: f64) {}
 }
 
 /// This client's role in the current (at most 2-player) session, mirroring

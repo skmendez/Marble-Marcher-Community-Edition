@@ -1,6 +1,5 @@
-//! GPU timestamp-query profiling (Stage 3 proof of concept -- the "fine"
-//! marcher pass only; the other 3 named passes are a later stage, not this
-//! one).
+//! GPU timestamp-query profiling for all 4 named render passes (coarse
+//! warm-start marcher, shadow-LOD marcher, fine marcher, present/blit).
 //!
 //! ## Why this needs a hand-authored render-graph node
 //!
@@ -25,7 +24,7 @@
 //! hardcodes `timestamp_writes: None` with no config surface, and this
 //! codebase has no existing custom render-graph node to extend. Rather
 //! than vendoring a patch against a specific Bevy point release (fragile,
-//! silently breakable on a future `cargo update`), [`FineTimingNode`]
+//! silently breakable on a future `cargo update`), [`MarcherTimingNode`]
 //! below is a from-scratch replacement for that stock node, registered
 //! under the *same* `Node2d::MainOpaquePass` label -- `RenderGraph::
 //! add_node` is a plain `HashMap` insert (confirmed by reading
@@ -35,9 +34,9 @@
 //! not the concrete node type) keeps working unchanged. Since `Camera2d`'s
 //! own `#[require(...)]` pins every 2D camera to the `Core2d` sub-graph,
 //! this one replacement node's `run()` gets invoked once per camera/view
-//! per frame (all 4 of this app's passes go through it) -- it behaves
-//! exactly like stock for every view except the one tagged
-//! [`GpuProfiledPass`], where it also attaches real timestamp writes.
+//! per frame -- all 4 of this app's passes go through the exact same node
+//! instance, distinguished only by which one (if any) carries a
+//! [`GpuProfiledPass`] marker naming it.
 //!
 //! Trade-off accepted deliberately: the stock node uses
 //! `RenderContext::add_command_buffer_generation_task` to record each
@@ -49,6 +48,17 @@
 //! code -- acceptable here since this app only has 4 cameras total, not
 //! the many-view workloads that optimization targets.
 //!
+//! ## Four passes sharing one query set
+//!
+//! All 4 named passes share a single 8-slot `wgpu::QuerySet` (2 slots --
+//! begin/end -- per pass) and a single 64-byte resolve buffer, rather than
+//! one query set per pass: simpler resource lifecycle (one lazy-init
+//! check, not four), and every pass already resolves its own 2-slot
+//! sub-range independently the moment its own render pass ends (see
+//! [`slot_pair`]), so sharing the underlying set/buffer costs nothing --
+//! there's no cross-pass synchronization concern since each pass only
+//! ever touches its own disjoint byte range.
+//!
 //! ## Readback
 //!
 //! Mirrors `bevy_render::gpu_readback::GpuReadbackPlugin`'s own shape
@@ -57,14 +67,13 @@
 //! registered from a system that runs *after* `render_system` has actually
 //! submitted the command buffer containing the corresponding
 //! `resolve_query_set`/copy (same ordering `gpu_readback.rs`'s own
-//! `map_buffers` system uses), and the resolved `[begin_ns, end_ns]` pair
-//! drained into the main world's [`PassTimings`] resource via a system in
-//! `ExtractSchedule` (which has `ResMut<MainWorld>` access despite running
-//! on the `RenderApp`, same as `gpu_readback.rs`'s `sync_readbacks`).
-//! Deliberately no buffer pool yet at this proof-of-concept stage (a
-//! single 16-byte buffer allocated and dropped per frame is not worth the
-//! complexity here); add one, mirroring `gpu_readback.rs`'s own pool, if
-//! generalizing to all 4 passes in a later stage makes it worth it.
+//! `map_buffers` system uses), and each resolved `(pass_name, duration)`
+//! pair drained into the main world's [`PassTimings`] resource via a
+//! system in `ExtractSchedule` (which has `ResMut<MainWorld>` access
+//! despite running on the `RenderApp`, same as `gpu_readback.rs`'s
+//! `sync_readbacks`). Still no buffer pool (a handful of small buffers
+//! allocated and dropped per frame, 4 passes worth, isn't worth pooling
+//! at this scale -- revisit only if profiling shows this actually matters).
 
 use async_channel::{Receiver, Sender};
 
@@ -88,18 +97,53 @@ use bevy::render::{ExtractSchedule, MainWorld, Render, RenderApp, RenderSet};
 use crate::config::Config;
 
 /// Marker for a camera whose Material2d pass should get real GPU
-/// timestamp queries when profiling is active. Attached to the fine
-/// camera in `render.rs`'s `setup` -- the other 3 named passes are a
-/// later stage.
+/// timestamp queries when profiling is active. Attached to each of the 4
+/// named-pass cameras: the coarse camera in `mrrm.rs`'s
+/// `setup_mrrm_pipeline`, the shadow camera in `shadow_pass.rs`'s
+/// `setup_shadow_pipeline`, and the fine + present cameras in
+/// `render.rs`'s `setup`.
 #[derive(Component, Clone, Copy, ExtractComponent)]
-// Unread for now: with only one profiled pass (Stage 3), `FineTimingNode`
-// only ever needs `Option::is_some()` on this, not the name itself --
-// becomes load-bearing (choosing which query-set slot pair a view gets)
-// once a later stage generalizes to all 4 named passes.
-#[allow(dead_code)]
 pub struct GpuProfiledPass(pub &'static str);
 
+pub const COARSE_PASS_NAME: &str = "coarse";
+pub const SHADOW_PASS_NAME: &str = "shadow";
 pub const FINE_PASS_NAME: &str = "fine";
+pub const PRESENT_PASS_NAME: &str = "present";
+
+/// Fixed order backing both the shared 8-slot query set's layout and
+/// [`slot_pair`]'s lookup -- each pass owns a disjoint 2-slot sub-range
+/// (index `i` in this array owns slots `2*i`/`2*i + 1`), so all 4 passes
+/// can safely share one `wgpu::QuerySet`/resolve buffer.
+const PASS_NAMES: [&str; 4] = [COARSE_PASS_NAME, SHADOW_PASS_NAME, FINE_PASS_NAME, PRESENT_PASS_NAME];
+
+/// WebGPU requires `resolve_query_set`'s *destination buffer* offset to be
+/// a multiple of 256 bytes (confirmed the hard way live: a tightly-packed
+/// 16-bytes-per-pass layout produced a "destination buffer offset is not
+/// a multiple of 256" validation warning -- which, worse, silently
+/// invalidates that *entire* frame's command-buffer submission, not just
+/// this one pass's resolve, since Bevy batches every view's command
+/// buffer into one `queue.submit()` call and a single invalid buffer in
+/// that list is a no-op for the whole call per the WebGPU spec). Each pass
+/// therefore gets its own 256-byte-aligned region of the resolve buffer,
+/// even though only the first 16 bytes of each region are ever actually
+/// read -- the query *set* itself has no such alignment constraint, so
+/// its slots stay tightly packed (2 per pass, [`slot_pair`]'s shape).
+const RESOLVE_BUFFER_STRIDE: u64 = 256;
+
+/// This pass's (begin, end) slot indices within the shared query set, or
+/// `None` for an unrecognized name (never expected in practice -- every
+/// [`GpuProfiledPass`] this app ever constructs uses one of the 4 named
+/// constants above).
+fn slot_pair(name: &str) -> Option<(u32, u32)> {
+    PASS_NAMES.iter().position(|&n| n == name).map(|i| (i as u32 * 2, i as u32 * 2 + 1))
+}
+
+/// This pass's 256-byte-aligned byte offset into the shared resolve
+/// buffer (see [`RESOLVE_BUFFER_STRIDE`]'s doc for why this is a
+/// *separate* index space from the query set's own tightly-packed slots).
+fn resolve_byte_offset(name: &str) -> Option<u64> {
+    PASS_NAMES.iter().position(|&n| n == name).map(|i| i as u64 * RESOLVE_BUFFER_STRIDE)
+}
 
 /// Main-world resource, set once at `Startup`: whether this adapter
 /// actually supports `wgpu::Features::TIMESTAMP_QUERY`. Bevy's default
@@ -131,7 +175,7 @@ pub fn log_gpu_profile_capability(mut commands: Commands, adapter: Res<RenderAda
 }
 
 /// Main-world resource, recomputed every frame by [`update_gpu_profile_active`]
-/// and extracted into the render world -- the one flag [`FineTimingNode`]
+/// and extracted into the render world -- the one flag [`MarcherTimingNode`]
 /// actually gates on, so it doesn't need to separately reach for both
 /// `Config` and [`GpuProfileCapability`] itself.
 #[derive(Resource, Clone, Copy, Default, ExtractResource)]
@@ -150,30 +194,60 @@ pub fn update_gpu_profile_active(
     active.active = config.gpu_profile_enabled && capability.is_some_and(|c| c.supported);
 }
 
-/// Main-world resource: the fine pass's last resolved GPU duration, in
-/// nanoseconds. `None` until the first successful readback arrives (GPU
-/// readback is inherently a frame or more behind).
+/// Main-world resource: each named pass's last resolved GPU duration, in
+/// nanoseconds. `None` until that pass's first successful readback
+/// arrives (GPU readback is inherently a frame or more behind).
 #[derive(Resource, Clone, Copy, Default)]
 pub struct PassTimings {
+    pub coarse_pass_ns: Option<i64>,
+    pub shadow_pass_ns: Option<i64>,
     pub fine_pass_ns: Option<i64>,
+    pub present_pass_ns: Option<i64>,
 }
 
-/// `Update` system (main world): temporary Stage-3 verification signal --
-/// logs the fine pass's GPU duration whenever it changes, so this can be
-/// confirmed live via the browser console without waiting for the real
-/// overlay (a later stage). Safe to remove once Stage 5 lands.
-pub fn log_pass_timings_on_change(timings: Res<PassTimings>) {
-    if timings.is_changed() {
-        if let Some(ns) = timings.fine_pass_ns {
-            info!("gpu_profile: fine pass = {:.3} ms", ns as f64 / 1_000_000.0);
+impl PassTimings {
+    fn set_by_name(&mut self, name: &str, ns: i64) {
+        match name {
+            COARSE_PASS_NAME => self.coarse_pass_ns = Some(ns),
+            SHADOW_PASS_NAME => self.shadow_pass_ns = Some(ns),
+            FINE_PASS_NAME => self.fine_pass_ns = Some(ns),
+            PRESENT_PASS_NAME => self.present_pass_ns = Some(ns),
+            _ => {}
         }
     }
+}
+
+/// `Update` system (main world): reports the current `PassTimings` (plus
+/// whether this adapter even supports GPU profiling at all) to the JS
+/// overlay (`index.html`) via `net.rs`'s `js_bridge`, once per frame.
+/// `-1.0` is the "not yet available" sentinel for a pass whose first
+/// readback hasn't landed yet (distinct from `supported == false`, which
+/// means it never will). Only runs at all while `gpuprofile` is on --
+/// true no-op otherwise, matching every other profiling system here.
+pub fn report_pass_timings_to_js(
+    config: Res<Config>,
+    capability: Option<Res<GpuProfileCapability>>,
+    timings: Res<PassTimings>,
+) {
+    if !config.gpu_profile_enabled {
+        return;
+    }
+    let supported = capability.is_some_and(|c| c.supported);
+    let to_ms = |ns: Option<i64>| ns.map(|n| n as f64 / 1_000_000.0).unwrap_or(-1.0);
+    crate::net::js_bridge::report_pass_timings(
+        supported,
+        to_ms(timings.coarse_pass_ns),
+        to_ms(timings.shadow_pass_ns),
+        to_ms(timings.fine_pass_ns),
+        to_ms(timings.present_pass_ns),
+    );
 }
 
 /// Render-world resource: the timestamp query set + its resolve buffer,
 /// created lazily (by [`ensure_gpu_profile_resources`]) the first time
 /// they're actually needed -- true no-op allocation-wise whenever
-/// profiling is off.
+/// profiling is off. Sized for all 4 named passes at once (see module
+/// doc's "Four passes sharing one query set").
 #[derive(Resource)]
 struct GpuProfileResources {
     query_set: wgpu::QuerySet,
@@ -182,14 +256,17 @@ struct GpuProfileResources {
 
 impl GpuProfileResources {
     fn new(device: &RenderDevice) -> Self {
+        let slot_count = (PASS_NAMES.len() * 2) as u32;
         let query_set = device.wgpu_device().create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("gpu_profile_query_set"),
             ty: wgpu::QueryType::Timestamp,
-            count: 2,
+            count: slot_count,
         });
         let resolve_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("gpu_profile_resolve_buffer"),
-            size: 2 * 8,
+            // One `RESOLVE_BUFFER_STRIDE`-sized (256-byte-aligned) region
+            // per pass, not `slot_count * 8` -- see that constant's doc.
+            size: (PASS_NAMES.len() as u64) * RESOLVE_BUFFER_STRIDE,
             usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -197,30 +274,32 @@ impl GpuProfileResources {
     }
 }
 
-/// A `Mutex`-guarded queue so [`FineTimingNode::run`] (which only has
-/// shared `&World` access) can still hand a freshly-created readback
-/// buffer off to [`poll_gpu_profile_readback`] (an ordinary system that
-/// runs later the same frame, with normal `Res`/`ResMut` access).
+/// A `Mutex`-guarded queue so [`MarcherTimingNode::run`] (which only has
+/// shared `&World` access) can still hand freshly-created readback
+/// buffers off to [`poll_gpu_profile_readback`] (an ordinary system that
+/// runs later the same frame, with normal `Res`/`ResMut` access). Each
+/// entry is tagged with which named pass it belongs to, since up to 4
+/// views can each queue one per frame.
 #[derive(Resource, Default)]
-struct PendingReadbackQueue(std::sync::Mutex<Vec<Buffer>>);
+struct PendingReadbackQueue(std::sync::Mutex<Vec<(&'static str, Buffer)>>);
 
 impl PendingReadbackQueue {
-    fn push(&self, buffer: Buffer) {
-        self.0.lock().unwrap().push(buffer);
+    fn push(&self, name: &'static str, buffer: Buffer) {
+        self.0.lock().unwrap().push((name, buffer));
     }
 }
 
 /// Render-world resource: the channel [`poll_gpu_profile_readback`]'s
-/// `map_async` callback sends a resolved raw tick duration through,
-/// drained each frame by [`sync_gpu_profile_timings`] in `ExtractSchedule`
-/// -- mirrors `gpu_readback.rs`'s own channel-per-readback shape, except
-/// this channel is created once and reused every frame rather than
-/// per-request, since there's only ever one in-flight fine-pass readback
-/// at a time at this proof-of-concept stage.
+/// `map_async` callbacks send a `(pass_name, resolved_raw_tick_duration)`
+/// pair through, drained each frame by [`sync_gpu_profile_timings`] in
+/// `ExtractSchedule` -- mirrors `gpu_readback.rs`'s own channel-per-
+/// readback shape, except this one channel is created once and shared by
+/// all 4 passes (each message self-identifies via its pass name) rather
+/// than one channel per request.
 #[derive(Resource)]
 struct GpuProfileReadbackChannel {
-    tx: Sender<i64>,
-    rx: Receiver<i64>,
+    tx: Sender<(&'static str, i64)>,
+    rx: Receiver<(&'static str, i64)>,
 }
 
 impl Default for GpuProfileReadbackChannel {
@@ -236,9 +315,9 @@ impl Default for GpuProfileReadbackChannel {
 /// Behaves identically to stock for every view except one tagged
 /// [`GpuProfiledPass`] while [`GpuProfileActive`] is also true.
 #[derive(Default)]
-struct FineTimingNode;
+struct MarcherTimingNode;
 
-impl ViewNode for FineTimingNode {
+impl ViewNode for MarcherTimingNode {
     type ViewQuery = (
         &'static ExtractedCamera,
         &'static ExtractedView,
@@ -268,16 +347,29 @@ impl ViewNode for FineTimingNode {
         };
 
         let active = world.get_resource::<GpuProfileActive>().is_some_and(|a| a.active);
-        let profile_resources =
-            (active && profiled_pass.is_some()).then(|| world.get_resource::<GpuProfileResources>()).flatten();
+        // (name, begin_slot, end_slot, resolve_byte_offset) for this view,
+        // only if it's both named and profiling is currently active --
+        // `None` for the other 3 passes (all the time) or any pass while
+        // profiling is off. The query-set slot pair and the resolve-buffer
+        // byte offset are deliberately separate index spaces -- see
+        // `RESOLVE_BUFFER_STRIDE`'s doc for why.
+        let pass_id: Option<(&'static str, u32, u32, u64)> = active.then_some(profiled_pass).flatten().and_then(|p| {
+            let (begin, end) = slot_pair(p.0)?;
+            let offset = resolve_byte_offset(p.0)?;
+            Some((p.0, begin, end, offset))
+        });
+        let profile_resources = pass_id.is_some().then(|| world.get_resource::<GpuProfileResources>()).flatten();
 
         let color_attachments = [Some(target.get_color_attachment())];
         let depth_stencil_attachment = Some(depth.get_attachment(StoreOp::Store));
-        let timestamp_writes = profile_resources.map(|res| wgpu::RenderPassTimestampWrites {
-            query_set: &res.query_set,
-            beginning_of_pass_write_index: Some(0),
-            end_of_pass_write_index: Some(1),
-        });
+        let timestamp_writes = match (&profile_resources, pass_id) {
+            (Some(res), Some((_, begin, end, _))) => Some(wgpu::RenderPassTimestampWrites {
+                query_set: &res.query_set,
+                beginning_of_pass_write_index: Some(begin),
+                end_of_pass_write_index: Some(end),
+            }),
+            _ => None,
+        };
 
         let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
             label: Some("main_opaque_pass_2d"),
@@ -304,25 +396,26 @@ impl ViewNode for FineTimingNode {
         }
         drop(render_pass);
 
-        // Resolve + copy this view's own timestamp pair out to a fresh
+        // Resolve + copy this view's own 2-slot sub-range out to a fresh
         // readback buffer, still within the same shared command encoder
         // used above -- ordering within one encoder's recorded command
         // list is exactly what makes this safe without any cross-view
-        // synchronization.
-        if let Some(res) = profile_resources {
+        // synchronization, and each pass only ever touches its own
+        // disjoint byte range of the shared resolve buffer.
+        if let (Some(res), Some((name, begin, end, byte_offset))) = (&profile_resources, pass_id) {
             if let (Some(device), Some(pending)) =
                 (world.get_resource::<RenderDevice>(), world.get_resource::<PendingReadbackQueue>())
             {
                 let readback_buffer = device.create_buffer(&BufferDescriptor {
                     label: Some("gpu_profile_readback_buffer"),
-                    size: 2 * 8,
+                    size: 16,
                     usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
                     mapped_at_creation: false,
                 });
                 let encoder = render_context.command_encoder();
-                encoder.resolve_query_set(&res.query_set, 0..2, &res.resolve_buffer, 0);
-                encoder.copy_buffer_to_buffer(&res.resolve_buffer, 0, &readback_buffer, 0, 16);
-                pending.push(readback_buffer);
+                encoder.resolve_query_set(&res.query_set, begin..(end + 1), &res.resolve_buffer, byte_offset);
+                encoder.copy_buffer_to_buffer(&res.resolve_buffer, byte_offset, &readback_buffer, 0, 16);
+                pending.push(name, readback_buffer);
             }
         }
 
@@ -331,7 +424,7 @@ impl ViewNode for FineTimingNode {
 }
 
 /// `RenderSet::Prepare` system: ensures [`GpuProfileResources`] exists
-/// before [`FineTimingNode`] runs this frame, whenever profiling is
+/// before [`MarcherTimingNode`] runs this frame, whenever profiling is
 /// active -- the lazy lookup itself has to happen here (an ordinary
 /// system with `ResMut`/`Commands`), not inside the node's `run()`, since
 /// that only gets shared `&World` access.
@@ -348,12 +441,12 @@ fn ensure_gpu_profile_resources(
 
 /// `RenderSet::Render`, after `render_system` (mirrors `gpu_readback.rs`'s
 /// `map_buffers` ordering exactly): only now, after the command buffer
-/// containing this frame's `resolve_query_set`/copy has actually been
-/// submitted to the queue, register the `map_async` read -- mapping a
-/// buffer any earlier risks racing the copy that fills it.
+/// containing this frame's `resolve_query_set`/copy calls has actually
+/// been submitted to the queue, register the `map_async` reads -- mapping
+/// a buffer any earlier risks racing the copy that fills it.
 fn poll_gpu_profile_readback(pending: Res<PendingReadbackQueue>, channel: Res<GpuProfileReadbackChannel>) {
-    let buffers: Vec<Buffer> = std::mem::take(&mut *pending.0.lock().unwrap());
-    for buffer in buffers {
+    let buffers: Vec<(&'static str, Buffer)> = std::mem::take(&mut *pending.0.lock().unwrap());
+    for (name, buffer) in buffers {
         let tx = channel.tx.clone();
         let buffer_for_callback = buffer.clone();
         buffer.slice(..).map_async(MapMode::Read, move |result| {
@@ -370,25 +463,30 @@ fn poll_gpu_profile_readback(pending: Res<PendingReadbackQueue>, channel: Res<Gp
             buffer_for_callback.unmap();
             let duration = end - begin;
             if duration > 0 {
-                let _ = tx.try_send(duration);
+                let _ = tx.try_send((name, duration));
             }
         });
     }
 }
 
 /// `ExtractSchedule` system (mirrors `gpu_readback.rs`'s `sync_readbacks`):
-/// drains whatever the readback channel has produced since last frame
-/// into the main world's [`PassTimings`]. `RenderQueue::get_timestamp_period`
-/// converts raw GPU ticks to nanoseconds -- required for correctness on
-/// native backends (Vulkan/Metal/DX12 ticks aren't always 1ns); the
-/// WebGPU spec guarantees timestamps are already in nanoseconds, where
-/// this returns `1.0` and the multiply is a no-op.
-fn sync_gpu_profile_timings(mut main_world: ResMut<MainWorld>, channel: Res<GpuProfileReadbackChannel>, queue: Res<RenderQueue>) {
+/// drains whatever the readback channel has produced since last frame,
+/// across all 4 passes, into the main world's [`PassTimings`].
+/// `RenderQueue::get_timestamp_period` converts raw GPU ticks to
+/// nanoseconds -- required for correctness on native backends
+/// (Vulkan/Metal/DX12 ticks aren't always 1ns); the WebGPU spec
+/// guarantees timestamps are already in nanoseconds, where this returns
+/// `1.0` and the multiply is a no-op.
+fn sync_gpu_profile_timings(
+    mut main_world: ResMut<MainWorld>,
+    channel: Res<GpuProfileReadbackChannel>,
+    queue: Res<RenderQueue>,
+) {
     let period = queue.get_timestamp_period();
-    while let Ok(raw_ticks) = channel.rx.try_recv() {
+    while let Ok((name, raw_ticks)) = channel.rx.try_recv() {
         let ns = (raw_ticks as f64 * period as f64) as i64;
         if let Some(mut timings) = main_world.get_resource_mut::<PassTimings>() {
-            timings.fine_pass_ns = Some(ns);
+            timings.set_by_name(name, ns);
         }
     }
 }
@@ -402,7 +500,7 @@ impl Plugin for GpuProfilePlugin {
             .init_resource::<GpuProfileActive>()
             .init_resource::<PassTimings>()
             .add_systems(Startup, log_gpu_profile_capability)
-            .add_systems(Update, (update_gpu_profile_active, log_pass_timings_on_change).chain());
+            .add_systems(Update, (update_gpu_profile_active, report_pass_timings_to_js).chain());
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -418,6 +516,6 @@ impl Plugin for GpuProfilePlugin {
                     poll_gpu_profile_readback.in_set(RenderSet::Render).after(render_system),
                 ),
             )
-            .add_render_graph_node::<ViewNodeRunner<FineTimingNode>>(Core2d, Node2d::MainOpaquePass);
+            .add_render_graph_node::<ViewNodeRunner<MarcherTimingNode>>(Core2d, Node2d::MainOpaquePass);
     }
 }

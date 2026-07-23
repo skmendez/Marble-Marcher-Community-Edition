@@ -334,6 +334,8 @@ pub fn setup_mrrm_pipeline(
         Msaa::Off,
         RenderLayers::layer(COARSE_LAYER),
         CoarseCamera,
+        // GPU-timestamp-query profiling (`gpu_profile.rs`).
+        crate::gpu_profile::GpuProfiledPass(crate::gpu_profile::COARSE_PASS_NAME),
     ));
 
     commands.spawn((
