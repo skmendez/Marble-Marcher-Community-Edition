@@ -357,6 +357,89 @@ fn exchange_checksums_and_resync(
     }
 }
 
+/// Requests a full resync in response to `RollbackSim::receive_inputs`
+/// reporting [`WindowExceeded`] -- same trigger role/latch gating as a
+/// checksum mismatch ([`exchange_checksums_and_resync`]'s own
+/// `role == Role::Joiner && !*resync_pending` check), reused here rather
+/// than relying on that separate periodic-checksum path to eventually
+/// notice on its own: that path only ever compares ticks still within its
+/// own `CHECKSUM_CACHE_TICKS`-deep cache (5 seconds), which a desync bad
+/// enough to blow the much shallower (~267ms) rewind window can easily
+/// have already outrun too -- once that happens, no mismatch is ever
+/// comparable again and the caller's warning would otherwise repeat
+/// forever with nothing to end it. Factored out of
+/// `marble_physics_tick_impl` (a Bevy system needing a full `World` to
+/// construct in a test) purely so this gating logic is directly
+/// unit-testable, same reasoning as [`is_valid_welcome_index`].
+fn request_resync_on_window_exceeded(mp: &mut MultiplayerSession, role: Role) {
+    if role == Role::Joiner && !mp.resync_pending {
+        if let Some(transport) = mp.transport.as_mut() {
+            transport.send_resync_request(mp.sim.current_tick());
+            mp.resync_pending = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod window_exceeded_resync_tests {
+    use super::*;
+    use marble_csg::scenes::demo_scene;
+    use marble_csg::Params;
+
+    /// Fix B regression test: a `WindowExceeded` correction failure must
+    /// trigger a fresh resync request (setting `resync_pending`) on a
+    /// joiner with none already in flight -- pre-fix, this path was purely
+    /// a log statement with no corrective action at all, which is exactly
+    /// why the reported symptom was "thousands of repeating warnings that
+    /// never recover."
+    #[test]
+    fn window_exceeded_on_a_joiner_with_no_pending_resync_requests_one() {
+        let mut params = Params::new();
+        let (object, _handles) = demo_scene(&mut params);
+        let scene = marble_csg::Scene { object, params, animations: vec![] };
+        let mut mp = MultiplayerSession::new_solo(scene, vec![Marble::spawn(Vec3::ZERO, 0.3)]);
+        mp.transport = Some(WebRtcTransport::new(Role::Joiner));
+        assert!(!mp.resync_pending);
+
+        request_resync_on_window_exceeded(&mut mp, Role::Joiner);
+
+        assert!(mp.resync_pending, "a WindowExceeded on a joiner must set resync_pending, requesting a resync");
+    }
+
+    /// A resync already in flight must not trigger a second request --
+    /// same latch behavior `exchange_checksums_and_resync`'s mismatch path
+    /// already relies on for its own repeated-mismatch case.
+    #[test]
+    fn window_exceeded_with_a_resync_already_pending_does_not_request_again() {
+        let mut params = Params::new();
+        let (object, _handles) = demo_scene(&mut params);
+        let scene = marble_csg::Scene { object, params, animations: vec![] };
+        let mut mp = MultiplayerSession::new_solo(scene, vec![Marble::spawn(Vec3::ZERO, 0.3)]);
+        mp.transport = Some(WebRtcTransport::new(Role::Joiner));
+        mp.resync_pending = true;
+
+        request_resync_on_window_exceeded(&mut mp, Role::Joiner);
+
+        assert!(mp.resync_pending, "still pending -- unaffected either way, just confirming no panic/reset occurs");
+    }
+
+    /// A host never requests a resync from anyone (host-authoritative
+    /// convention, `net::Role`'s doc) -- `WindowExceeded` on the host side
+    /// must not flip `resync_pending`.
+    #[test]
+    fn window_exceeded_on_the_host_never_requests_a_resync() {
+        let mut params = Params::new();
+        let (object, _handles) = demo_scene(&mut params);
+        let scene = marble_csg::Scene { object, params, animations: vec![] };
+        let mut mp = MultiplayerSession::new_solo(scene, vec![Marble::spawn(Vec3::ZERO, 0.3)]);
+        mp.transport = Some(WebRtcTransport::new(Role::Host));
+
+        request_resync_on_window_exceeded(&mut mp, Role::Host);
+
+        assert!(!mp.resync_pending, "a host must never request a resync from itself");
+    }
+}
+
 /// Drains and applies the host's most recent authoritative tick+state
 /// push, if any arrived since the last tick. The same `ResyncPayload`
 /// message (and this same adoption code) serves three triggers that all
@@ -401,10 +484,22 @@ fn apply_resync_payload(mp: &mut MultiplayerSession, marble_state: &mut MarbleSt
     if !mp.joined {
         // First time this client has ever heard from a host: strip `Demo`'s
         // decorative extra marbles (`render::setup`'s doc) down to just
-        // this client's own real one.
+        // this client's own real one. That marble is always local index 0
+        // (`render::setup` hardcodes `local_player_index: 0` at every
+        // session's start) -- a compile-time-known constant, NOT
+        // `marble_state.local_player_index`, which `apply_welcome` (called
+        // just above, same tick in practice, `marble_physics_tick_impl`'s
+        // ordering) has *already* overwritten to the host-assigned
+        // multiplayer slot by the time this runs. Reusing that
+        // already-reassigned field here would narrow to whichever
+        // decorative marble happens to sit at the host-assigned index
+        // instead of the joiner's real one, and then the old `= 0`
+        // afterward would clobber the correct value `apply_welcome` just
+        // set -- together, exactly the "ghost marble, camera on the wrong
+        // marble" bug this fixes.
+        const JOINERS_OWN_PRE_JOIN_MARBLE_INDEX: PlayerIndex = 0;
         if mp.sim.num_players() > 1 {
-            mp.sim = mp.sim.narrow_to(marble_state.local_player_index);
-            marble_state.local_player_index = 0;
+            mp.sim = mp.sim.narrow_to(JOINERS_OWN_PRE_JOIN_MARBLE_INDEX);
         }
         mp.joined = true;
     }
@@ -545,6 +640,36 @@ mod resync_payload_tests {
         assert_eq!(mp.sim.current_tick(), 3);
         assert_eq!(mp.sim.marbles()[0].pos, new_marbles[0].pos);
         assert_eq!(mp.sim.marbles()[1].pos, new_marbles[1].pos);
+    }
+
+    /// "Ghost marble" regression test: the first-join narrow-down step must
+    /// narrow to the joiner's own compile-time-known pre-join marble
+    /// (always local index 0, `render::setup`'s doc) and must NOT touch
+    /// `marble_state.local_player_index` -- which, by the time this runs,
+    /// `apply_welcome` has already correctly set to the host-assigned
+    /// multiplayer slot (simulated directly here, without a live
+    /// `apply_welcome` call, since this test is scoped to
+    /// `apply_resync_payload`'s own behavior). Pre-fix, this block reused
+    /// `marble_state.local_player_index` for both `narrow_to`'s argument
+    /// (narrowing to whichever decorative marble sat at the host-assigned
+    /// index instead of the joiner's real one) and then reset it to `0`
+    /// unconditionally afterward, clobbering the correct value -- from then
+    /// on the joiner's camera and its own WASD input both followed the
+    /// host's marble (shared index 0) instead of its own.
+    #[test]
+    fn apply_resync_payload_narrows_to_the_joiners_own_marble_without_clobbering_local_player_index() {
+        let (mut mp, mut marble_state) = minimal_session_with_players(2);
+        mp.joined = false;
+        marble_state.local_player_index = 1;
+        mp.transport.as_mut().unwrap().test_inject_resync_payload(7, vec![Marble::spawn(Vec3::new(50.0, 0.0, 0.0), 0.3)]);
+
+        apply_resync_payload(&mut mp, &mut marble_state);
+
+        assert_eq!(
+            marble_state.local_player_index, 1,
+            "apply_resync_payload must not clobber the index apply_welcome already assigned"
+        );
+        assert_eq!(mp.sim.num_players(), 1, "narrowing must collapse the pre-join decorative marble(s) away");
     }
 }
 
@@ -918,16 +1043,12 @@ fn marble_physics_tick_impl(
     // owned `Scene` rather than taking one as a parameter (`RollbackSim`'s
     // own doc) -- this system never calls `apply_animations` itself.
     if let Err(e) = mp.sim.receive_inputs(&arrivals, &marble_state.cfg, kill_y, &starts) {
-        // Network conditions outran the rewind window. Milestone 2's
-        // minimum bar (per the plan) is "don't crash or corrupt the
-        // simulation" -- log and keep going with whatever state the
-        // sim already has, rather than panicking. A real fix needs a
-        // full state resync from the peer, out of scope here.
         warn!(
             "multiplayer: rollback window exceeded (tick {}, oldest available {}) -- \
-             possible desync until the next full resync",
+             requesting a full resync",
             e.requested_tick, e.oldest_available
         );
+        request_resync_on_window_exceeded(mp, net.role);
     }
     mp.sim.advance(&marble_state.cfg, kill_y, &starts);
     marble_state.marbles = mp.sim.marbles().to_vec();
