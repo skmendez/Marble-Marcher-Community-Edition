@@ -39,9 +39,9 @@ use net::{
 use perfprobe::{perfprobe_tick, spawn_perfprobe_overlay, update_perfprobe_overlay_text, PerfProbeState};
 use physics_sys::{marble_physics_tick, PendingSceneSync};
 use render::{
-    apply_pending_scene_sync, finalize_marble_cubemap, resize_fine_render_target, setup,
-    sync_fine_render_target_and_present, sync_quad_scale, update_frame_data, FineMarcherMaterial,
-    PresentMaterial,
+    apply_pending_scene_sync, finalize_marble_cubemap, oscillate_fine_resolution_tier,
+    resize_fine_render_target, setup, sync_fine_render_target_and_present, sync_quad_scale,
+    update_frame_data, FineMarcherMaterial, PresentMaterial,
 };
 use shadow_pass::{resize_shadow_render_target, setup_shadow_pipeline, sync_shadow_quad_scale, ShadowMarcherMaterial};
 use touch::{touch_camera_input, TouchDebugInfo};
@@ -167,35 +167,57 @@ fn main() {
         .add_systems(
             Update,
             (
-                apply_pending_scene_sync,
-                resize_fine_render_target,
-                resize_coarse_render_target,
-                resize_shadow_render_target,
-                sync_fine_render_target_and_present,
-                sync_quad_scale,
-                sync_coarse_quad_scale,
-                sync_shadow_quad_scale,
-                orbit_camera_input,
-                touch_camera_input,
-                finalize_marble_cubemap,
-                // Must run before the three `update_*_material` systems below:
-                // a probe window transition's camera-active/step-override
-                // changes need to apply on the same frame they happen, not one
-                // frame late (see `perfprobe::perfprobe_tick`'s doc).
-                perfprobe_tick,
-                // Writes all three passes' uniforms + the marble list into
-                // `MarcherFrameData` (render.rs) -- replaced the three
-                // per-pass `update_material`/`update_coarse_material`/
-                // `update_shadow_material` systems when per-frame data moved
-                // to persistent GPU buffers (gpu.rs).
-                update_frame_data,
-                update_perfprobe_overlay_text,
-                draw_thrust_debug.run_if(|config: Res<Config>| config.debug_enabled),
-                poll_net_status,
-                update_copy_button_visibility,
-                handle_copy_button_click,
-                update_copy_feedback,
-                sync_net_ui_text,
+                // Split into two nested, individually-chained groups purely
+                // because Bevy's `.chain()`-tuple trait impl has a fixed max
+                // arity (20) and this list has since grown past it -- the
+                // outer tuple is `.chain()`d too, so full sequential
+                // ordering across both groups is preserved exactly as if
+                // this were still one flat chained tuple.
+                (
+                    apply_pending_scene_sync,
+                    resize_fine_render_target,
+                    resize_coarse_render_target,
+                    resize_shadow_render_target,
+                    // Debug-only (`?res_oscillate=1`) manual smoothness check
+                    // -- must run after `resize_fine_render_target` (so it
+                    // sees this frame's up-to-date `max_size` if a real
+                    // resize also just happened) and before
+                    // `sync_fine_render_target_and_present` (so its
+                    // `active_size` write applies on the same frame, not one
+                    // frame late).
+                    oscillate_fine_resolution_tier,
+                    sync_fine_render_target_and_present,
+                    sync_quad_scale,
+                    sync_coarse_quad_scale,
+                    sync_shadow_quad_scale,
+                    orbit_camera_input,
+                    touch_camera_input,
+                    finalize_marble_cubemap,
+                    // Must run before the three `update_*_material` systems
+                    // below: a probe window transition's camera-active/
+                    // step-override changes need to apply on the same frame
+                    // they happen, not one frame late (see
+                    // `perfprobe::perfprobe_tick`'s doc).
+                    perfprobe_tick,
+                )
+                    .chain(),
+                (
+                    // Writes all three passes' uniforms + the marble list
+                    // into `MarcherFrameData` (render.rs) -- replaced the
+                    // three per-pass `update_material`/
+                    // `update_coarse_material`/`update_shadow_material`
+                    // systems when per-frame data moved to persistent GPU
+                    // buffers (gpu.rs).
+                    update_frame_data,
+                    update_perfprobe_overlay_text,
+                    draw_thrust_debug.run_if(|config: Res<Config>| config.debug_enabled),
+                    poll_net_status,
+                    update_copy_button_visibility,
+                    handle_copy_button_click,
+                    update_copy_feedback,
+                    sync_net_ui_text,
+                )
+                    .chain(),
             )
                 .chain(),
         )

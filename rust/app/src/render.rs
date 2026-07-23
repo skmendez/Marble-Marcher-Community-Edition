@@ -702,6 +702,59 @@ pub fn resize_fine_render_target(
     render_target.active_size = native_size;
 }
 
+/// Full down-and-up period for `oscillate_fine_resolution_tier`'s sweep.
+const RES_OSCILLATE_PERIOD_SECS: f32 = 6.0;
+
+/// The tier fraction (of `FineRenderTarget::max_size`) `oscillate_fine_
+/// resolution_tier` never goes below -- 1/10th linear, i.e. 100x fewer
+/// pixels than full resolution, per this tool's own purpose (a smoothness
+/// check deliberately more extreme than any real tier the eventual
+/// hysteresis-based tier-switching logic would ever pick, so a human
+/// watching it can clearly see whether the transition itself is smooth
+/// across the widest range this architecture supports, not just confirm
+/// a realistic in-range change looks fine).
+const RES_OSCILLATE_MIN_FRACTION: f32 = 0.1;
+
+/// `Update` system, gated on `?res_oscillate=1`/`MM_RES_OSCILLATE=1`: a
+/// manual, always-visible smoothness check for the adaptive-resolution
+/// plumbing (`FineRenderTarget`'s doc) -- continuously sweeps
+/// `active_size` between `max_size` (full resolution) and 1/10th of it in
+/// each dimension (100x fewer total pixels) and back, via a plain
+/// triangle wave over wall-clock time (`Time`, not the deterministic
+/// simulation tick -- this is a debug-only visual tool with no physics/
+/// rollback involvement, matching `perfprobe.rs`'s own wall-clock-based
+/// timing for the same reason). Writes only through `FineRenderTarget`'s
+/// `active_size` field, same as the (not-yet-built) real tier-switching
+/// logic will -- `sync_fine_render_target_and_present` reacts atomically
+/// either way, so this exercises the exact same downstream path a real
+/// resolution change will use, not a separate toy code path.
+pub fn oscillate_fine_resolution_tier(
+    config: Res<crate::config::Config>,
+    time: Res<Time>,
+    mut render_target: ResMut<FineRenderTarget>,
+) {
+    if !config.res_oscillate_enabled {
+        return;
+    }
+    let phase = (time.elapsed_secs() % RES_OSCILLATE_PERIOD_SECS) / RES_OSCILLATE_PERIOD_SECS;
+    // Triangle wave: 0..0.5 sweeps down (1.0 -> MIN), 0.5..1.0 sweeps back up.
+    let down = phase < 0.5;
+    let leg_phase = if down { phase * 2.0 } else { (phase - 0.5) * 2.0 };
+    let span = 1.0 - RES_OSCILLATE_MIN_FRACTION;
+    let fraction = if down {
+        1.0 - leg_phase * span
+    } else {
+        RES_OSCILLATE_MIN_FRACTION + leg_phase * span
+    };
+    let target = UVec2::new(
+        ((render_target.max_size.x as f32 * fraction).round() as u32).max(1),
+        ((render_target.max_size.y as f32 * fraction).round() as u32).max(1),
+    );
+    if render_target.active_size != target {
+        render_target.active_size = target;
+    }
+}
+
 /// A minimal (1x1 per face) placeholder cube texture, already correctly
 /// `Cube`-dimensioned -- used as `marble_texture`'s initial value in `setup`
 /// while the real `marble_cubemap.png` is still loading. `Handle::default()`

@@ -45,6 +45,12 @@ pub struct Config {
     /// diagnostic toggle, not a recommendation to ship uncapped rendering
     /// (`main.rs`'s `present_mode` doc).
     pub vsync_off: bool,
+    /// `?res_oscillate=1`/`MM_RES_OSCILLATE=1` continuously sweeps the fine
+    /// pass's resolution tier between full size and 1/10th (100x fewer
+    /// pixels) and back -- a manual, always-visible smoothness check for
+    /// the adaptive-resolution plumbing (`render::oscillate_fine_resolution_tier`'s
+    /// doc), independent of and not gated on `debug_enabled`. Default off.
+    pub res_oscillate_enabled: bool,
 }
 
 impl Config {
@@ -59,6 +65,8 @@ impl Config {
             ),
             debug_enabled: query_value("debug", "MM_DEBUG").as_deref() == Some("1"),
             vsync_off: query_value("vsync", "MM_VSYNC").as_deref() == Some("off"),
+            res_oscillate_enabled: query_value("res_oscillate", "MM_RES_OSCILLATE").as_deref()
+                == Some("1"),
         }
     }
 }
@@ -80,6 +88,7 @@ mod tests {
         assert!(!matches!(value, Some("1") | Some("true"))); // perfprobe
         assert!(value != Some("1")); // debug
         assert!(value != Some("off")); // vsync
+        assert!(value != Some("1")); // res_oscillate
     }
 
     #[test]
