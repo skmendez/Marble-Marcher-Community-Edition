@@ -259,7 +259,7 @@ mod scene_uniforms_impl {
         /// rgb.
         pub bg_col: Vec4,
         /// x aspect (w/h), y time seconds, z *this pass's own* render target
-        /// height in physical pixels (drives the marcher's distance-scaled
+        /// height in pixels (drives the marcher's distance-scaled
         /// hit threshold -- see `codegen.rs`'s `MARCH_CORE`; deliberately
         /// read from a uniform each frame rather than a shader constant so
         /// adaptive-render-resolution doesn't need this touched -- and
@@ -494,7 +494,8 @@ pub struct FineRenderTarget {
     /// resized except on a genuine window-size change.
     pub image: Handle<Image>,
     /// The backing texture's own fixed pixel size (the window's native
-    /// physical size) -- NOT the currently-active tier.
+    /// *logical* size, deliberately not physical -- `setup`'s doc on why)
+    /// -- NOT the currently-active tier.
     pub max_size: UVec2,
     /// The currently-active tier's pixel size -- what `Camera.viewport`
     /// restricts rendering to, what `MarcherQuad`'s `Transform.scale`
@@ -661,9 +662,11 @@ pub fn sync_fine_render_target_and_present(
 }
 
 /// `Update` system: keeps [`FineRenderTarget`]'s backing texture sized to
-/// the window's current native physical size -- only touches the GPU
-/// resource (a new `Image`) when that size actually changed (a real
-/// window resize), mirroring `mrrm.rs`'s `resize_coarse_render_target`
+/// the window's current native *logical* size (`setup`'s doc on why
+/// logical, not physical) -- only touches the GPU resource (a new `Image`)
+/// when that size actually changed (a real window resize, or a
+/// devicePixelRatio change on wasm, e.g. dragging the window to a
+/// different-DPR display), mirroring `mrrm.rs`'s `resize_coarse_render_target`
 /// exactly, including the "build a new `Image` and redirect handles
 /// rather than resize in place" freeze-avoidance (that function's doc).
 /// Stage 1: `active_size` tracks `max_size` 1:1 here too (tier pinned at
@@ -680,7 +683,8 @@ pub fn resize_fine_render_target(
     let Ok(window) = windows.single() else {
         return;
     };
-    let native_size = UVec2::new(window.physical_width().max(1), window.physical_height().max(1));
+    let native_size =
+        UVec2::new(window.width().round().max(1.0) as u32, window.height().round().max(1.0) as u32);
     if native_size == render_target.max_size {
         return;
     }
@@ -1181,9 +1185,18 @@ pub fn setup(
     // (`FineRenderTarget`'s doc). A previous, since-fully-reverted
     // attempt at this rendered straight to the window with no offscreen
     // indirection at all; this replaces that.
+    //
+    // Logical, not physical, pixels: on a scaled-HiDPI display (e.g. a
+    // native 4K panel set to "look like" 2560x1440, `devicePixelRatio:
+    // 1.5`), physical pixels are `dpr^2` more ray-marched samples than the
+    // display can actually distinguish once the compositor scales this
+    // pass's output back down to fit the window -- real GPU cost for a
+    // per-pixel-expensive shader, no perceptible benefit. A DPR=1 display
+    // (the common case, and this dev environment's) has logical ==
+    // physical, so this is a no-op there.
     let native_size = windows
         .single()
-        .map(|w| UVec2::new(w.physical_width().max(1), w.physical_height().max(1)))
+        .map(|w| UVec2::new(w.width().round().max(1.0) as u32, w.height().round().max(1.0) as u32))
         .unwrap_or(UVec2::new(1280, 720));
     let fine_image_handle = images.add(make_fine_render_target_image(native_size));
 

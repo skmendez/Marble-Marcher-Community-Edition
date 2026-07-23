@@ -71,7 +71,7 @@ const SHADOW_SCALE_DIVISOR: u32 = 2;
 // `?shadowlod=0` vs `=1` screenshot comparison at a fixed camera state
 // only ever differs in this one value.
 
-/// Rounds the window's current physical pixel size down by
+/// Rounds the window's current logical pixel size down by
 /// `SHADOW_SCALE_DIVISOR` in each dimension, flooring at 1px -- pure and
 /// unit-tested, mirrors `mrrm::coarse_target_size`.
 pub fn shadow_target_size(window_size: UVec2) -> UVec2 {
@@ -237,9 +237,14 @@ pub fn setup_shadow_pipeline(
         Shader::from_wgsl(wgsl, "generated://marcher_shadow.wgsl"),
     );
 
+    // Logical, not physical, pixels -- matches `render::FineRenderTarget`'s/
+    // `mrrm::CoarseRenderTarget`'s basis (`render::setup`'s doc) so this
+    // pre-pass's resolution scales down together with the fine pass it
+    // feeds, rather than staying pinned to the (possibly `dpr^2` larger)
+    // physical pixel count on a scaled-HiDPI display.
     let native_size = windows
         .single()
-        .map(|w| UVec2::new(w.physical_width().max(1), w.physical_height().max(1)))
+        .map(|w| UVec2::new(w.width().round().max(1.0) as u32, w.height().round().max(1.0) as u32))
         .unwrap_or(UVec2::new(1280, 720));
     let size = shadow_target_size(native_size);
     let image_handle = images.add(make_shadow_render_target_image(size));
@@ -284,7 +289,8 @@ pub fn setup_shadow_pipeline(
 }
 
 /// `Update` system: keeps the shadow render target sized at
-/// `shadow_target_size` of the window's current physical size, and keeps
+/// `shadow_target_size` of the window's current *logical* size
+/// (`setup_shadow_pipeline`'s doc on why logical, not physical), and keeps
 /// its material's `coarse` binding pointed at MRRM's coarse render target
 /// (which itself gets rebuilt as a new `Image` on resize, `mrrm.rs`) --
 /// only touches GPU resources when something actually changed. Builds a
@@ -306,7 +312,8 @@ pub fn resize_shadow_render_target(
     let Ok(window) = windows.single() else {
         return;
     };
-    let native_size = UVec2::new(window.physical_width().max(1), window.physical_height().max(1));
+    let native_size =
+        UVec2::new(window.width().round().max(1.0) as u32, window.height().round().max(1.0) as u32);
     let desired = shadow_target_size(native_size);
 
     // Keep the `coarse` binding current (MRRM's own render target is
