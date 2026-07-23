@@ -265,20 +265,23 @@ enum Combine {
 /// unbounded -- `marble_csg::Object::bounding_sphere` returned `None` -- or
 /// this uniform was never populated), which `ray_sphere_clip` (`MARCH_CORE`)
 /// treats as "don't clip, march the full range" rather than "everything
-/// misses".
+/// misses". `misc3.x` is the `?stepheat=1` ray-march step-count heatmap
+/// debug flag (fine pass only -- see `MARCHER`'s `fragment`; y/z/w unused,
+/// added as its own field rather than squeezed into `misc`/`misc2` since
+/// both of those are already fully occupied).
 ///
 /// The single authoritative field list for the GPU `SceneUniforms` ABI --
 /// every `vec4<f32>`, same order the Rust-side `render.rs::SceneUniforms`
 /// struct declares them in. This WGSL struct text below is *generated*
 /// from this list rather than hand-typed a second time; `render.rs` can't
 /// generate its own field declarations from this same list (no macro/derive
-/// wiring for that here, and it's not worth building one for a 10-field,
+/// wiring for that here, and it's not worth building one for an 11-field,
 /// rarely-changing struct), so it has its own `#[test]` that asserts its
 /// field order against this exact constant -- a mismatch is a loud test
 /// failure instead of a silent wrong-looking render.
-pub const SCENE_UNIFORMS_FIELD_NAMES: [&str; 10] = [
+pub const SCENE_UNIFORMS_FIELD_NAMES: [&str; 11] = [
     "cam_pos", "cam_right", "cam_up", "cam_forward", "sun", "sun_col", "bg_col", "misc", "misc2",
-    "bounding",
+    "bounding", "misc3",
 ];
 
 fn bindings() -> String {
@@ -923,6 +926,24 @@ fn tonemap(col: vec3<f32>) -> vec3<f32> {
     return pow(x, vec3<f32>(1.0 / 2.2));
 }
 
+// `?stepheat=1` debug view (`scene.misc3.x`): a 3-stop dark-blue -> yellow ->
+// red gradient over `iters / fine_max_steps`, the classic \"shader
+// complexity\"/overdraw heatmap convention -- perceptually ordered (cold to
+// hot), not a hue wheel, so there's no ambiguous wraparound at either end.
+// Returned directly, not run through `tonemap()`: this is an already-final
+// display color encoding a raw ratio, not a lit HDR surface value (same
+// reasoning as the outline color's doc, just above `apply_tint`'s callers).
+fn step_heat_color(frac: f32) -> vec3<f32> {
+    let f = clamp(frac, 0.0, 1.0);
+    let cold = vec3<f32>(0.0, 0.0, 0.35);
+    let mid = vec3<f32>(1.0, 0.9, 0.0);
+    let hot = vec3<f32>(1.0, 0.05, 0.0);
+    if (f < 0.5) {
+        return mix(cold, mid, f * 2.0);
+    }
+    return mix(mid, hot, (f - 0.5) * 2.0);
+}
+
 @fragment
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     let ndc = vec2<f32>(mesh.uv.x * 2.0 - 1.0, 1.0 - mesh.uv.y * 2.0);
@@ -1159,6 +1180,19 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     if (hit_frac) {
+        // `?stepheat=1`: full override, not a blend, matching how a
+        // shader-complexity/overdraw debug view conventionally works --
+        // reached only for an actual terrain march hit (the thing with real
+        // `iters` data), so marble/outline pixels above still render
+        // normally (they're closed-form sphere tests, not marched, so
+        // there's no step count to show for them) and the miss/sky case
+        // below gets its own distinct override rather than falling into
+        // this gradient at the \"0 steps\" end, which would be visually
+        // ambiguous with a genuinely cheap real hit.
+        if (scene.misc3.x > 0.5) {
+            let heat_frac = f32(iters) / f32(fine_max_steps);
+            return vec4<f32>(step_heat_color(heat_frac), 1.0);
+        }
         let p = ro + rd * t;
         let eps = 1e-4 * max(t, 0.05);
         let n = calc_normal(p, eps);
@@ -1223,6 +1257,14 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(tonemap(color), 1.0);
     }
 
+    // `?stepheat=1`: a ray that never hit anything gets a fixed, distinct
+    // black rather than the normal sky color -- the heat gradient's own
+    // \"cold\" end is a dark blue, close enough to a pale-sky-tinted black
+    // that leaving the real sky color in here would read ambiguously as
+    // \"very cheap hit\" instead of \"no hit at all\".
+    if (scene.misc3.x > 0.5) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
     return vec4<f32>(tonemap(sky(rd)), 1.0);
 }
 ";

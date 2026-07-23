@@ -292,6 +292,13 @@ mod scene_uniforms_impl {
         /// Same value on every pass's material (computed once from the
         /// scene tree at setup time, `SceneState::bounding_sphere`).
         pub bounding: Vec4,
+        /// x the `?stepheat=1` ray-march step-count heatmap debug flag
+        /// (fine pass's material only, same uniform-flag convention as
+        /// `misc.w`'s MRRM flag -- `config::Config::step_heat_enabled`, see
+        /// `codegen.rs`'s `MARCHER::fragment`); y/z/w unused. Its own field
+        /// rather than a `misc`/`misc2` lane since both of those are
+        /// already fully occupied.
+        pub misc3: Vec4,
     }
 
     impl Default for SceneUniforms {
@@ -309,6 +316,7 @@ mod scene_uniforms_impl {
                 // radius 0.0 -- "no bound" until `SceneState::bounding_sphere`
                 // is actually written in.
                 bounding: Vec4::ZERO,
+                misc3: Vec4::ZERO,
             }
         }
     }
@@ -325,9 +333,9 @@ mod scene_uniforms_abi_tests {
     // from, see that constant's doc). If either side adds, removes, or
     // reorders a field without updating the other, this fails loudly at
     // `cargo test` time instead of silently misrendering.
-    const RUST_FIELD_ORDER: [&str; 10] = [
+    const RUST_FIELD_ORDER: [&str; 11] = [
         "cam_pos", "cam_right", "cam_up", "cam_forward", "sun", "sun_col", "bg_col", "misc",
-        "misc2", "bounding",
+        "misc2", "bounding", "misc3",
     ];
 
     #[test]
@@ -1592,6 +1600,11 @@ fn update_frame_data_impl(
             perfprobe.fine_max_steps_override,
             marble_rotation,
         ),
+        // x: `?stepheat=1` ray-march step-count heatmap debug flag (fine
+        // pass's material only, `MARCHER::fragment`'s doc) -- coarse/shadow
+        // never read `misc3`, so `base`'s default `0.0` there is fine as
+        // leftover unread padding, same as every other fine-only field here.
+        misc3: Vec4::new(if config.step_heat_enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0),
         ..base
     };
 

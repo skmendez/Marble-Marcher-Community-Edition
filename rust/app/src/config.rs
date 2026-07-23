@@ -57,6 +57,13 @@ pub struct Config {
     /// no-op on hardware/browsers without `wgpu::Features::TIMESTAMP_QUERY`,
     /// see `gpu_profile.rs`'s module doc).
     pub gpu_profile_enabled: bool,
+    /// `?stepheat=1`/`MM_STEPHEAT=1` replaces the fine pass's normal shading
+    /// with a heatmap colored by each pixel's ray-march step count (dark
+    /// blue = few steps, red = near the step budget) -- default off, a
+    /// visualization debug tool for understanding where march cost actually
+    /// goes (e.g. whether MRRM's coarse warm-start has room to help a given
+    /// view), see `marble_csg::codegen`'s `MARCHER::fragment` doc.
+    pub step_heat_enabled: bool,
 }
 
 impl Config {
@@ -75,6 +82,7 @@ impl Config {
                 == Some("1"),
             gpu_profile_enabled: query_value("gpuprofile", "MM_GPUPROFILE").as_deref()
                 == Some("1"),
+            step_heat_enabled: query_value("stepheat", "MM_STEPHEAT").as_deref() == Some("1"),
         }
     }
 }
@@ -98,6 +106,7 @@ mod tests {
         assert!(value != Some("off")); // vsync
         assert!(value != Some("1")); // res_oscillate
         assert!(value != Some("1")); // gpuprofile
+        assert!(value != Some("1")); // stepheat
     }
 
     #[test]
