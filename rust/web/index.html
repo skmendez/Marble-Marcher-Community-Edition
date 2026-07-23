@@ -107,6 +107,12 @@
           parse: (v) => v === "1", // default off
           serialize: (v) => (v ? "1" : "0"),
         },
+        {
+          key: "gpuprofile",
+          type: "bool",
+          parse: (v) => v === "1", // default off
+          serialize: (v) => (v ? "1" : "0"),
+        },
       ];
 
       const state = {};
