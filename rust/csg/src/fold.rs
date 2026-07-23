@@ -359,6 +359,29 @@ impl Fold {
         }
     }
 
+    /// Whether every parameter handle in this fold (recursively, for
+    /// `Series`/`Repeat`) is valid for a `Params` table with `slot_count`
+    /// slots -- see `Object::handles_valid_for`'s doc for why this check
+    /// exists at all.
+    pub(crate) fn handles_valid_for(&self, slot_count: usize) -> bool {
+        match self {
+            Fold::Abs | Fold::Menger => true,
+            Fold::Rotate { mat, .. } => mat.handle_valid_for(slot_count),
+            Fold::ScaleTranslate { scale, shift } => {
+                scale.handle_valid_for(slot_count) && shift.handle_valid_for(slot_count)
+            }
+            Fold::Plane { normal, offset } => {
+                normal.handle_valid_for(slot_count) && offset.handle_valid_for(slot_count)
+            }
+            Fold::Modulo { modulus, .. } => modulus.handle_valid_for(slot_count),
+            Fold::Series(folds) => folds.iter().all(|f| f.handles_valid_for(slot_count)),
+            Fold::Repeat { count, inner } => {
+                count.handle_valid_for(slot_count) && inner.handles_valid_for(slot_count)
+            }
+            Fold::OrbitInit(v) | Fold::OrbitMax(v) => v.handle_valid_for(slot_count),
+        }
+    }
+
     /// Inverse of [`Self::encode`] — see [`crate::expr::Expr::decode_at`]
     /// for the recursion shape this mirrors (`None` on any malformed/
     /// truncated input, `pos` is where the caller should resume reading).
@@ -391,6 +414,16 @@ impl Fold {
             6 => {
                 let count = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
                 let mut pos = pos + 4;
+                // Reject before allocating: the smallest possible encoded
+                // `Fold` (`Abs`/`Menger`) is a single tag byte, so `count`
+                // can never legitimately exceed the bytes actually left --
+                // without this bound, a corrupted `count` near `u32::MAX`
+                // would immediately attempt a multi-GB `Vec::with_capacity`
+                // (an allocation failure aborts the process, worse than a
+                // parse error) even against a tiny buffer.
+                if count > bytes.len().saturating_sub(pos) {
+                    return None;
+                }
                 let mut folds = Vec::with_capacity(count);
                 for _ in 0..count {
                     let (f, next) = Fold::decode_at(bytes, pos)?;
@@ -632,5 +665,20 @@ mod tests {
         repeat.unfold(&mut hist, &mut n, &params);
         assert!(hist.is_empty());
         assert!(n.is_finite());
+    }
+
+    /// Fix 6 regression test: a `Fold::Series` `count` field claiming far
+    /// more nested folds than the buffer could possibly hold (the smallest
+    /// possible encoded `Fold` is one tag byte, `Abs`/`Menger`) must be
+    /// rejected before ever attempting `Vec::with_capacity(count)`.
+    #[test]
+    fn decode_at_rejects_a_series_count_that_exceeds_the_buffer() {
+        let mut bytes = vec![6u8]; // Fold::Series's tag
+        bytes.extend_from_slice(&1_000_000u32.to_le_bytes()); // count -- no fold data follows
+        assert!(Fold::decode_at(&bytes, 0).is_none());
+
+        let mut overflow_bytes = vec![6u8];
+        overflow_bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Fold::decode_at(&overflow_bytes, 0).is_none());
     }
 }

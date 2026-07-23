@@ -43,11 +43,35 @@ impl Scene {
     /// Inverse of [`Self::encode`]/[`Self::to_bytes`] — `None` on any
     /// malformed/truncated input, or leftover bytes after a complete
     /// decode (same reasoning as [`Expr::from_bytes`]).
+    ///
+    /// Also validates, after all three pieces decode individually, that
+    /// every parameter handle referenced anywhere in `object` or
+    /// `animations` is actually in range for `params`'s slot count
+    /// (`Object::handles_valid_for`'s doc): each piece is self-delimiting
+    /// on its own, but nothing about a successful decode guarantees they're
+    /// *mutually* consistent — a corrupted-but-still-parseable buffer could
+    /// produce a tree whose handles point past the decoded `Params`, which
+    /// panics the instant anything evaluates it (the very next line after
+    /// this call in most callers, e.g. `pack_bounding_sphere`). Rejecting
+    /// here, at the one point both pieces are first known together, is
+    /// simpler and more robust than re-validating at every later call site
+    /// that touches the tree.
     pub fn from_bytes(bytes: &[u8]) -> Option<Scene> {
         let (object, pos) = Object::decode_at(bytes, 0)?;
         let (params, pos) = Params::decode_at(bytes, pos)?;
         let count = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
         let mut pos = pos + 4;
+        // Reject before allocating: each animation entry is at least 3
+        // bytes on the wire (a 2-byte `ScalarParam` handle + `Expr`'s own
+        // smallest possible encoding, a single `Tick` tag byte), so a
+        // `count` that can't fit that many times over in what's left of
+        // `bytes` is definitely malformed -- without this, a corrupted
+        // `count` near `u32::MAX` would attempt a multi-GB
+        // `Vec::with_capacity` (an allocation failure aborts the process,
+        // worse than any parse error) even against a tiny buffer.
+        if count > bytes.len().saturating_sub(pos) / 3 {
+            return None;
+        }
         let mut animations = Vec::with_capacity(count);
         for _ in 0..count {
             let (handle, next) = ScalarParam::decode_at(bytes, pos)?;
@@ -55,11 +79,17 @@ impl Scene {
             animations.push((handle, expr));
             pos = next;
         }
-        if pos == bytes.len() {
-            Some(Scene { object, params, animations })
-        } else {
-            None
+        if pos != bytes.len() {
+            return None;
         }
+        let slot_count = params.slots().len();
+        if !object.handles_valid_for(slot_count) {
+            return None;
+        }
+        if animations.iter().any(|(handle, _)| handle.index() >= slot_count) {
+            return None;
+        }
+        Some(Scene { object, params, animations })
     }
 }
 
@@ -223,5 +253,69 @@ mod tests {
         let mut extra = bytes.clone();
         extra.push(0);
         assert!(Scene::from_bytes(&extra).is_none(), "leftover trailing byte");
+    }
+
+    /// Fix 5 regression test: a `Scene` whose `Object` tree references a
+    /// param handle past its own `Params`'s slot count must be rejected,
+    /// not accepted and left to panic the moment anything evaluates the
+    /// tree (`Params::scalar`'s unguarded `self.slots[h.index()]`). Each
+    /// piece here still decodes fine on its own -- the whole point of this
+    /// check is that individually-valid decodes can still be mutually
+    /// inconsistent.
+    #[test]
+    fn from_bytes_rejects_an_object_handle_out_of_range_for_its_own_params() {
+        let params = Params::new(); // zero slots -- any handle at all is out of range
+        let object = Object::Sphere { radius: ScalarValue::Param(ScalarParam(0)) };
+        let scene = Scene { object, params, animations: Vec::new() };
+        let bytes = scene.to_bytes();
+        assert!(Scene::from_bytes(&bytes).is_none());
+    }
+
+    /// Fix 5 regression test: same property as above, but for a handle in
+    /// the animation table instead of the `Object` tree.
+    #[test]
+    fn from_bytes_rejects_an_animation_handle_out_of_range_for_its_own_params() {
+        let params = Params::new(); // zero slots
+        let object = Object::Sphere { radius: ScalarValue::Const(1.0) };
+        let scene = Scene { object, params, animations: vec![(ScalarParam(0), crate::expr::Expr::Tick)] };
+        let bytes = scene.to_bytes();
+        assert!(Scene::from_bytes(&bytes).is_none());
+    }
+
+    /// Sanity check alongside the two regression tests above: a scene whose
+    /// handles are genuinely all in range (the ordinary case, allocated via
+    /// `Params::alloc_scalar` rather than hand-built out of range) must
+    /// still decode successfully -- fix 5's new validation must not reject
+    /// legitimate scenes.
+    #[test]
+    fn from_bytes_accepts_a_scene_whose_handles_are_all_in_range() {
+        let mut params = Params::new();
+        let h = params.alloc_scalar(2.0);
+        let object = Object::Sphere { radius: ScalarValue::Param(h) };
+        let scene = Scene { object, params, animations: vec![(h, crate::expr::Expr::Const(1.0))] };
+        let bytes = scene.to_bytes();
+        assert!(Scene::from_bytes(&bytes).is_some());
+    }
+
+    /// Fix 6 regression test: an animation-table `count` field claiming far
+    /// more entries than the buffer could possibly hold (each entry is at
+    /// least 3 bytes: a 2-byte handle + `Expr`'s smallest encoding, a
+    /// single `Tick` tag byte) must be rejected before ever attempting
+    /// `Vec::with_capacity(count)`.
+    #[test]
+    fn from_bytes_rejects_an_animation_count_that_exceeds_the_buffer() {
+        let object = Object::Sphere { radius: ScalarValue::Const(1.0) };
+        let params = Params::new();
+        let mut bytes = Vec::new();
+        object.encode(&mut bytes);
+        params.encode(&mut bytes);
+        bytes.extend_from_slice(&1_000_000u32.to_le_bytes()); // count -- no animation data follows
+        assert!(Scene::from_bytes(&bytes).is_none());
+
+        let mut overflow_bytes = Vec::new();
+        object.encode(&mut overflow_bytes);
+        params.encode(&mut overflow_bytes);
+        overflow_bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Scene::from_bytes(&overflow_bytes).is_none());
     }
 }

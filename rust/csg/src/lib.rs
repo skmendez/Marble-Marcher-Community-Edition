@@ -94,6 +94,16 @@ pub struct Mat2Param(u16);
 pub struct IntParam(u16);
 
 impl ScalarParam {
+    /// This handle's raw slot index -- `pub(crate)` so `scene_sync.rs`'s
+    /// post-decode validation (a decoded `Object`/`Fold` tree's handles
+    /// must all be in range for the decoded `Params` table, `Scene::
+    /// from_bytes`'s doc) can check it against a `Params`'s slot count
+    /// without reaching into this otherwise-opaque handle's private field
+    /// directly.
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+
     fn encode(self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.0.to_le_bytes());
     }
@@ -105,6 +115,10 @@ impl ScalarParam {
 }
 
 impl Vec3Param {
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+
     fn encode(self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.0.to_le_bytes());
     }
@@ -116,6 +130,10 @@ impl Vec3Param {
 }
 
 impl Mat2Param {
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+
     fn encode(self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.0.to_le_bytes());
     }
@@ -127,6 +145,10 @@ impl Mat2Param {
 }
 
 impl IntParam {
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+
     fn encode(self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.0.to_le_bytes());
     }
@@ -227,6 +249,15 @@ impl Params {
         let mut pos = pos;
         let count = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
         pos += 4;
+        // Reject before ever allocating: each slot is a fixed 16 bytes on
+        // the wire, so a `count` that can't possibly fit in what's left of
+        // `bytes` is definitely malformed. Without this, a corrupted
+        // `count` near `u32::MAX` would immediately attempt a multi-GB
+        // `Vec::with_capacity` -- an allocation failure aborts the process
+        // outright (not a catchable `panic`), worse than any parse error.
+        if count > bytes.len().saturating_sub(pos) / 16 {
+            return None;
+        }
         let mut slots = Vec::with_capacity(count);
         for _ in 0..count {
             let end = pos + 16;
@@ -264,6 +295,16 @@ impl ScalarValue {
         match self {
             ScalarValue::Const(v) => *v,
             ScalarValue::Param(h) => params.scalar(*h),
+        }
+    }
+
+    /// Whether this value's handle (if it has one) is in range for a
+    /// `Params` table with `slot_count` slots -- `Const` is always valid,
+    /// it references nothing. See `Object::handles_valid_for`'s doc.
+    pub(crate) fn handle_valid_for(&self, slot_count: usize) -> bool {
+        match self {
+            ScalarValue::Const(_) => true,
+            ScalarValue::Param(h) => h.index() < slot_count,
         }
     }
 
@@ -314,6 +355,13 @@ impl Vec3Value {
         match self {
             Vec3Value::Const(v) => *v,
             Vec3Value::Param(h) => params.vec3(*h),
+        }
+    }
+
+    pub(crate) fn handle_valid_for(&self, slot_count: usize) -> bool {
+        match self {
+            Vec3Value::Const(_) => true,
+            Vec3Value::Param(h) => h.index() < slot_count,
         }
     }
 
@@ -372,6 +420,13 @@ impl Mat2Value {
         match self {
             Mat2Value::Const(m) => *m,
             Mat2Value::Param(h) => params.mat2(*h),
+        }
+    }
+
+    pub(crate) fn handle_valid_for(&self, slot_count: usize) -> bool {
+        match self {
+            Mat2Value::Const(_) => true,
+            Mat2Value::Param(h) => h.index() < slot_count,
         }
     }
 
@@ -439,6 +494,13 @@ impl IntValue {
         }
     }
 
+    pub(crate) fn handle_valid_for(&self, slot_count: usize) -> bool {
+        match self {
+            IntValue::Const(_) => true,
+            IntValue::Param(h) => h.index() < slot_count,
+        }
+    }
+
     pub fn wgsl(&self) -> String {
         match self {
             IntValue::Const(v) => format!("{v}"),
@@ -500,5 +562,24 @@ mod tests {
         let _a = p.alloc_scalar(1.0);
         let b = p.alloc_vec3(Vec3::ONE);
         assert_eq!(Vec3Value::Param(b).wgsl(), "params[1].xyz");
+    }
+
+    /// Fix 6 regression test: a `Params::decode_at` `count` field that
+    /// claims far more slots than the buffer could possibly hold (each
+    /// slot is a fixed 16 bytes) must be rejected before ever attempting
+    /// `Vec::with_capacity(count)` -- a corrupted `count` near `u32::MAX`
+    /// would otherwise request a multi-GB allocation, which aborts the
+    /// process on failure rather than returning a catchable error.
+    #[test]
+    fn decode_at_rejects_a_slot_count_that_exceeds_the_buffer() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_000_000u32.to_le_bytes()); // count -- no slot data follows
+        assert!(Params::decode_at(&bytes, 0).is_none());
+
+        // Also confirm a `count` near `u32::MAX` (which would overflow a
+        // naive `count * 16` on a 32-bit target) is rejected the same way.
+        let mut overflow_bytes = Vec::new();
+        overflow_bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Params::decode_at(&overflow_bytes, 0).is_none());
     }
 }

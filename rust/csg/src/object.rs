@@ -25,6 +25,31 @@ pub enum Object {
 }
 
 impl Object {
+    /// Whether every parameter handle referenced anywhere in this tree
+    /// (recursively, including any nested `Fold`) is a valid index into a
+    /// `Params` table with `slot_count` slots. A decoded `Scene` (`scene_
+    /// sync.rs`) is three independently-decoded pieces -- an `Object` tree,
+    /// a `Params` table, and an animation list -- each self-delimiting on
+    /// its own but never cross-checked against each other; a corrupted-but-
+    /// still-parseable buffer could produce a tree whose handles point past
+    /// the decoded `Params`'s actual slot count, which panics the moment
+    /// anything evaluates it (`Params::scalar`/`vec3`/`mat2`/`int`'s
+    /// unguarded `self.slots[h.index()]`). `Scene::from_bytes` calls this
+    /// (and the equivalent check on the animation table) before ever
+    /// accepting a decoded scene.
+    pub(crate) fn handles_valid_for(&self, slot_count: usize) -> bool {
+        match self {
+            Object::Sphere { radius } => radius.handle_valid_for(slot_count),
+            Object::Cuboid { half_extent } => half_extent.handle_valid_for(slot_count),
+            Object::Fractal { fold, base } => {
+                fold.handles_valid_for(slot_count) && base.handles_valid_for(slot_count)
+            }
+            Object::Union(left, right) | Object::Intersect(left, right) | Object::Difference(left, right) => {
+                left.handles_valid_for(slot_count) && right.handles_valid_for(slot_count)
+            }
+        }
+    }
+
     /// Distance estimate at `p` (xyz position, `w` = accumulated scale
     /// divisor; callers pass `p.w = 1.0`). Allocation-free.
     pub fn de(&self, p: Vec4, params: &Params) -> f32 {
