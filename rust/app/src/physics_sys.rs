@@ -430,6 +430,29 @@ fn apply_resync_payload(mp: &mut MultiplayerSession, marble_state: &mut MarbleSt
         // actually used as a kill-plane respawn reference.
         marble_state.start_positions.push(Vec3::ZERO);
     }
+    // The growth loop above only ever grows *towards* `marbles.len()` --
+    // a payload with *fewer* marbles than this session already has skips
+    // it entirely and would otherwise reach `hard_reset_to` with mismatched
+    // lengths, hitting its internal `assert_eq!` (an internal invariant
+    // that assert is meant to enforce on its caller, not something it
+    // should have to re-validate itself -- `hard_reset_to`'s own doc).
+    // Reject rather than ever calling it with bad data: a host is never
+    // expected to legitimately shrink a session's player count mid-resync
+    // (players are only ever added, never removed, `net.rs`'s stable-
+    // index-order guarantee), so a short payload here means something's
+    // gone wrong on the wire (or, on this directly peer-drivable P2P
+    // channel, a malformed/adversarial message) rather than a real
+    // resync this side should ever adopt.
+    if mp.sim.num_players() != marbles.len() {
+        warn!(
+            "multiplayer: rejecting resync payload at tick {tick} -- host sent {} marbles but this \
+             session has {} after growth (a resync should never arrive short)",
+            marbles.len(),
+            mp.sim.num_players()
+        );
+        mp.resync_pending = false;
+        return;
+    }
     if mp.sim.num_players() > players_before_growth {
         // A scene is in flight for this exact resync -- defer the
         // tick/marble jump until `render::apply_pending_scene_sync` can
@@ -454,6 +477,77 @@ fn apply_resync_payload(mp: &mut MultiplayerSession, marble_state: &mut MarbleSt
     marble_state.marbles = mp.sim.marbles().to_vec();
 }
 
+#[cfg(test)]
+mod resync_payload_tests {
+    use super::*;
+    use marble_csg::scenes::demo_scene;
+    use marble_csg::Params;
+
+    /// A minimal, valid `MultiplayerSession` + `MarbleState` with exactly
+    /// `n` players, already `joined` and holding a live (but never actually
+    /// connected -- `js_bridge` is a no-op stub natively) `WebRtcTransport`,
+    /// so [`apply_resync_payload`] can be called directly against it.
+    fn minimal_session_with_players(n: usize) -> (MultiplayerSession, MarbleState) {
+        let mut params = Params::new();
+        let (object, _handles) = demo_scene(&mut params);
+        let scene = marble_csg::Scene { object, params, animations: vec![] };
+        let rad = 0.3;
+        let marbles: Vec<Marble> = (0..n).map(|i| Marble::spawn(Vec3::new(i as f32, 0.0, 0.0), rad)).collect();
+        let mut mp = MultiplayerSession::new_solo(scene, marbles.clone());
+        mp.joined = true;
+        mp.transport = Some(WebRtcTransport::new(Role::Joiner));
+        let marble_state = MarbleState {
+            marbles: marbles.clone(),
+            cfg: PhysicsConfig::default(),
+            start_positions: marbles.iter().map(|m| m.pos).collect(),
+            kill_y: -1e6,
+            local_player_index: 0,
+        };
+        (mp, marble_state)
+    }
+
+    /// Fix 4 regression test: a `ResyncPayload` with *fewer* marbles than
+    /// the session already has must be rejected rather than passed to
+    /// `RollbackSim::hard_reset_to`, whose internal `assert_eq!` on marble
+    /// count would otherwise panic. Pre-fix, the growth loop in
+    /// `apply_resync_payload` only ever grows *towards* the incoming
+    /// count, so a short payload skipped it entirely and reached
+    /// `hard_reset_to` directly with mismatched lengths.
+    #[test]
+    fn apply_resync_payload_rejects_a_payload_with_fewer_marbles_than_current() {
+        let (mut mp, mut marble_state) = minimal_session_with_players(2);
+        let tick_before = mp.sim.current_tick();
+        mp.transport.as_mut().unwrap().test_inject_resync_payload(5, vec![Marble::spawn(Vec3::ZERO, 0.3)]);
+
+        apply_resync_payload(&mut mp, &mut marble_state);
+
+        assert_eq!(mp.sim.num_players(), 2, "a short resync payload must not shrink the session's player count");
+        assert_eq!(mp.sim.current_tick(), tick_before, "a rejected resync payload must not move the tick forward");
+        assert!(
+            !mp.resync_pending,
+            "rejecting the payload must still clear resync_pending so a future mismatch can retry"
+        );
+    }
+
+    /// Sanity check alongside the regression test above: a payload with
+    /// *exactly* the current marble count (the ordinary checksum-mismatch-
+    /// correction case, no growth needed) is still adopted normally, so
+    /// fix 4's new length check doesn't accidentally reject legitimate
+    /// same-size resyncs.
+    #[test]
+    fn apply_resync_payload_accepts_a_payload_with_the_same_marble_count() {
+        let (mut mp, mut marble_state) = minimal_session_with_players(2);
+        let new_marbles = vec![Marble::spawn(Vec3::new(9.0, 0.0, 0.0), 0.3), Marble::spawn(Vec3::new(10.0, 0.0, 0.0), 0.3)];
+        mp.transport.as_mut().unwrap().test_inject_resync_payload(3, new_marbles.clone());
+
+        apply_resync_payload(&mut mp, &mut marble_state);
+
+        assert_eq!(mp.sim.current_tick(), 3);
+        assert_eq!(mp.sim.marbles()[0].pos, new_marbles[0].pos);
+        assert_eq!(mp.sim.marbles()[1].pos, new_marbles[1].pos);
+    }
+}
+
 /// Drains and applies the host's "you are player index K" message, if one
 /// arrived since the last tick — a joiner's own player index is no longer
 /// a compile-time constant now that more than one joiner can exist
@@ -466,10 +560,66 @@ fn apply_resync_payload(mp: &mut MultiplayerSession, marble_state: &mut MarbleSt
 /// channel preserves send order, and the host always sends `Welcome`
 /// before that same connection's first `ResyncPayload`/`SceneSync`
 /// (`marble_physics_tick_impl`'s join-handling doc).
+///
+/// Validates `index` is a real joiner index (`1..=MAX_JOINERS`, same range
+/// `WebRtcTransport::take_newly_connected` already asserts on the host
+/// side) before ever assigning it — this one check is what keeps every
+/// later unguarded `marbles[local_player_index]` read (`MarbleState::
+/// local_marble`, `render.rs`, `camera.rs`, `debug_gizmos.rs`) and every
+/// `RollbackSim::narrow_to(local_player_index)` call safe, since all of
+/// them trust this field without re-checking it themselves. An
+/// out-of-range `Welcome` (any raw byte outside that range — a build
+/// mismatch or a malformed message on this directly peer-drivable P2P
+/// channel, not something `net.js`'s own assignment logic would ever
+/// produce against a matching build) is logged and dropped instead of
+/// adopted, so `local_player_index` stays at whatever it already was.
 fn apply_welcome(mp: &mut MultiplayerSession, marble_state: &mut MarbleState) {
     let Some(transport) = mp.transport.as_mut() else { return };
     if let Some(index) = transport.poll_welcomes().into_iter().next_back() {
-        marble_state.local_player_index = index;
+        if is_valid_welcome_index(index) {
+            marble_state.local_player_index = index;
+        } else {
+            warn!(
+                "multiplayer: ignoring Welcome with out-of-range index {index} (valid range is 1..={})",
+                crate::net::MAX_JOINERS
+            );
+        }
+    }
+}
+
+/// Whether `index` is a real joiner index (`1..=MAX_JOINERS` — index `0` is
+/// always the host, never assigned via `Welcome`). Factored out of
+/// [`apply_welcome`] purely so this range check is directly unit-testable:
+/// `apply_welcome` itself needs a live `WebRtcTransport` with a pending
+/// message queued, which on the native target these tests run on requires
+/// going through `net.rs`'s wasm-only `js_bridge` (a no-op stub natively) --
+/// this predicate is the actual safety property fix 3 depends on, so
+/// testing it directly covers the fix without needing that plumbing.
+fn is_valid_welcome_index(index: PlayerIndex) -> bool {
+    (1..=crate::net::MAX_JOINERS).contains(&index)
+}
+
+#[cfg(test)]
+mod welcome_validation_tests {
+    use super::*;
+
+    /// Fix 3 regression test: every index outside `1..=MAX_JOINERS` --
+    /// including `0` (the host's own index, never legitimately assigned via
+    /// `Welcome`) and values past `MAX_JOINERS` (whatever raw byte a
+    /// malformed or build-mismatched `Welcome` might carry) -- must be
+    /// rejected, while every index actually inside that range is accepted.
+    /// Pre-fix, `apply_welcome` assigned any of these straight to
+    /// `local_player_index` with no check at all, which then panicked the
+    /// next time it indexed `marbles[local_player_index]` or was passed to
+    /// `RollbackSim::narrow_to`.
+    #[test]
+    fn welcome_index_validation_accepts_only_1_through_max_joiners() {
+        assert!(!is_valid_welcome_index(0), "index 0 is the host's own index, never a valid Welcome payload");
+        for i in 1..=crate::net::MAX_JOINERS {
+            assert!(is_valid_welcome_index(i), "index {i} is within 1..=MAX_JOINERS and must be accepted");
+        }
+        assert!(!is_valid_welcome_index(crate::net::MAX_JOINERS + 1));
+        assert!(!is_valid_welcome_index(255));
     }
 }
 

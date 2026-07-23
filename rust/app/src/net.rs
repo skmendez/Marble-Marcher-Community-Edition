@@ -967,6 +967,18 @@ impl WebRtcTransport {
         self.drain_and_demux();
         std::mem::take(&mut self.pending_welcomes)
     }
+
+    /// Test-only: injects a `ResyncPayload` directly into the pending
+    /// queue, bypassing `js_bridge` entirely -- `physics_sys.rs`'s fix-4
+    /// regression test needs to simulate "a resync payload arrived" for a
+    /// `WebRtcTransport` under test, but `js_bridge` is a no-op stub on the
+    /// native target these tests run on (there's no real WebRTC channel to
+    /// receive anything from), so there's no way to exercise the real
+    /// `drain_and_demux` path here.
+    #[cfg(test)]
+    pub(crate) fn test_inject_resync_payload(&mut self, tick: Tick, marbles: Vec<Marble>) {
+        self.pending_resync_payloads.push((tick, marbles));
+    }
 }
 
 impl InputTransport for WebRtcTransport {
