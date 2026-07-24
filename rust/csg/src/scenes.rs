@@ -323,36 +323,37 @@ pub const DONUT_MAJOR_RADIUS: f32 = 3.0;
 pub const DONUT_MINOR_RADIUS: f32 = 1.0;
 pub const DONUT_THICKNESS: f32 = 0.15;
 
-/// Base ("dough") albedo, set by `OrbitInit` before the angular folds --
-/// each channel is then lifted by [`DONUT_STRIPE_COLOR`]'s position term
-/// wherever that term exceeds it (`OrbitMax` is a componentwise max). The
-/// blue channel is deliberately near-zero: it's the angular-stripe channel,
-/// and its *contrast* is `stripe_term - base` after the shader's Reinhard
-/// compression, so a low floor is what makes the bands actually visible
-/// (the first attempt's 0.14 floor + weak coefficient survived compression
-/// as a barely-there tint).
-const DONUT_BASE_COLOR: Vec3 = Vec3::new(0.50, 0.22, 0.03);
-
-/// Two `OrbitMax` samples at *different fold depths* give the ring two
-/// angular color frequencies at once, so alternating segments are
-/// distinguishable instead of every 45-degree wedge looking identical:
+/// Base albedo, set by `OrbitInit` before the angular folds -- this is the
+/// **seam rib color** (warm amber): at every wedge seam the stripe term
+/// below is ~0 and the base shows through unmodified. Channel values are
+/// chosen *for what survives the shader's albedo pipeline* (Reinhard
+/// compression `v/(1+v)`, then the material-gamma squaring): `r = 1.5`
+/// compresses+squares to ~0.36 and `g = 0.8` to ~0.19 -- a rich
+/// amber-brown -- where a "tasteful" `r = 0.5` would crush to ~0.11,
+/// near-black.
 ///
-///  - [`DONUT_STRIPE_QUAD`] sits after the first two plane folds (the
-///    quadrant, whose `z` spans the full `0 ..= r` range): `g <- z` ramps
-///    over ~1 unit past each cardinal seam -- 4 broad teal-shifted bands.
-///    It also carries the tube-radial term (`r <- x`, outer wall warmer
-///    than inner), which is fold-depth-independent.
-///  - [`DONUT_STRIPE_OCT`] sits after the diagonal fold (the final
-///    wedge): `b <- z` with a deliberately large coefficient (2.2, not a
-///    subtle 0.4) -- the shader Reinhard-compresses orbit into `v/(1+v)`,
-///    so a large coefficient completes the dark->bright ramp within ~10
-///    degrees past each of the 8 wedge seams and *saturates* elsewhere,
-///    rendering as crisp dark rib lines every 45 degrees on bright walls.
-///    (Verified across screenshot rounds: gentle coefficients simply do
-///    not survive the compression -- a 45-degree-wide soft gradient never
-///    reads as banding.)
-const DONUT_STRIPE_QUAD: Vec3 = Vec3::new(0.20, 0.90, 0.0);
-const DONUT_STRIPE_OCT: Vec3 = Vec3::new(0.0, 0.0, 2.2);
+/// Deliberately **no height/green term anywhere in this palette**. An
+/// earlier version lifted `g` by `y * 0.9` (quadrant-depth `OrbitMax`) as
+/// an interior ceiling cue, and it backfired on the *exterior*:
+/// `OrbitMax` hard-ties channels to axes (`r <- x`, `g <- y`, `b <- z`),
+/// so a height cue can only ever paint green -- and on the donut's outer
+/// top surface (`y ~= 1.15`) it hit full strength exactly where the seams
+/// zero the blue channel, rendering the seam ribs as garish yellow-green
+/// rings (reported from an exterior screenshot). The palette is now a
+/// strict warm<->violet axis -- no combination of viewpoint and position
+/// can produce yellow/green from it.
+const DONUT_BASE_COLOR: Vec3 = Vec3::new(1.5, 0.8, 0.05);
+
+/// The single `OrbitMax` stripe term, applied after the final (octant)
+/// fold: `b <- z` with a deliberately large coefficient (2.2, not a
+/// subtle 0.4) -- the shader Reinhard-compresses orbit into `v/(1+v)`, so
+/// a large coefficient completes the dark->bright ramp within ~10 degrees
+/// past each of the 8 wedge seams and *saturates* elsewhere: warm amber
+/// rib lines on an otherwise violet-magenta body (the saturated blue over
+/// the base's warm undertone). Verified across screenshot rounds: gentle
+/// coefficients simply do not survive the compression -- a 45-degree-wide
+/// soft gradient never reads as banding at all.
+const DONUT_STRIPE_COLOR: Vec3 = Vec3::new(0.0, 0.0, 2.2);
 
 /// How many skylights/stripe repeats around the ring: 3 plane folds halve
 /// the angular domain three times, `2^3 = 8` copies of the fold wedge.
@@ -461,15 +462,14 @@ pub fn hollow_donut(params: &mut Params) -> (Object, HollowDonutHandles) {
             normal: Vec3Value::Const(Vec3::Z),
             offset: ScalarValue::Const(0.0),
         },
-        // Quadrant-depth color sample -- 4 broad bands (see
-        // DONUT_STRIPE_QUAD's doc for the two-frequency scheme).
-        Fold::OrbitMax(Vec3Value::Const(DONUT_STRIPE_QUAD)),
         Fold::Plane {
             normal: Vec3Value::Const(Vec3::new(sqrt_half, 0.0, -sqrt_half)),
             offset: ScalarValue::Const(0.0),
         },
-        // Final-wedge-depth sample -- 8 crisp rib lines.
-        Fold::OrbitMax(Vec3Value::Const(DONUT_STRIPE_OCT)),
+        // Final-wedge-depth stripe sample -- 8 crisp rib lines (see
+        // DONUT_STRIPE_COLOR's doc; the base color is the rib color, this
+        // paints the violet body between them).
+        Fold::OrbitMax(Vec3Value::Const(DONUT_STRIPE_COLOR)),
     ]);
 
     let object = Object::Fractal {
