@@ -66,6 +66,12 @@ jobs:
           cp rust/web/index.html dist/
           cp rust/web/scenes.html dist/
           cp rust/web/net.js dist/
+          # Vendored third-party JS (dat.gui, PeerJS -- rust/web/index.html's
+          # vendoring note): index.html now loads these from ./vendor/
+          # instead of unpkg, so forgetting this copy would 404 them on the
+          # deployed site and take the controls panel down harder than the
+          # CDN flakiness the vendoring exists to fix.
+          cp -r rust/web/vendor dist/vendor
           # Image assets (e.g. the marble's cubemap texture): Bevy's
           # AssetPlugin fetches these via HTTP relative to the served page
           # on wasm, they are not bundled into the wasm binary by cargo --
