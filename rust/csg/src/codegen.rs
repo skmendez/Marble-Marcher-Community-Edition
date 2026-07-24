@@ -181,6 +181,29 @@ impl CodeWriter {
                     self.writeln(&format!("orbit = max(orbit, p.xyz * {});", v.wgsl()));
                 }
             }
+            // Helical two-color stripes in toroidal coordinates (see the
+            // variant's doc). Emitted from the *current* `p`, so place it
+            // before any folds that break the angular coordinates it
+            // measures (e.g. before kaleidoscope plane folds). Integer
+            // counts guarantee seamless closure across both atan2 branch
+            // cuts; the smoothstep half-width keeps the stripe edge crisp
+            // but slightly antialiased against distance shimmer.
+            Fold::OrbitBarberPole { major, ring_count, twist_count, color_a, color_b } => {
+                if self.color_pass {
+                    let phase = self.fresh("bp_phase");
+                    self.writeln(&format!(
+                        "let {phase} = f32({}) * atan2(p.z, p.x) + f32({}) * atan2(p.y, length(p.xz) - {});",
+                        ring_count.wgsl(),
+                        twist_count.wgsl(),
+                        major.wgsl()
+                    ));
+                    self.writeln(&format!(
+                        "orbit = mix({}, {}, smoothstep(-0.15, 0.15, sin({phase})));",
+                        color_a.wgsl(),
+                        color_b.wgsl()
+                    ));
+                }
+            }
         }
     }
 
@@ -2276,6 +2299,26 @@ struct VertexOutput {
         assert!(de_part.contains(", 0.0, 1.0);"), "t must be clamped:\n{de_part}");
         assert!(!de_part.contains("orbit = mix("), "{de_part}");
         assert!(col_part.contains("d = mix(dl_"), "{col_part}");
+        assert!(col_part.contains("orbit = mix("), "{col_part}");
+    }
+
+    #[test]
+    fn barber_pole_emits_only_in_the_color_pass() {
+        let obj = Object::Fractal {
+            fold: crate::Fold::OrbitBarberPole {
+                major: ScalarValue::Const(3.0),
+                ring_count: IntValue::Const(8),
+                twist_count: IntValue::Const(3),
+                color_a: Vec3Value::Const(glam::Vec3::new(1.3, 0.05, 0.06)),
+                color_b: Vec3Value::Const(glam::Vec3::splat(2.5)),
+            },
+            base: Box::new(sphere(1.0)),
+        };
+        let src = generate_scene_functions(&obj);
+        let split = src.find("fn col_scene").expect("col_scene present");
+        let (de_part, col_part) = src.split_at(split);
+        assert!(!de_part.contains("atan2"), "de pass must not pay for stripes:\n{de_part}");
+        assert!(col_part.contains("atan2(p.z, p.x)"), "{col_part}");
         assert!(col_part.contains("orbit = mix("), "{col_part}");
     }
 

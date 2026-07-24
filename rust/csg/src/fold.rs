@@ -36,6 +36,43 @@ pub enum Fold {
     OrbitInit(Vec3Value),
     /// src/fractals/OrbitMax.hpp — CPU no-op, GPU/color-pass only.
     OrbitMax(Vec3Value),
+    /// Two-color helical "barber pole" stripes in toroidal coordinates
+    /// around the Y axis (no C++ counterpart) — CPU no-op, GPU/color-pass
+    /// only, like the other orbit ops. Sets `orbit` outright (no
+    /// `OrbitInit` needed before it) from the stripe phase
+    /// `ring_count * phi + twist_count * theta`, where `phi = atan2(z, x)`
+    /// (toroidal angle around the ring) and `theta = atan2(y, |p.xz| -
+    /// major)` (poloidal angle around the tube).
+    ///
+    /// This op exists because the `OrbitInit`/`OrbitMax` algebra
+    /// structurally cannot express it: orbit accumulation is a
+    /// componentwise max of *linear* functions of folded coordinates, and
+    /// the only periodicity available comes from folds — which also fold
+    /// the geometry, so only the object's own symmetries are usable. A
+    /// helix is invariant under a *screw* motion (rotate around Y while
+    /// advancing the tube angle), which is not a rigid symmetry of
+    /// anything, so no fold arrangement can produce it.
+    ///
+    /// **Seamless closure is automatic for integer counts**: crossing
+    /// either `atan2` branch cut jumps the phase by exactly
+    /// `count * 2*PI`, invisible to the `sin` the stripe test applies —
+    /// the pattern meets itself perfectly around both loops, for any
+    /// integer `ring_count`/`twist_count` (including 0: pure poloidal or
+    /// pure toroidal bands). Counts are `IntValue`s so they can be
+    /// params (live-editable, `Expr`-animatable).
+    OrbitBarberPole {
+        /// Ring radius the poloidal angle is measured against — pass the
+        /// torus's own `major` value (a shared `Param` keeps them in sync
+        /// when resized live).
+        major: ScalarValue,
+        /// Stripe periods around the ring (toroidal).
+        ring_count: IntValue,
+        /// Stripe periods around the tube cross-section (poloidal); the
+        /// stripes' visual tilt is set by the ratio of the two counts.
+        twist_count: IntValue,
+        color_a: Vec3Value,
+        color_b: Vec3Value,
+    },
 }
 
 /// Component indices `(c1, c2)` rotated by `FoldRotate` for a given axis,
@@ -125,7 +162,7 @@ impl Fold {
                     inner.fold(p, params);
                 }
             }
-            Fold::OrbitInit(_) | Fold::OrbitMax(_) => {}
+            Fold::OrbitInit(_) | Fold::OrbitMax(_) | Fold::OrbitBarberPole { .. } => {}
         }
     }
 
@@ -151,7 +188,7 @@ impl Fold {
                     inner.fold_with_history(p, hist, params);
                 }
             }
-            Fold::OrbitInit(_) | Fold::OrbitMax(_) => {}
+            Fold::OrbitInit(_) | Fold::OrbitMax(_) | Fold::OrbitBarberPole { .. } => {}
         }
     }
 
@@ -218,7 +255,7 @@ impl Fold {
                     inner.unfold(hist, n, params);
                 }
             }
-            Fold::OrbitInit(_) | Fold::OrbitMax(_) => {}
+            Fold::OrbitInit(_) | Fold::OrbitMax(_) | Fold::OrbitBarberPole { .. } => {}
         }
     }
 
@@ -302,7 +339,7 @@ impl Fold {
                 bound
             }
             // Color-pass-only no-ops (same as `fold`/`unfold`).
-            Fold::OrbitInit(_) | Fold::OrbitMax(_) => Some((c, r)),
+            Fold::OrbitInit(_) | Fold::OrbitMax(_) | Fold::OrbitBarberPole { .. } => Some((c, r)),
         }
     }
 
@@ -356,6 +393,14 @@ impl Fold {
                 out.push(9);
                 v.encode(out);
             }
+            Fold::OrbitBarberPole { major, ring_count, twist_count, color_a, color_b } => {
+                out.push(10);
+                major.encode(out);
+                ring_count.encode(out);
+                twist_count.encode(out);
+                color_a.encode(out);
+                color_b.encode(out);
+            }
         }
     }
 
@@ -379,6 +424,13 @@ impl Fold {
                 count.handle_valid_for(slot_count) && inner.handles_valid_for(slot_count)
             }
             Fold::OrbitInit(v) | Fold::OrbitMax(v) => v.handle_valid_for(slot_count),
+            Fold::OrbitBarberPole { major, ring_count, twist_count, color_a, color_b } => {
+                major.handle_valid_for(slot_count)
+                    && ring_count.handle_valid_for(slot_count)
+                    && twist_count.handle_valid_for(slot_count)
+                    && color_a.handle_valid_for(slot_count)
+                    && color_b.handle_valid_for(slot_count)
+            }
         }
     }
 
@@ -444,6 +496,14 @@ impl Fold {
             9 => {
                 let (v, pos) = Vec3Value::decode_at(bytes, pos)?;
                 (Fold::OrbitMax(v), pos)
+            }
+            10 => {
+                let (major, pos) = ScalarValue::decode_at(bytes, pos)?;
+                let (ring_count, pos) = IntValue::decode_at(bytes, pos)?;
+                let (twist_count, pos) = IntValue::decode_at(bytes, pos)?;
+                let (color_a, pos) = Vec3Value::decode_at(bytes, pos)?;
+                let (color_b, pos) = Vec3Value::decode_at(bytes, pos)?;
+                (Fold::OrbitBarberPole { major, ring_count, twist_count, color_a, color_b }, pos)
             }
             _ => return None,
         };

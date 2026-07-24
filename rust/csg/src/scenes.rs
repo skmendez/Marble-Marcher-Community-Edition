@@ -314,6 +314,11 @@ pub struct HollowDonutHandles {
     pub major: ScalarParam,
     pub minor: ScalarParam,
     pub thickness: ScalarParam,
+    /// Barber-pole stripe periods around the ring (toroidal).
+    pub ring_count: IntParam,
+    /// Barber-pole stripe periods around the tube (poloidal) -- the
+    /// stripes' visual tilt is the ratio of the two counts.
+    pub twist_count: IntParam,
 }
 
 /// [`hollow_donut`]'s stock dimensions: ring radius 3, tube radius 1, wall
@@ -323,50 +328,28 @@ pub const DONUT_MAJOR_RADIUS: f32 = 3.0;
 pub const DONUT_MINOR_RADIUS: f32 = 1.0;
 pub const DONUT_THICKNESS: f32 = 0.15;
 
-/// Base albedo, set by `OrbitInit` before the angular folds -- this is the
-/// **seam rib color** (crimson): at every wedge seam the stripe term
-/// below is ~0 and the base shows through unmodified. Channel values are
-/// chosen *for what survives the shader's albedo pipeline* (Reinhard
-/// compression `v/(1+v)`, material-gamma squaring, lighting, ACES) --
-/// `(1.0, 0.12, 0.08)` lands at ~display-RGB `(0.72, 0.10, 0.07)` under
-/// full sun and a dimmer version of the same hue under interior ambient.
-///
-/// The green channel is deliberately near-zero, and this is the load-
-/// bearing choice (learned across two rounds of yellow-band reports from
-/// exterior screenshots): any rib color with meaningful green content
-/// reads *yellow-gold* under direct sun once lighting and ACES lift it --
-/// the first round's `g <- y*0.9` height term and the second round's
-/// "amber" base (`g = 0.8`) both produced the same yellow rings that way.
-/// A strict red<->blue palette (crimson ribs, violet body) has no path to
-/// yellow or green from any viewpoint or lighting.
-const DONUT_BASE_COLOR: Vec3 = Vec3::new(1.0, 0.12, 0.08);
+/// Barber-pole stripe colors, fed to [`Fold::OrbitBarberPole`] (which
+/// replaced the earlier `OrbitInit`/`OrbitMax` wedge-fold scheme -- that
+/// algebra could only produce mirror-symmetric triangle-wave bands locked
+/// to the geometry's D4 symmetry, 4 ribs at the cardinals, and never a
+/// helix; see the fold variant's doc for the expressiveness argument).
+/// Classic red/white, with raw values chosen for what survives the
+/// shader's albedo pipeline (Reinhard compression, material-gamma
+/// squaring, lighting, ACES): white starts well above 1.0 so it still
+/// displays near-white after compression+squaring, and the red keeps
+/// near-zero green -- the hard-won lesson from this scene's earlier
+/// palettes: any meaningful green content reads yellow under direct sun.
+const DONUT_POLE_RED: Vec3 = Vec3::new(1.3, 0.05, 0.06);
+const DONUT_POLE_WHITE: Vec3 = Vec3::new(2.5, 2.5, 2.5);
 
-/// The single `OrbitMax` stripe term, applied after the final (octant)
-/// fold: `b <- z` with a deliberately large coefficient (2.2, not a
-/// subtle 0.4) -- the shader Reinhard-compresses orbit into `v/(1+v)`, so
-/// a large coefficient completes the dark->bright ramp within ~10 degrees
-/// of each rib and *saturates* elsewhere. Verified across screenshot
-/// rounds: gentle coefficients simply do not survive the compression.
-///
-/// **This yields 4 ribs, not 8** (a correction to this doc's earlier
-/// claim, prompted by counting them in an exterior screenshot). The three
-/// plane folds generate the dihedral group D4: 8 wedge *copies*, but the
-/// two edges of the fundamental wedge are not equivalent -- they lie on
-/// two different mirror-plane families. `z_folded = 0` (rib: stripe term
-/// vanishes, crimson base shows) happens only on the x/z-axis mirrors,
-/// whose orbit is the **4 cardinal angles**; the diagonal mirrors carry
-/// `z_folded = max` (fully saturated blue), orbit = the 4 diagonal
-/// angles. Equivalently: folding makes any function of folded coordinates
-/// mirror-symmetric across every seam, so a monotone ramp in `z` unfolds
-/// to a *triangle wave* -- one valley + one peak per 90 degrees. The 8
-/// skylights don't share this halving because their cutter sits at the
-/// wedge's *interior* mid-angle (22.5deg), a generic point whose D4 orbit
-/// is the full 8; wedge-*edge* features always come in 4s. (To actually
-/// get 8 ribs: add a fourth plane fold at 22.5deg -- D8, 16 copies, rib
-/// orbit = cardinals + diagonals = 8 -- and re-seat the skylight cutter
-/// *on* the new mirror plane so its multiplicity stays 8 rather than
-/// doubling to 16.)
-const DONUT_STRIPE_COLOR: Vec3 = Vec3::new(0.0, 0.0, 2.2);
+/// Default barber-pole stripe counts: 8 periods around the ring (one per
+/// skylight) and 3 around the tube; the tilt of the stripes on the
+/// surface goes as `(minor * twist) / (major * ring)`. Both are live
+/// `IntValue` params ([`HollowDonutHandles`]) -- retune the pattern from
+/// the params panel while playing. Any integer values close seamlessly
+/// around both loops by construction ([`Fold::OrbitBarberPole`]'s doc).
+pub const DONUT_RING_COUNT: i32 = 8;
+pub const DONUT_TWIST_COUNT: i32 = 3;
 
 /// How many skylights around the ring: 3 plane folds halve the angular
 /// domain three times, `2^3 = 8` copies of the fold wedge, and the cutter
@@ -426,20 +409,21 @@ pub const DONUT_SKYLIGHT_HEIGHT: f32 = 1.0;
 ///    into [`DONUT_SYMMETRY`] portholes around the ring, letting real
 ///    sun/sky light pour in (bright pools on the tunnel floor, and a
 ///    rhythm of landmarks that makes travel around the ring legible).
-///  - **Stripes**: an `OrbitMax` placed *after* the plane folds samples
-///    the wedge-folded position -- a triangle wave around the ring: 4
-///    crimson ribs at the cardinal angles, saturated violet between
-///    ([`DONUT_STRIPE_COLOR`]'s doc explains the orbit-size math of why
-///    ribs come in 4s while skylights come in 8s). The bands recede
-///    around the tunnel's curve, which is what actually reads as "inside
-///    a donut" instead of "inside a vague pale tube".
+///  - **Stripes**: a [`Fold::OrbitBarberPole`] placed *before* the plane
+///    folds (it needs the true, unfolded angles) paints red/white helical
+///    stripes that close seamlessly around both loops, with live-param
+///    ring/twist counts ([`DONUT_RING_COUNT`]/[`DONUT_TWIST_COUNT`]). The
+///    stripes recede around the tunnel's curve, which is what actually
+///    reads as "inside a donut" instead of "inside a vague pale tube".
 pub fn hollow_donut(params: &mut Params) -> (Object, HollowDonutHandles) {
     use std::f32::consts::FRAC_PI_8;
 
     let major = params.alloc_scalar(DONUT_MAJOR_RADIUS);
     let minor = params.alloc_scalar(DONUT_MINOR_RADIUS);
     let thickness = params.alloc_scalar(DONUT_THICKNESS);
-    let handles = HollowDonutHandles { major, minor, thickness };
+    let ring_count = params.alloc_int(DONUT_RING_COUNT);
+    let twist_count = params.alloc_int(DONUT_TWIST_COUNT);
+    let handles = HollowDonutHandles { major, minor, thickness, ring_count, twist_count };
     let shell = Object::Onion {
         base: Box::new(Object::Torus {
             major: ScalarValue::Param(major),
@@ -467,12 +451,24 @@ pub fn hollow_donut(params: &mut Params) -> (Object, HollowDonutHandles) {
     };
     let pierced = Object::Difference(Box::new(shell), Box::new(skylight));
 
-    // Three reflections through Y-axis planes fold the full circle into
-    // the wedge `atan2(z, x) in [0, PI/4]`: |x|, then |z| (first
+    // The barber-pole orbit op must run FIRST, on the *unfolded* query
+    // point: it measures the true toroidal/poloidal angles, which the
+    // kaleidoscope plane folds below (still needed to replicate the
+    // skylight cutter) would destroy. Orbit ops never move `p`, but they
+    // are emission-order-sensitive relative to folds that do.
+    //
+    // Three reflections through Y-axis planes then fold the full circle
+    // into the wedge `atan2(z, x) in [0, PI/4]`: |x|, then |z| (first
     // quadrant), then reflect across the x = z diagonal (keep x >= z).
     let sqrt_half = std::f32::consts::FRAC_1_SQRT_2;
     let fold = Fold::Series(vec![
-        Fold::OrbitInit(Vec3Value::Const(DONUT_BASE_COLOR)),
+        Fold::OrbitBarberPole {
+            major: ScalarValue::Param(major),
+            ring_count: IntValue::Param(ring_count),
+            twist_count: IntValue::Param(twist_count),
+            color_a: Vec3Value::Const(DONUT_POLE_RED),
+            color_b: Vec3Value::Const(DONUT_POLE_WHITE),
+        },
         Fold::Plane {
             normal: Vec3Value::Const(Vec3::X),
             offset: ScalarValue::Const(0.0),
@@ -485,11 +481,6 @@ pub fn hollow_donut(params: &mut Params) -> (Object, HollowDonutHandles) {
             normal: Vec3Value::Const(Vec3::new(sqrt_half, 0.0, -sqrt_half)),
             offset: ScalarValue::Const(0.0),
         },
-        // Final-wedge-depth stripe sample -- 4 crisp rib lines at the
-        // cardinal angles (see DONUT_STRIPE_COLOR's doc for why 4, not 8;
-        // the base color is the rib color, this paints the violet body
-        // between them).
-        Fold::OrbitMax(Vec3Value::Const(DONUT_STRIPE_COLOR)),
     ]);
 
     let object = Object::Fractal {

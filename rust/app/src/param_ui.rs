@@ -179,6 +179,10 @@ fn build_entries(handles: &SceneHandles, params: &Params) -> Vec<ParamEntry> {
         entries.push(ParamEntry::new("major", ParamBinding::Scalar(h.major), params, 1.5, 6.0, 0.01));
         entries.push(ParamEntry::new("minor", ParamBinding::Scalar(h.minor), params, 0.7, 2.0, 0.005));
         entries.push(ParamEntry::new("thick", ParamBinding::Scalar(h.thickness), params, 0.05, 0.4, 0.002));
+        // Barber-pole stripe counts -- any integers close seamlessly
+        // (Fold::OrbitBarberPole's doc), so the ranges are just taste.
+        entries.push(ParamEntry::new("stripes", ParamBinding::Int(h.ring_count), params, 0.0, 24.0, 1.0));
+        entries.push(ParamEntry::new("twist", ParamBinding::Int(h.twist_count), params, 0.0, 8.0, 1.0));
     };
     match handles {
         SceneHandles::Classic(h) => classic(&mut entries, h),

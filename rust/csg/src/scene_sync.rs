@@ -134,6 +134,13 @@ mod tests {
             Fold::Repeat { count: IntValue::Const(4), inner: Box::new(Fold::Abs) },
             Fold::OrbitInit(Vec3Value::Const(Vec3::new(1.0, 0.0, 0.0))),
             Fold::OrbitMax(Vec3Value::Const(Vec3::new(0.0, 1.0, 0.0))),
+            Fold::OrbitBarberPole {
+                major: ScalarValue::Const(3.0),
+                ring_count: IntValue::Const(8),
+                twist_count: IntValue::Const(3),
+                color_a: Vec3Value::Const(Vec3::new(1.3, 0.05, 0.06)),
+                color_b: Vec3Value::Const(Vec3::splat(2.5)),
+            },
         ];
         for fold in variants {
             let object = Object::Fractal { fold: fold.clone(), base: Box::new(Object::Sphere { radius: ScalarValue::Const(1.0) }) };
