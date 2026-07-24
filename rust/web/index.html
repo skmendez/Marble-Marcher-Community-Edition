@@ -42,6 +42,23 @@
         height: 20px;
       }
     }
+    /* GPU profiling overlay (see setUpGpuProfileOverlay below): styled to
+       read as part of the same developer HUD as the dat.gui controls panel
+       (dark semi-transparent backing, monospace, rounded corners) rather
+       than a visually distinct floating text block. */
+    #gpu-profile-overlay {
+      position: fixed;
+      bottom: 6px;
+      left: 6px;
+      margin: 0;
+      padding: 6px 10px;
+      background: rgba(0, 0, 0, 0.55);
+      color: #9cf;
+      font: 12px/1.4 monospace;
+      white-space: pre;
+      border-radius: 3px;
+      z-index: 999;
+    }
   </style>
 </head>
 <body>
@@ -57,22 +74,77 @@
        connection, not for gameplay traffic once connected. -->
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <script src="./net.js"></script>
-  <!-- Debug/config panel: a dat.gui control per existing `?key=value` toggle
-       (see rust/app/src/config.rs's `Config::from_env` -- this table must
-       stay in sync with that function's flags, encodings, and defaults by
-       hand, since there's no shared source of truth across the wasm
-       boundary). Deliberately reload-on-change, not a live in-place update:
-       every flag here is only ever read once, at startup
-       (`Config::from_env`), so a reload is what actually applies a change
-       regardless of which flag it is -- no need to special-case flags that
-       "happen to" get re-read every frame vs. ones that don't. This is
-       purely a faster alternative to hand-editing the URL; every link built
-       by editing `?key=value` directly (shared links, this project's CDP
-       test scripts) is completely unaffected. -->
+  <!-- Always-run JS bridge state: two independent groups of
+       `window.mmNet.*` assignments that Rust calls through plain
+       `extern "C"` bindings (`net.rs`'s `js_bridge`) with no `catch` and no
+       fallback -- if any of these aren't real functions by the time Rust
+       calls them, the call throws and breaks the game for every player.
+       Neither group is gated on `?debug=1` (or any other flag): both must
+       run unconditionally, on every page load, before the debug-gated
+       dat.gui folders/GPU-profiling panel below ever get a chance to run
+       or fail to run.
+         1. `window.mmLiveDebug` (the plain object `live_debug.rs`'s
+            wasm-only `poll_live_debug_toggles` reads every single frame)
+            and the `liveMrrmEnabled`/`liveViewMode` getters it calls.
+            Seeded once from query params so a shared `?mrrm=0`/
+            `?stepheat=1` link still opens in the expected state.
+         2. `reportPassTimings`/`reportStepData` -- unlike the getters
+            above, `gpu_profile.rs`'s `report_pass_timings_to_js` and
+            `step_data.rs`'s `report_step_data_to_js` gate *calling* these
+            purely on `Config.gpu_profile_enabled` (`?gpuprofile=1` alone),
+            independent of `?debug=1`. So `?gpuprofile=1` without
+            `?debug=1` still drives real per-frame calls into these on the
+            Rust side even though the visible overlay below is never built
+            -- they default to safe no-ops here so that combination can
+            never throw; the debug-gated overlay (below) overwrites them
+            with the real panel-updating versions only when it actually
+            exists. -->
+  <script>
+    (function setUpLiveDebugState() {
+      const params = new URLSearchParams(location.search);
+      window.mmLiveDebug = {
+        mrrm: params.get("mrrm") !== "0", // absent/anything-but-"0" => on (default on)
+        viewMode: params.get("stepheat") === "1" ? 1 : 0, // legacy ?stepheat=1 seeds FineStepHeat
+      };
+      // Polled every frame from Rust (`net.rs`'s `js_bridge`) -- getters,
+      // not pushes, unlike `reportPassTimings`/`reportStepData` below,
+      // since this is Rust pulling current JS state rather than JS pushing
+      // a computed result to Rust.
+      window.mmNet.liveMrrmEnabled = () => window.mmLiveDebug.mrrm;
+      window.mmNet.liveViewMode = () => window.mmLiveDebug.viewMode;
+    })();
+
+    (function setUpGpuProfileBridgeDefaults() {
+      // Safe no-ops: real implementations are installed by
+      // `setUpGpuProfileOverlay` below, but only when `?debug=1` is also
+      // present -- see the module doc above for why `?gpuprofile=1` alone
+      // still needs these to exist.
+      window.mmNet.reportPassTimings = function () {};
+      window.mmNet.reportStepData = function () {};
+    })();
+  </script>
+  <!-- Controls panel: a dat.gui instance that ALWAYS exists (every player
+       gets it, regardless of `?debug=1`) because it's the only place the
+       "copy invite link" row lives (moved here from the old always-on
+       in-canvas "Share this link..." text + Bevy "Copy Link" button --
+       `net.rs`'s `spawn_net_ui` doc) -- a real gameplay feature, not debug
+       tooling, so it can never be hidden behind a debug flag.
+       Everything else historically shown here -- the reload-triggering
+       `Config::from_env` toggles (scene/shadowlod/perfprobe/vsync/
+       res_oscillate/gpuprofile) and the live (no-reload) mrrm/view-mode
+       toggles (`live_debug.rs`'s `LiveDebugToggles`) -- IS purely debug
+       tooling a casual player has no use for, so those two folders are
+       only added when `?debug=1` is present (`rust/app/src/config.rs`'s
+       `Config::debug_enabled` convention, matching `fps_overlay.rs`'s own
+       `?debug=1` gate for its top-left overlay). When `debug` isn't `"1"`
+       the panel still exists (for the copy-link row) but shows nothing
+       else -- effectively a single "copy invite link" button, not the
+       full technical control surface. -->
   <script src="https://unpkg.com/dat.gui@0.7.9/build/dat.gui.min.js"></script>
   <script>
     (function setUpConfigPanel() {
       const params = new URLSearchParams(location.search);
+      const debugEnabled = params.get("debug") === "1";
 
       // One entry per `Config::from_env` flag. `key`: the query-param name.
       // `type`: 'bool' (dat.gui checkbox) or 'enum' (dat.gui dropdown).
@@ -83,11 +155,11 @@
       // "false"/"true"). `options`: dropdown choices for 'enum' fields
       // (`SceneKind::from_value`'s exact accepted strings, render.rs).
       //
-      // `mrrm` and `stepheat` are NOT here: they moved to the live (no
-      // reload) panel below (`live_debug.rs`'s `LiveDebugToggles`) since
+      // `mrrm` and `stepheat` are NOT here: they're in the "Live Debug"
+      // folder below instead (`live_debug.rs`'s `LiveDebugToggles`) since
       // debugging MRRM's coarse-warm-start behavior needs to flip these
       // mid-session without losing camera position. Every other flag stays
-      // reload-based -- see this panel's own doc just above.
+      // reload-based.
       const FIELDS = [
         {
           key: "scene",
@@ -156,7 +228,7 @@
 
       // `autoPlace: false` + our own `#config-gui` container (styled in the
       // <head>): dat.gui's auto-placed container is fixed top-right with its
-      // own inline sizing, and the previous approach of restyling
+      // own inline sizing, and an earlier approach of restyling
       // `gui.domElement` *inside* that container rendered mispositioned and
       // bottom-clipped on phones (the last rows and close button off-screen).
       // Owning the container makes the position/max-height/scroll behavior
@@ -173,13 +245,12 @@
         gui.close();
       }
 
-      // Copy-invite-link, moved here from the old in-canvas Bevy button
-      // (net.rs's spawn_net_ui used to draw its own top-right link text +
-      // button): the invite URL is plain JS state (`mmNet.hostedId()`), so
-      // the controls panel can own the whole flow -- build the link, write
-      // the clipboard (synchronously inside the click handler, the same
-      // user-gesture requirement net.js's copyToClipboard documents), and
-      // show transient feedback by renaming the row.
+      // Copy-invite-link -- always present regardless of `?debug=1` (module
+      // doc above): the invite URL is plain JS state (`mmNet.hostedId()`),
+      // so the controls panel can own the whole flow -- build the link,
+      // write the clipboard (synchronously inside the click handler, the
+      // same user-gesture requirement net.js's copyToClipboard documents),
+      // and show transient feedback by renaming the row.
       const COPY_IDLE_LABEL = "copy invite link";
       const copyState = {
         copy: function () {
@@ -210,74 +281,75 @@
         }, 1500);
       }
 
-      for (const field of FIELDS) {
-        const controller =
-          field.type === "enum" ? gui.add(state, field.key, field.options) : gui.add(state, field.key);
-        controller.onFinishChange(applyChange);
+      // Everything past this point is debug-only tooling (module doc
+      // above) -- skip entirely when `?debug=1` isn't set, so a casual
+      // player's panel is just the copy-link row above.
+      if (!debugEnabled) {
+        return;
       }
 
+      // Two folders so reload-triggering and instant/live controls are
+      // visually distinguishable at a glance, instead of one flat list a
+      // user has to click into to discover which kind each row is.
+      const reloadFolder = gui.addFolder("Scene & Render (reload)");
+      for (const field of FIELDS) {
+        const controller =
+          field.type === "enum"
+            ? reloadFolder.add(state, field.key, field.options)
+            : reloadFolder.add(state, field.key);
+        controller.onFinishChange(applyChange);
+      }
+      reloadFolder.open();
+
       // Live (no-reload) debug toggles (`live_debug.rs`'s
-      // `LiveDebugToggles`) -- added to the same dat.gui panel as the
-      // reload-based flags above, but deliberately with no
-      // `onFinishChange`/`applyChange` wiring: `window.mmLiveDebug` is a
-      // plain object dat.gui mutates in place, polled fresh every frame by
-      // Rust (`net.rs`'s `js_bridge::live_mrrm_enabled`/`live_view_mode`),
-      // so a change here takes effect on the very next frame with no
-      // navigation at all. Seeded once from the same query params so a
-      // shared `?mrrm=0`/`?stepheat=1` link still opens in the expected
-      // state.
-      window.mmLiveDebug = {
-        mrrm: params.get("mrrm") !== "0", // absent/anything-but-"0" => on (default on)
-        viewMode: params.get("stepheat") === "1" ? 1 : 0, // legacy ?stepheat=1 seeds FineStepHeat
-      };
-      // Object-mapped dropdown (dat.gui's `gui.add(obj, key, {label: value})`
-      // form): values are `live_debug.rs`'s `DebugViewMode::as_uniform_value`
-      // wire encoding exactly (0..=3) -- keep in sync if that enum grows.
+      // `LiveDebugToggles`), deliberately with no `onFinishChange`/
+      // `applyChange` wiring: `window.mmLiveDebug` is a plain object
+      // dat.gui mutates in place, polled fresh every frame by Rust
+      // (`net.rs`'s `js_bridge::live_mrrm_enabled`/`live_view_mode`,
+      // wired unconditionally in `setUpLiveDebugState` above), so a
+      // change here takes effect on the very next frame with no
+      // navigation at all.
+      const liveFolder = gui.addFolder("Live Debug (instant)");
+      // Object-mapped dropdown (dat.gui's `gui.add(obj, key, {label:
+      // value})` form): values are `live_debug.rs`'s
+      // `DebugViewMode::as_uniform_value` wire encoding exactly (0..=3)
+      // -- keep in sync if that enum grows.
       const VIEW_MODE_OPTIONS = {
         Off: 0,
         "Fine step heat": 1,
         "Coarse step heat": 2,
         "Coarse step distance": 3,
       };
-      gui.add(window.mmLiveDebug, "mrrm").name("mrrm (live)");
-      gui.add(window.mmLiveDebug, "viewMode", VIEW_MODE_OPTIONS).name("view mode (live)");
-
-      // Polled every frame from Rust (`net.rs`'s `js_bridge`) -- getters,
-      // not pushes, unlike every other `window.mmNet.*` assignment in this
-      // file (`reportPassTimings`/`reportStepData` below), since this is
-      // Rust pulling current JS state rather than JS pushing a computed
-      // result to Rust.
-      window.mmNet.liveMrrmEnabled = () => window.mmLiveDebug.mrrm;
-      window.mmNet.liveViewMode = () => window.mmLiveDebug.viewMode;
+      liveFolder.add(window.mmLiveDebug, "mrrm").name("mrrm (live)");
+      liveFolder.add(window.mmLiveDebug, "viewMode", VIEW_MODE_OPTIONS).name("view mode (live)");
+      liveFolder.open();
     })();
   </script>
-  <!-- GPU per-pass timestamp profiling overlay (gpu_profile.rs). Only
-       created when `?gpuprofile=1` is present (mirrors the config panel's
-       own `parse` convention for this flag above) -- zero DOM cost
-       otherwise. `window.mmNet.reportPassTimings` is called once per frame
-       from Rust via net.rs's `js_bridge` once profiling is active there
-       too (both sides gate independently on the same flag, by design --
-       neither depends on the other having read it first). Positioned
-       bottom-left: bottom-right is the config panel above, top-left is
-       the Bevy-UI debug overlay (fps_overlay.rs, `?debug=1`), top-right is
-       the networking status panel (net.rs's spawn_net_ui -- hidden except
-       on connect/disconnect/error events). -->
+  <!-- GPU per-pass timestamp profiling overlay (gpu_profile.rs). Built only
+       when BOTH `?debug=1` AND `?gpuprofile=1` hold -- `?debug=1` is the
+       single consistent master switch for every developer-facing UI
+       element in this file; `?gpuprofile=1` alone no longer shows this
+       panel (previously it did on its own). Overwrites the safe no-op
+       `window.mmNet.reportPassTimings`/`reportStepData` installed
+       unconditionally above with the real panel-updating versions --
+       Rust's own gate for *calling* these (`Config.gpu_profile_enabled`,
+       `gpu_profile.rs`/`step_data.rs`) is `?gpuprofile=1` alone,
+       independent of `?debug=1`, so this panel existing or not is purely
+       about whether anyone's watching the numbers, never about whether
+       Rust is allowed to report them. Positioned bottom-left (styled in
+       the <head>, `#gpu-profile-overlay`, to read as part of the same
+       developer HUD as the dat.gui panel bottom-right): top-left is the
+       Bevy-UI debug overlay (fps_overlay.rs, `?debug=1`), top-right is the
+       networking status panel (net.rs's spawn_net_ui -- hidden except on
+       connect/disconnect/error events) -- all four corners used, no
+       overlap. -->
   <script>
     (function setUpGpuProfileOverlay() {
       const params = new URLSearchParams(location.search);
-      if (params.get("gpuprofile") !== "1") return;
+      if (params.get("debug") !== "1" || params.get("gpuprofile") !== "1") return;
 
       const panel = document.createElement("pre");
-      panel.style.position = "fixed";
-      panel.style.bottom = "6px";
-      panel.style.left = "6px";
-      panel.style.margin = "0";
-      panel.style.padding = "6px 10px";
-      panel.style.background = "rgba(0, 0, 0, 0.55)";
-      panel.style.color = "#9cf";
-      panel.style.font = "12px/1.4 monospace";
-      panel.style.whiteSpace = "pre";
-      panel.style.zIndex = "999";
+      panel.id = "gpu-profile-overlay";
       document.body.appendChild(panel);
 
       // `ms < 0` is the "no reading yet" sentinel (net.rs's js_bridge doc) --
@@ -287,10 +359,10 @@
 
       // Cumulative ray-march step-count estimate (`step_data.rs`) -- a
       // separate `reportStepData` call, independent of `reportPassTimings`
-      // above (both gate on the same `?gpuprofile=1` flag on the Rust side,
-      // but neither depends on the other having landed first, so this
-      // panel tracks each one's own "no reading yet" state separately
-      // rather than assuming they arrive together).
+      // above (both gate on the same `?debug=1&gpuprofile=1` flags on the
+      // Rust side, but neither depends on the other having landed first,
+      // so this panel tracks each one's own "no reading yet" state
+      // separately rather than assuming they arrive together).
       let lastTimingsLine = "GPU pass timings: waiting for first frame...";
       let lastStepDataLine = "step count: waiting for first frame...";
       const render = () => {

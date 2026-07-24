@@ -8,12 +8,18 @@
 //! AO"), which does the same thing.
 //!
 //! Sits between MRRM's coarse pass and the fine pass in `Camera.order`
-//! (`mrrm.rs`'s module doc): warm-starts its own march from MRRM's existing
-//! coarse hit-distance buffer (same technique the fine pass uses), then the
-//! fine pass resamples *this* pass's cached shadow visibility
-//! (`marble_csg::codegen`'s `sample_shadow`, a depth-aware 4-tap blend --
-//! ported from MMCE's `bilinear_surface`) instead of marching a fresh shadow
-//! ray per full-res pixel.
+//! (`mrrm.rs`'s module doc): its own march starts at the bounding-sphere clip
+//! entry point, deliberately *not* warm-started from MRRM's coarse
+//! hit-distance buffer (unlike the fine pass) -- see
+//! `marble_csg::codegen`'s `SHADOW_MARCHER` doc for why that warm-start was
+//! removed (a real correctness bug: a single, uninterpolated nearest-texel
+//! read of the coarse pass's cheapened-fold DE could land this march on the
+//! wrong fold near a Menger-fold crease, producing a materially wrong shadow
+//! value for the whole frame under a tiny camera nudge). The fine pass
+//! resamples *this* pass's cached shadow visibility (`marble_csg::codegen`'s
+//! `sample_shadow`, a depth-aware 4-tap blend -- ported from MMCE's
+//! `bilinear_surface`) instead of marching a fresh shadow ray per full-res
+//! pixel.
 //!
 //! `ShadowCamera`/`ShadowQuad` get their own `RenderLayers` (distinct from
 //! both the fine marcher's implicit layer 0 and MRRM's `COARSE_LAYER`), same
@@ -88,13 +94,15 @@ const SHADOW_MARCHER_SHADER_HANDLE: Handle<Shader> =
 
 /// The shadow pass's own material: bindings 0/1 (scene/params) come from
 /// `gpu::MarcherGpuBuffers`'s persistent shared buffers (see `gpu.rs`); the
-/// only field left is MRRM's coarse hit-distance texture (binding 2, this
-/// pass's own warm-start source -- same bind-group shape `FineMarcherMaterial`
-/// had before it also grew a `shadow` binding, see `generate_shadow_shader`'s
-/// doc for why this still needs its own `Material2d`/shader module rather
-/// than reusing either the coarse or fine one). Mutating `coarse` (MRRM's
-/// render target resizing) is the only thing that re-prepares this
-/// material now.
+/// only field left is MRRM's coarse hit-distance texture (binding 2 --
+/// no longer read by the fragment shader itself, see
+/// `marble_csg::codegen`'s `SHADOW_MARCHER` doc for why its warm-start was
+/// removed; kept only for bind-group-layout parity with the shape
+/// `FineMarcherMaterial` had before it also grew a `shadow` binding, see
+/// `generate_shadow_shader`'s doc for why this still needs its own
+/// `Material2d`/shader module rather than reusing either the coarse or fine
+/// one). Mutating `coarse` (MRRM's render target resizing) is the only
+/// thing that re-prepares this material now.
 #[derive(Asset, TypePath, Clone)]
 pub struct ShadowMarcherMaterial {
     pub coarse: Handle<Image>,
