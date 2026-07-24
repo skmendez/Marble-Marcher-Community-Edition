@@ -64,6 +64,15 @@ pub struct Config {
     /// goes (e.g. whether MRRM's coarse warm-start has room to help a given
     /// view), see `marble_csg::codegen`'s `MARCHER::fragment` doc.
     pub step_heat_enabled: bool,
+    /// `?exposure=<f>`/`MM_EXPOSURE=<f>` scales the HDR color before the
+    /// ACES tonemap (`marble_csg::codegen`'s `MARCHER::tonemap`; rides in
+    /// `SceneUniforms::misc3.y`). Default 1.0; unparseable or non-positive
+    /// values fall back to the default rather than blacking out the frame
+    /// (the shader guards non-positive again independently). The C++
+    /// original's counterpart is a live-tunable setting with auto-exposure
+    /// on top (`Settings.h`'s `exposure`/`auto_exposure_*`); this is the
+    /// fixed-value starting point.
+    pub exposure: f32,
 }
 
 impl Config {
@@ -83,6 +92,10 @@ impl Config {
             gpu_profile_enabled: query_value("gpuprofile", "MM_GPUPROFILE").as_deref()
                 == Some("1"),
             step_heat_enabled: query_value("stepheat", "MM_STEPHEAT").as_deref() == Some("1"),
+            exposure: query_value("exposure", "MM_EXPOSURE")
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(1.0),
         }
     }
 }

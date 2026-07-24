@@ -321,7 +321,7 @@ enum Combine {
 /// this uniform was never populated), which `ray_sphere_clip` (`MARCH_CORE`)
 /// treats as "don't clip, march the full range" rather than "everything
 /// misses". `misc3.x` is the fine pass's debug-view-mode selector (fine
-/// pass only -- see `MARCHER`'s `fragment`; y/z/w unused, added as its own
+/// pass only -- see `MARCHER`'s `fragment`; z/w unused, added as its own
 /// field rather than squeezed into `misc`/`misc2` since both of those are
 /// already fully occupied): `0` off, `1` the fine pass's own per-pixel
 /// ray-march step-count heatmap (the original `?stepheat=1` view), `2` the
@@ -330,7 +330,10 @@ enum Combine {
 /// same way -- see `rust/app/src/live_debug.rs`'s `DebugViewMode` for the
 /// Rust-side enum this integer encodes, and why it's a live, no-reload
 /// toggle rather than a `Config`-seeded-at-startup one like every other
-/// debug flag here.
+/// debug flag here. `misc3.y` is the fine pass's exposure multiplier for
+/// the ACES tonemap (`MARCHER`'s `tonemap`; `?exposure=`/`MM_EXPOSURE`,
+/// default 1.0 -- non-positive values fall back to 1.0 in the shader so an
+/// unset uniform can't black the frame out).
 ///
 /// The single authoritative field list for the GPU `SceneUniforms` ABI --
 /// every `vec4<f32>`, same order the Rust-side `render.rs::SceneUniforms`
@@ -1033,9 +1036,23 @@ fn sky(rd: vec3<f32>) -> vec3<f32> {
     return col;
 }
 
+// ACES filmic tone mapping (the Narkowicz polynomial fit), ported from
+// MMCE's HDRmapping/ACESFilm (utility/shading.glsl) -- replaces the
+// previous Reinhard `x/(1+x)` curve, which was the single biggest cause of
+// this port's washed-out look vs. the C++ original: Reinhard lifts blacks
+// (nothing ever reads as dark) and, because it compresses each channel
+// independently toward 1, actively desaturates every bright color toward
+// gray. ACES is an S-curve: real shadow contrast, punchier mids, and
+// saturation preserved into the highlights, at the same cost class (a few
+// multiplies). Exposure rides in `scene.misc3.y` (the fine pass's
+// material is the only one that sets `misc3` -- and the only one that
+// shades); `select` falls back to 1.0 for a non-positive value so an
+// unset uniform can never render the whole frame black.
 fn tonemap(col: vec3<f32>) -> vec3<f32> {
-    let x = col / (1.0 + col);
-    return pow(x, vec3<f32>(1.0 / 2.2));
+    let exposure = select(1.0, scene.misc3.y, scene.misc3.y > 0.0);
+    let x = col * exposure;
+    let aces = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+    return pow(clamp(aces, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
 }
 
 // `?stepheat=1` debug view (`scene.misc3.x`): a 3-stop dark-blue -> yellow ->
@@ -1449,7 +1466,7 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     // before this fix.
     let outline_visible = candidate_hit && best_is_outline;
     if (outline_visible) {
-        // Deliberately *not* run through `tonemap()`: that Reinhard+gamma
+        // Deliberately *not* run through `tonemap()`: that ACES+gamma
         // curve is calibrated for lit HDR surface values (which is why the
         // marble's own shaded color above goes through it), and applying it
         // to an already-final flat display color pushes it lighter *and*
@@ -1493,8 +1510,11 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         // reads as a uniformly pale/washed-out surface no matter how
         // ambient/diffuse/tonemap constants downstream are tuned (clamping
         // is lossy -- detail above 1.0 is gone, not just displayed brightly).
-        // Compress with a Reinhard-style curve (matches `tonemap()` below)
-        // before clamping instead: this maps the *typical* orbit range
+        // Compress with a Reinhard-style curve before clamping instead
+        // (this is albedo-range normalization, deliberately *not* switched
+        // to ACES along with `tonemap()` -- ACES is a display transform;
+        // this just needs a monotonic squash of orbit magnitudes into
+        // [0, 1)): this maps the *typical* orbit range
         // smoothly into (-1, 1) so the coloring keeps its shape (still
         // varies meaningfully across the surface -- it's the same orbit
         // value, just range-compressed) rather than being hard-clipped to a
