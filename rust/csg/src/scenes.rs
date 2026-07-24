@@ -323,10 +323,33 @@ pub const DONUT_MAJOR_RADIUS: f32 = 3.0;
 pub const DONUT_MINOR_RADIUS: f32 = 1.0;
 pub const DONUT_THICKNESS: f32 = 0.15;
 
-/// Flat frosting-pink surface color, applied the same way `creme_spheres`
-/// colors itself: a single constant `OrbitInit` (no `OrbitMax`
-/// accumulation), which `col_scene` returns as-is for every hit point.
-const DONUT_COLOR: Vec3 = Vec3::new(0.95, 0.62, 0.72);
+/// Base ("dough") albedo, set by `OrbitInit` before the angular folds --
+/// each channel is then lifted by [`DONUT_STRIPE_COLOR`]'s position term
+/// wherever that term exceeds it (`OrbitMax` is a componentwise max).
+const DONUT_BASE_COLOR: Vec3 = Vec3::new(0.42, 0.24, 0.14);
+
+/// Per-component scale on the *wedge-folded* position fed to `OrbitMax`
+/// (`orbit = max(orbit, p.xyz * this)`): inside the fold wedge `x` runs
+/// ~`major - minor ..= major + minor` (radial: outer wall warmer), `y` runs
+/// `-minor ..= minor` (slight top brightening), and `z` runs `0 ..= x`
+/// (the angular coordinate within the wedge -- this is the stripe term,
+/// rising from the wedge seam to its far edge and mirroring back, giving
+/// [`DONUT_SYMMETRY`] pink bands around the ring).
+const DONUT_STRIPE_COLOR: Vec3 = Vec3::new(0.16, 0.10, 0.28);
+
+/// How many skylights/stripe repeats around the ring: 3 plane folds halve
+/// the angular domain three times, `2^3 = 8` copies of the fold wedge.
+pub const DONUT_SYMMETRY: usize = 8;
+
+/// The skylight cutter sphere: centered at the fold wedge's mid-angle
+/// (`PI / 8`), just above the tube's top surface, sized to pierce the wall
+/// clean through (wall spans `minor ± thickness` vertically at the ring
+/// radius; the sphere spans `DONUT_SKYLIGHT_HEIGHT ± DONUT_SKYLIGHT_RADIUS`).
+/// Positioned from the stock dimension constants, not the live params -- a
+/// params-panel resize moves the wall but not the skylights, which is fine
+/// for a tuning tool (the holes just get deeper/shallower).
+pub const DONUT_SKYLIGHT_RADIUS: f32 = 0.5;
+pub const DONUT_SKYLIGHT_HEIGHT: f32 = 1.3;
 
 /// A hollow donut: `Onion(Torus)` -- the shell of points within
 /// `thickness` of the torus surface, i.e. a donut-shaped **tunnel**. The
@@ -334,9 +357,29 @@ const DONUT_COLOR: Vec3 = Vec3::new(0.95, 0.62, 0.72);
 /// `minor - thickness`, comfortably positive), circulating around the ring
 /// like a closed hamster-tube circuit; physics collides against the same
 /// exact shell field the shader renders (`Object::Onion`'s doc for the
-/// exactness argument). All three dimensions are runtime `Param`s so the
-/// params panel can resize the donut live.
+/// exactness argument). `major`/`minor`/`thickness` are runtime `Param`s
+/// so the params panel can resize the donut live.
+///
+/// Interior readability (the whole scene is experienced from *inside* the
+/// shell, where the sun never reaches and shading is ambient-only): two
+/// structures on top of the bare shell, both built purely from `Fold::
+/// Plane` reflections through the Y axis -- **exact symmetries of the
+/// torus**, so the shell's geometry (and physics) is completely untouched
+/// by the folding; only what's placed *inside* the wedge gets replicated:
+///
+///  - **Skylights**: one cutter sphere at the wedge's mid-angle above the
+///    tube's top, `Difference`d out of the shell -- the folds replicate it
+///    into [`DONUT_SYMMETRY`] portholes around the ring, letting real
+///    sun/sky light pour in (bright pools on the tunnel floor, and a
+///    rhythm of landmarks that makes travel around the ring legible).
+///  - **Stripes**: an `OrbitMax` placed *after* the plane folds samples
+///    the wedge-folded position, so the albedo carries the same 8-fold
+///    angular banding ([`DONUT_STRIPE_COLOR`]) -- the bands recede around
+///    the tunnel's curve, which is what actually reads as "inside a
+///    donut" instead of "inside a vague pale tube".
 pub fn hollow_donut(params: &mut Params) -> (Object, HollowDonutHandles) {
+    use std::f32::consts::FRAC_PI_8;
+
     let major = params.alloc_scalar(DONUT_MAJOR_RADIUS);
     let minor = params.alloc_scalar(DONUT_MINOR_RADIUS);
     let thickness = params.alloc_scalar(DONUT_THICKNESS);
@@ -348,9 +391,50 @@ pub fn hollow_donut(params: &mut Params) -> (Object, HollowDonutHandles) {
         }),
         thickness: ScalarValue::Param(thickness),
     };
+
+    // One cutter sphere at the wedge's mid-angle; `ScaleTranslate`'s
+    // forward map is `p' = p + shift`, so a sphere-at-origin base appears
+    // at `-shift`.
+    let skylight_center = Vec3::new(
+        DONUT_MAJOR_RADIUS * FRAC_PI_8.cos(),
+        DONUT_SKYLIGHT_HEIGHT,
+        DONUT_MAJOR_RADIUS * FRAC_PI_8.sin(),
+    );
+    let skylight = Object::Fractal {
+        fold: Fold::ScaleTranslate {
+            scale: ScalarValue::Const(1.0),
+            shift: Vec3Value::Const(-skylight_center),
+        },
+        base: Box::new(Object::Sphere {
+            radius: ScalarValue::Const(DONUT_SKYLIGHT_RADIUS),
+        }),
+    };
+    let pierced = Object::Difference(Box::new(shell), Box::new(skylight));
+
+    // Three reflections through Y-axis planes fold the full circle into
+    // the wedge `atan2(z, x) in [0, PI/4]`: |x|, then |z| (first
+    // quadrant), then reflect across the x = z diagonal (keep x >= z).
+    let sqrt_half = std::f32::consts::FRAC_1_SQRT_2;
+    let fold = Fold::Series(vec![
+        Fold::OrbitInit(Vec3Value::Const(DONUT_BASE_COLOR)),
+        Fold::Plane {
+            normal: Vec3Value::Const(Vec3::X),
+            offset: ScalarValue::Const(0.0),
+        },
+        Fold::Plane {
+            normal: Vec3Value::Const(Vec3::Z),
+            offset: ScalarValue::Const(0.0),
+        },
+        Fold::Plane {
+            normal: Vec3Value::Const(Vec3::new(sqrt_half, 0.0, -sqrt_half)),
+            offset: ScalarValue::Const(0.0),
+        },
+        Fold::OrbitMax(Vec3Value::Const(DONUT_STRIPE_COLOR)),
+    ]);
+
     let object = Object::Fractal {
-        fold: Fold::OrbitInit(Vec3Value::Const(DONUT_COLOR)),
-        base: Box::new(shell),
+        fold,
+        base: Box::new(pierced),
     };
     (object, handles)
 }
@@ -649,6 +733,41 @@ mod tests {
         params.set_scalar(handles.minor, DONUT_MINOR_RADIUS + 0.5);
         let d = object.de(Vec4::new(DONUT_MAJOR_RADIUS, 0.0, 0.0, 1.0), &params);
         assert!((d - (DONUT_MINOR_RADIUS + 0.5 - DONUT_THICKNESS)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hollow_donut_skylights_pierce_the_wall_at_every_wedge_center_but_not_the_seams() {
+        use std::f32::consts::{FRAC_PI_8, TAU};
+        let mut params = Params::new();
+        let (object, _handles) = hollow_donut(&mut params);
+
+        // Mid-wall point at the tube's top for a given ring angle.
+        let top_wall = |angle: f32| {
+            Vec4::new(
+                DONUT_MAJOR_RADIUS * angle.cos(),
+                DONUT_MINOR_RADIUS,
+                DONUT_MAJOR_RADIUS * angle.sin(),
+                1.0,
+            )
+        };
+
+        // Every replicated wedge center has an open hole; every seam
+        // between them is still solid wall -- the plane folds turn the one
+        // cutter sphere into DONUT_SYMMETRY skylights, no more, no fewer.
+        for i in 0..DONUT_SYMMETRY {
+            let step = TAU / DONUT_SYMMETRY as f32;
+            let center = FRAC_PI_8 + i as f32 * step;
+            let seam = i as f32 * step;
+            let d_center = object.de(top_wall(center), &params);
+            assert!(d_center > 0.05, "wedge {i}: expected an open skylight, de={d_center}");
+            let d_seam = object.de(top_wall(seam), &params);
+            assert!(d_seam < -0.05, "seam {i}: expected solid wall, de={d_seam}");
+        }
+
+        // The tunnel floor is untouched by the top-side skylights.
+        let floor = Vec4::new(DONUT_MAJOR_RADIUS, -DONUT_MINOR_RADIUS, 0.0, 1.0);
+        let d = object.de(floor, &params);
+        assert!(d < -0.05, "floor should still be solid, de={d}");
     }
 
     #[test]
