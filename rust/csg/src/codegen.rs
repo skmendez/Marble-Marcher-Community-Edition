@@ -986,34 +986,6 @@ fn coarse_distance_color(dist: f32) -> vec3<f32> {
 
 @fragment
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
-    // View modes 2 (`CoarseStepHeat`) and 3 (`CoarseStepDistance`,
-    // `live_debug.rs`'s `DebugViewMode`) only ever need `mesh.uv` to look up
-    // the coarse pre-pass's own cached output for this pixel's texel, so
-    // they return here before any of the real march setup below (`ndc`/
-    // `ro`/`rd`/`clip`) -- deliberately a separate early-exit rather than
-    // threading a branch through the marble/terrain/outline shading further
-    // down, since these two views visualize the *coarse* pass's own numbers
-    // untouched by anything the fine pass itself does. Mode 1
-    // (`FineStepHeat`) is unaffected: it's handled by the existing
-    // `scene.misc3.x > 0.5` checks later in this function, which now only
-    // ever see mode 1 by the time they run, since modes 2/3 never reach
-    // them.
-    if (scene.misc3.x > 1.5) {
-        let coarse_dims = vec2<i32>(textureDimensions(coarse_tex));
-        let texel = clamp(vec2<i32>(mesh.uv * vec2<f32>(coarse_dims)), vec2<i32>(0), coarse_dims - vec2<i32>(1));
-        let sample = textureLoad(coarse_tex, texel, 0);
-        if (sample.r <= 0.0) {
-            // Coarse pass's own miss sentinel (`-1.0` in R, `mrrm.rs`'s
-            // doc) -- render as flat black in both modes rather than a
-            // meaningless color from a negative/`MAX_STEPS` value.
-            return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-        }
-        if (scene.misc3.x > 2.5) {
-            return vec4<f32>(coarse_distance_color(sample.r), 1.0);
-        }
-        return vec4<f32>(step_heat_color(sample.g / f32(MAX_STEPS)), 1.0);
-    }
-
     let ndc = vec2<f32>(mesh.uv.x * 2.0 - 1.0, 1.0 - mesh.uv.y * 2.0);
     let aspect = scene.misc.x;
     let ro = scene.cam_pos.xyz;
@@ -1022,6 +994,58 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         + scene.cam_up.xyz * ndc.y
         + scene.cam_forward.xyz * scene.cam_forward.w
     );
+
+    // View modes 2 (`CoarseStepHeat`) and 3 (`CoarseStepDistance`,
+    // `live_debug.rs`'s `DebugViewMode`) show the coarse pre-pass's own
+    // cached output for this pixel's texel, ignoring this fine march's
+    // `hit_frac`/`iters`/`t`/`marble_hit` entirely -- checked and returned
+    // here, before any of that (marble test, march, shading) even runs,
+    // which is both the semantically cleanest spot (these views are
+    // supposed to show the coarse pass's numbers *untouched* by anything
+    // the fine pass does) and the only spot that doesn't risk a later,
+    // unrelated `if` (`hit_frac`'s own `scene.misc3.x > 0.5` check, meant
+    // for mode 1 only) silently intercepting modes 2/3 too, since both are
+    // also `> 0.5` -- confirmed the hard way: an earlier version placed
+    // this after `if (hit_frac) {...}` instead, and modes 2/3 rendered
+    // (wrong) fine-pass-heatmap colors for every hit pixel, having fallen
+    // through that earlier check before ever reaching this one.
+    //
+    // The texture read itself, though, is NOT allowed to be conditioned on
+    // `scene.misc3.x` the way the rest of this block is: an earlier
+    // version wrapped the whole `textureLoad(coarse_tex, ...)` in the
+    // `scene.misc3.x > 1.5` check below, which is naga-valid (this
+    // module's own tests happily accept it) but reproducibly hung the GPU
+    // on a real WebGPU backend after a few frames. Reading it here
+    // unconditionally -- every pixel, top-level uniform flow -- and only
+    // *branching on the result* fixed it, the same fix shape as this
+    // const's own `marble_tex_sample` a bit further below (its doc has
+    // that incident's full story: an implicit-derivative texture read
+    // gated behind a non-uniform condition broke production once already).
+    // `textureLoad` isn't supposed to need this per the WGSL spec (unlike
+    // `textureSample`'s derivatives) -- a real browser-side gap between
+    // the spec and what's actually safe here, not a documented rule,
+    // bisected empirically against a live build.
+    let coarse_debug_dims = vec2<i32>(textureDimensions(coarse_tex));
+    let coarse_debug_texel = clamp(
+        vec2<i32>(mesh.uv * vec2<f32>(coarse_debug_dims)),
+        vec2<i32>(0),
+        coarse_debug_dims - vec2<i32>(1),
+    );
+    let coarse_debug_sample = textureLoad(coarse_tex, coarse_debug_texel, 0);
+    if (scene.misc3.x > 1.5) {
+        // Coarse pass's own miss sentinel (`-1.0` in R, `mrrm.rs`'s doc)
+        // defaults `color` to flat black rather than a meaningless color
+        // from a negative/`MAX_STEPS` value; overwritten below on a hit.
+        var color = vec3<f32>(0.0, 0.0, 0.0);
+        if (coarse_debug_sample.r > 0.0) {
+            if (scene.misc3.x > 2.5) {
+                color = coarse_distance_color(coarse_debug_sample.r);
+            } else {
+                color = step_heat_color(coarse_debug_sample.g / f32(MAX_STEPS));
+            }
+        }
+        return vec4<f32>(color, 1.0);
+    }
 
     // Angular size of one pixel (small-angle tangent, radians-ish), used as
     // a distance-scaled hit threshold (MMCE's \"fovray\"/cone-angle
@@ -1256,7 +1280,11 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         // there's no step count to show for them) and the miss/sky case
         // below gets its own distinct override rather than falling into
         // this gradient at the \"0 steps\" end, which would be visually
-        // ambiguous with a genuinely cheap real hit.
+        // ambiguous with a genuinely cheap real hit. Safe as a plain
+        // `> 0.5` even though `misc3.x` is now a 4-value selector, not a
+        // bool: modes 2 and 3 already returned at the very top of this
+        // function (before `hit_frac` was even computed), so nothing
+        // reaches this point with `misc3.x` above `1.0`.
         if (scene.misc3.x > 0.5) {
             let heat_frac = f32(iters) / f32(fine_max_steps);
             return vec4<f32>(step_heat_color(heat_frac), 1.0);
