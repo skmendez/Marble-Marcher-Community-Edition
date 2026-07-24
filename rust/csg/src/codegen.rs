@@ -689,19 +689,56 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
 
 /// The half-resolution shadow/AO pre-pass's fragment shader
 /// (`shadow_pass.rs`/`generate_shadow_shader`): ray setup, a ray-sphere
-/// clip, then a march warm-started from MRRM's existing coarse buffer (same
-/// technique `MARCHER`'s `fragment` uses, at this pass's own, coarser
-/// resolution), then `calc_normal`/`shadow` on a genuine hit, packed as
-/// `vec4(shadow_visibility, 0.0, 0.0, traveled_distance)`. The `A` channel
-/// (traveled distance) is what `MARCHER`'s `sample_shadow` needs for its
-/// depth-aware resample -- a miss (or bounding-sphere clip miss) writes
-/// `MAX_DIST` there deliberately: `sample_shadow`'s weighting is
+/// clip, then a march starting at the bounding-sphere clip entry point
+/// (`clip.x`) -- deliberately *not* warm-started from MRRM's coarse buffer,
+/// unlike `MARCHER`'s `fragment` -- then `calc_normal`/`shadow` on a genuine
+/// hit, packed as `vec4(shadow_visibility, 0.0, 0.0, traveled_distance)`.
+/// The `A` channel (traveled distance) is what `MARCHER`'s `sample_shadow`
+/// needs for its depth-aware resample -- a miss (or bounding-sphere clip
+/// miss) writes `MAX_DIST` there deliberately: `sample_shadow`'s weighting is
 /// `1/(sz^2+(td-td_i)^2)`, so a \"far away\" sentinel just gets naturally
 /// down-weighted against a real nearby hit rather than needing a branch on
 /// the fine-pass side. Doesn't need full fractal fidelity (only an
 /// approximate occlusion test), so its shader is generated with a reduced
 /// `Fold::Repeat` iteration count, same as `COARSE_MARCHER` (see
 /// `CodeWriter::iteration_divisor`).
+///
+/// This pass used to warm-start its own march from a single, uninterpolated
+/// nearest-texel read of the coarse pass's cached hit distance (same
+/// technique `MARCHER` uses), gated behind the same `scene.misc.w` MRRM
+/// flag. Removed this session after a live investigation (mobile bug
+/// report: the *entire* visible terrain on the default
+/// `menger_oscillating_sphere` scene flipping between flat full-sun and flat
+/// full-shadow under a camera nudge of a few hundredths of a unit) traced it
+/// to this exact warm-start: the coarse pass's DE runs at
+/// `COARSE_ITERATION_DIVISOR`-reduced fold iterations, and near a
+/// Menger-fold crease Enhanced Sphere Tracing can have multiple close
+/// candidate roots -- a single nearest-texel, non-interpolated sample of
+/// that cheapened DE can warm-start this march onto a different fold than
+/// the true nearest surface, especially right at a crease. Unlike the fine
+/// pass's own coarse warm-start (this session's `sky_confirmed_miss`, doc
+/// above, added a `map()`-based corroboration probe specifically because
+/// this failure mode is real), this pass's hit point feeds directly into
+/// the sun-shadow test *and*, via the fine pass's own separately-gated
+/// shadow-tier warm-start reuse (`MARCHER`'s `fragment` doc), can propagate
+/// a wrong fold into the fine pass's own warm-start too -- so a wrong fold
+/// here isn't merely extra steps (self-correcting, see `march_scene`'s
+/// over-relaxation doc), it's a materially wrong shadow value that can flip
+/// for the whole frame at once, since every pixel's coarse texel is subject
+/// to the same near-crease instability under a small camera change.
+/// Confirmed live this session: at a fixed camera angle on the default
+/// scene, with only trivial (<0.5-unit) camera drift from the marble
+/// settling under gravity, cycling `mrrm` on/off/on swung the *fine* pass's
+/// own avg steps/px between roughly 9.9 -> 11.3 -> 6.2 -- i.e. the
+/// coarse-driven warm-start chain (coarse -> shadow -> fine) is genuinely
+/// unstable under tiny position changes on this scene, matching the
+/// hypothesis. This pass is already half-resolution with only
+/// `SHADOW_STEPS` (16) fixed iterations, so the warm-start's perf upside
+/// here is small next to the fine pass's own (measured, real) MRRM win --
+/// not worth the correctness risk. The coarse-texture binding
+/// (`COARSE_TEXTURE_BINDING`) is still declared in this pass's generated
+/// source and bind-group layout (`shadow_pass.rs`'s `ShadowMarcherMaterial`)
+/// so neither needs restructuring, it's simply unread now.
 const SHADOW_MARCHER: &str = "\
 @fragment
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
@@ -725,30 +762,14 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(1.0, 0.0, 0.0, MAX_DIST);
     }
 
-    var t0 = clip.x;
-    // Gated behind the same `misc.w` MRRM flag as the fine pass's own
-    // warm-start read (`MARCHER`'s `fragment`), for the same two reasons:
-    // `?mrrm=0` should mean \"no pass consumes the coarse guess\" (the
-    // documented pre-MRRM-behavior fallback), and executing a
-    // texture-fetch-derived value into `march_scene`'s starting `t` is the
-    // exact data flow that segfaults llvmpipe's shader JIT
-    // (`COARSE_TEXTURE_BINDING`'s doc) -- the runtime skip is what makes
-    // headless/software-Vulkan runs of this pass possible at all.
-    if (scene.misc.w > 0.5) {
-        let coarse_dims = vec2<i32>(textureDimensions(coarse_tex));
-        let texel = clamp(
-            vec2<i32>(mesh.uv * vec2<f32>(coarse_dims)),
-            vec2<i32>(0),
-            coarse_dims - vec2<i32>(1),
-        );
-        let coarse_t = textureLoad(coarse_tex, texel, 0).r;
-        if (coarse_t > 0.0) {
-            let coarse_pixel_angle = 2.0 * half_fov / max(f32(coarse_dims.y), 1.0);
-            t0 = max(t0, coarse_t - coarse_t * coarse_pixel_angle);
-        }
-    }
-
-    let march = march_scene(ro, rd, t0, pixel_angle, clip.y, MAX_STEPS);
+    // Deliberately *not* warm-started from MRRM's coarse buffer -- see this
+    // constant's own doc above for why (a real correctness bug: a single
+    // uninterpolated nearest-texel read of the coarse pass's cheapened-fold
+    // DE could land this march on the wrong fold near a Menger-fold crease,
+    // producing a materially wrong shadow value rather than just extra
+    // steps). Always starts at the bounding-sphere clip entry point, the
+    // same behavior every pass has when `?mrrm=0`.
+    let march = march_scene(ro, rd, clip.x, pixel_angle, clip.y, MAX_STEPS);
     if (!march.hit) {
         return vec4<f32>(1.0, 0.0, 0.0, MAX_DIST);
     }
@@ -1741,13 +1762,14 @@ pub fn generate_coarse_shader(obj: &Object) -> String {
 
 /// Full fragment shader for the app's half-resolution shadow/AO pre-pass
 /// (`shadow_pass.rs`): import line + bindings + the MRRM coarse-texture
-/// binding (this pass warm-starts its own march from it, same as the fine
-/// pass) + library + a reduced-iteration copy of the scene functions (same
-/// `COARSE_ITERATION_DIVISOR` as the coarse pass -- this pass only needs an
-/// approximate occlusion test, not full fractal fidelity either) + shared
-/// march core + shared shading core + the `fragment` entry (see
-/// `SHADOW_MARCHER`'s doc). Wholly separate module from both
-/// `generate_shader` and `generate_coarse_shader`, same "fixed
+/// binding (kept for bind-group-layout parity with `ShadowMarcherMaterial`
+/// only -- no longer read by the fragment body, see `SHADOW_MARCHER`'s doc
+/// for why its warm-start was removed) + library + a reduced-iteration copy
+/// of the scene functions (same `COARSE_ITERATION_DIVISOR` as the coarse
+/// pass -- this pass only needs an approximate occlusion test, not full
+/// fractal fidelity either) + shared march core + shared shading core + the
+/// `fragment` entry (see `SHADOW_MARCHER`'s doc). Wholly separate module
+/// from both `generate_shader` and `generate_coarse_shader`, same "fixed
 /// `\"fragment\"` entry-point name per `Material2d`" reasoning as
 /// `COARSE_MARCHER`'s doc.
 pub fn generate_shadow_shader(obj: &Object) -> String {
