@@ -42,6 +42,21 @@
         height: 20px;
       }
     }
+    /* dat.gui's bottom close button ships as `position: absolute`, sized
+       for dat.gui's own auto-place container (whose height tracks the open
+       list for it). Inside our height-follows-content container an
+       absolutely-positioned button contributes no height, so a *closed*
+       panel collapses to 0px total and the "Open Controls" bar renders
+       clipped outside the container's own bottom-anchored, overflow-clipped
+       box -- i.e. a closed panel was completely invisible with no way to
+       reopen it. Phones start collapsed (setUpConfigPanel), which is
+       exactly the reported "panel doesn't show up on my phone at all"
+       bug; desktop starts open, which is why it never reproduced there
+       (though manually closing had the same trap). Static flow makes a
+       closed panel exactly one visible "Open Controls" bar tall. */
+    #config-gui .dg.main .close-button {
+      position: static;
+    }
     /* GPU profiling overlay (see setUpGpuProfileOverlay below): styled to
        read as part of the same developer HUD as the dat.gui controls panel
        (dark semi-transparent backing, monospace, rounded corners) rather
@@ -68,11 +83,17 @@
        running any server-side code of its own -- see net.js, which is the
        only thing that talks to the `Peer`/`DataConnection` objects this
        script defines; rust/app/src/net.rs only ever calls net.js's narrow
-       poll-based API. Loaded from a CDN (unpkg) rather than vendored, so
-       this is a real runtime dependency on that CDN and on 0.peerjs.com's
-       broker being reachable -- both are only needed to *establish* a
-       connection, not for gameplay traffic once connected. -->
-  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+       poll-based API. Vendored locally (`vendor/peerjs.min.js`, PeerJS
+       1.5.4) rather than loaded from unpkg: a CDN script that fails to
+       load (flaky mobile network, content blocker, captive portal) used to
+       take the whole feature down silently, and the sibling dat.gui CDN
+       load's failure took the *entire controls panel* down the same way --
+       diagnosed reproducibly in a headless-Chromium repro of exactly the
+       reported "panel doesn't show up on my phone" symptom ("dat is not
+       defined" -> setUpConfigPanel throws -> no panel, game otherwise
+       fine). The broker (0.peerjs.com) is still a runtime dependency for
+       *establishing* connections -- that part can't be vendored. -->
+  <script src="./vendor/peerjs.min.js"></script>
   <script src="./net.js"></script>
   <!-- Always-run JS bridge state: two independent groups of
        `window.mmNet.*` assignments that Rust calls through plain
@@ -140,7 +161,9 @@
        the panel still exists (for the copy-link row) but shows nothing
        else -- effectively a single "copy invite link" button, not the
        full technical control surface. -->
-  <script src="https://unpkg.com/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+  <!-- Vendored (dat.gui 0.7.9) -- see the PeerJS vendoring note above for
+       why nothing UI-critical loads from a CDN anymore. -->
+  <script src="./vendor/dat.gui.min.js"></script>
   <script>
     (function setUpConfigPanel() {
       const params = new URLSearchParams(location.search);
