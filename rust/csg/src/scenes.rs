@@ -325,17 +325,25 @@ pub const DONUT_THICKNESS: f32 = 0.15;
 
 /// Base ("dough") albedo, set by `OrbitInit` before the angular folds --
 /// each channel is then lifted by [`DONUT_STRIPE_COLOR`]'s position term
-/// wherever that term exceeds it (`OrbitMax` is a componentwise max).
-const DONUT_BASE_COLOR: Vec3 = Vec3::new(0.42, 0.24, 0.14);
+/// wherever that term exceeds it (`OrbitMax` is a componentwise max). The
+/// blue channel is deliberately near-zero: it's the angular-stripe channel,
+/// and its *contrast* is `stripe_term - base` after the shader's Reinhard
+/// compression, so a low floor is what makes the bands actually visible
+/// (the first attempt's 0.14 floor + weak coefficient survived compression
+/// as a barely-there tint).
+const DONUT_BASE_COLOR: Vec3 = Vec3::new(0.50, 0.26, 0.04);
 
 /// Per-component scale on the *wedge-folded* position fed to `OrbitMax`
-/// (`orbit = max(orbit, p.xyz * this)`): inside the fold wedge `x` runs
-/// ~`major - minor ..= major + minor` (radial: outer wall warmer), `y` runs
-/// `-minor ..= minor` (slight top brightening), and `z` runs `0 ..= x`
-/// (the angular coordinate within the wedge -- this is the stripe term,
-/// rising from the wedge seam to its far edge and mirroring back, giving
-/// [`DONUT_SYMMETRY`] pink bands around the ring).
-const DONUT_STRIPE_COLOR: Vec3 = Vec3::new(0.16, 0.10, 0.28);
+/// (`orbit = max(orbit, p.xyz * this)`), one spatial axis per channel:
+///  - `r <- x` (tube-radial, `~major - minor ..= major + minor`): the outer
+///    wall runs warmer than the inner wall, a constant cross-tunnel cue.
+///  - `g <- y` (height): the ceiling lifts toward yellow-green, floor stays
+///    dark -- an up/down cue that also halos the skylights.
+///  - `b <- z` (angular coordinate within the wedge, `0 ..= ~x`): the
+///    stripe term -- climbs from each wedge seam to its far edge and
+///    mirrors back, giving [`DONUT_SYMMETRY`] violet bands around the ring
+///    that recede with the tunnel's curve.
+const DONUT_STRIPE_COLOR: Vec3 = Vec3::new(0.20, 0.30, 0.45);
 
 /// How many skylights/stripe repeats around the ring: 3 plane folds halve
 /// the angular domain three times, `2^3 = 8` copies of the fold wedge.
