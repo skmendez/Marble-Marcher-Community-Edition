@@ -318,8 +318,6 @@ pub(crate) mod js_bridge {
         pub fn send_to(idx: u8, bytes: &[u8]);
         #[wasm_bindgen(js_namespace = mmNet, js_name = status)]
         pub fn status() -> i32;
-        #[wasm_bindgen(js_namespace = mmNet, js_name = hostedId)]
-        pub fn hosted_id() -> String;
         #[wasm_bindgen(js_namespace = mmNet, js_name = takeError)]
         pub fn take_error() -> String;
         #[wasm_bindgen(js_namespace = mmNet, js_name = takeReceived)]
@@ -330,10 +328,6 @@ pub(crate) mod js_bridge {
         pub fn newly_connected_indices() -> Vec<u8>;
         #[wasm_bindgen(js_namespace = mmNet, js_name = newlyDisconnectedIndices)]
         pub fn newly_disconnected_indices() -> Vec<u8>;
-        #[wasm_bindgen(js_namespace = mmNet, js_name = copyToClipboard)]
-        pub fn copy_to_clipboard(text: &str);
-        #[wasm_bindgen(js_namespace = mmNet, js_name = takeClipboardStatus)]
-        pub fn take_clipboard_status() -> i32;
         // GPU-timestamp-query profiling (`gpu_profile.rs`) -- reports the
         // last-resolved duration (milliseconds, `-1.0` sentinel for "not
         // yet available") for each of the 4 named passes, plus whether
@@ -380,9 +374,6 @@ pub(crate) mod js_bridge {
     pub fn status() -> i32 {
         0
     }
-    pub fn hosted_id() -> String {
-        String::new()
-    }
     pub fn take_error() -> String {
         String::new()
     }
@@ -397,10 +388,6 @@ pub(crate) mod js_bridge {
     }
     pub fn newly_disconnected_indices() -> Vec<u8> {
         Vec::new()
-    }
-    pub fn copy_to_clipboard(_text: &str) {}
-    pub fn take_clipboard_status() -> i32 {
-        0
     }
     pub fn report_pass_timings(_supported: bool, _coarse_ms: f64, _shadow_ms: f64, _fine_ms: f64, _present_ms: f64) {}
     pub fn report_step_data(_avg_iters_per_px: f64, _estimated_total_steps: f64) {}
@@ -480,27 +467,17 @@ pub enum Role {
 }
 
 /// Whole-session networking state — one per app, inserted at [`Startup`].
+///
+/// The invite link itself is deliberately *not* tracked here anymore: the
+/// whole share flow (build `?join=<id>` URL from `mmNet.hostedId()`, write
+/// the clipboard, show feedback) lives in `web/index.html`'s controls
+/// panel now, entirely in JS -- the id never needed to round-trip through
+/// wasm just to end up back in a browser clipboard call.
 #[derive(Resource)]
 pub struct NetSession {
     pub role: Role,
     pub status: NetStatus,
-    /// The shareable link's query-string suffix (`?join=<id>`), populated
-    /// once `net.js`'s `host()` callback reports an assigned id. `None`
-    /// for a joiner (they never host) or before hosting's `open` event has
-    /// fired yet.
-    pub hosted_join_suffix: Option<String>,
     pub last_error: String,
-}
-
-impl NetSession {
-    /// The full, shareable invite URL, if one exists yet (hosting, with an
-    /// id already assigned) -- shared by [`sync_net_ui_text`] (displays it)
-    /// and [`handle_copy_button_click`] (copies it), so there's exactly one
-    /// place that assembles a link from `page_url_base` + the join suffix.
-    fn current_link(&self) -> Option<String> {
-        let suffix = self.hosted_join_suffix.as_ref()?;
-        Some(page_url_base().map_or_else(|| suffix.clone(), |base| format!("{base}{suffix}")))
-    }
 }
 
 /// `Startup` system: reads `?join=` (via the same `web_config::query_param`
@@ -508,21 +485,20 @@ impl NetSession {
 /// client's [`Role`], then calls `net.js`'s `host()`/`join()` exactly once.
 /// Unconditional — every session hosts by default, per the module doc.
 pub fn setup_networking(mut commands: Commands) {
-    let (role, hosted_join_suffix) = match query_param("join") {
+    let role = match query_param("join") {
         Some(host_id) => {
             js_bridge::join(&host_id);
-            (Role::Joiner, None)
+            Role::Joiner
         }
         None => {
             js_bridge::host();
-            (Role::Host, None)
+            Role::Host
         }
     };
     info!("multiplayer: starting as {role:?}");
     commands.insert_resource(NetSession {
         role,
         status: NetStatus::Idle,
-        hosted_join_suffix,
         last_error: String::new(),
     });
 }
@@ -534,87 +510,41 @@ pub fn setup_networking(mut commands: Commands) {
 /// boundary.
 pub fn poll_net_status(mut session: ResMut<NetSession>) {
     session.status = NetStatus::from_js(js_bridge::status());
-    if session.role == Role::Host && session.hosted_join_suffix.is_none() {
-        let id = js_bridge::hosted_id();
-        if !id.is_empty() {
-            // Deliberately just `?join=<id>` -- no `&scene=` hint. The
-            // host's actual scene (tree + params + animations) is sent
-            // over WebRTC itself (`NetMessage::SceneSync`, applied by
-            // `render::apply_pending_scene_sync`), which is the only
-            // copy that's ever authoritative; a URL-carried scene name
-            // would just be a second, redundant source that could disagree
-            // with it (a joiner opening a stale/shared link after the host
-            // switched scenes, for instance) with no way to ever be
-            // "wrong" about it -- not worth that divergence risk for what
-            // was only ever a cosmetic pre-sync guess.
-            session.hosted_join_suffix = Some(format!("?join={id}"));
-        }
-    }
     let err = js_bridge::take_error();
     if !err.is_empty() {
         session.last_error = err;
     }
 }
 
-/// The current page's origin + path, so [`sync_net_ui_text`] can show a
-/// complete, clickable/copyable URL rather than a bare `?join=<id>`
-/// suffix the user would have to know to append themselves. `None` on
-/// native (no browser location to read) or if the browser APIs are
-/// unavailable for some reason — callers fall back to showing the raw
-/// suffix in that case.
-#[cfg(target_arch = "wasm32")]
-fn page_url_base() -> Option<String> {
-    let location = web_sys::window()?.location();
-    Some(format!("{}{}", location.origin().ok()?, location.pathname().ok()?))
-}
+/// Marker for the networking status panel's root node (visibility) --
+/// `pub(crate)`: it appears in `sync_net_ui_text`'s public query type,
+/// which `main.rs` (a different module) needs to be able to name when
+/// registering that system — same reasoning as this codebase's other UI
+/// marker components (`mrrm.rs`'s `CoarseCamera`/`CoarseQuad`, `touch.rs`'s
+/// debug markers).
+#[derive(Component)]
+pub(crate) struct NetStatusPanel;
 
-#[cfg(not(target_arch = "wasm32"))]
-fn page_url_base() -> Option<String> {
-    None
-}
-
-/// Marker for the on-screen networking status/invite-link text. `pub(crate)`:
-/// it appears in `sync_net_ui_text`'s public query type, which `main.rs` (a
-/// different module) needs to be able to name when registering that system
-/// — same reasoning as this codebase's other UI marker components
-/// (`mrrm.rs`'s `CoarseCamera`/`CoarseQuad`, `touch.rs`'s debug markers).
+/// Marker for the panel's status `Text` -- same `pub(crate)` reasoning as
+/// [`NetStatusPanel`].
 #[derive(Component)]
 pub(crate) struct NetStatusText;
 
-/// Marker for the "Copy Link" button itself (the `Button`-required `Node`,
-/// not its label) -- `pub(crate)` for the same reason as [`NetStatusText`].
-#[derive(Component)]
-pub(crate) struct CopyLinkButton;
-
-/// Marker for the button's `Text` child, so [`handle_copy_button_click`]/
-/// [`update_copy_feedback`] can update the label without also touching the
-/// button `Node` it's attached to.
-#[derive(Component)]
-pub(crate) struct CopyLinkButtonLabel;
-
-const COPY_BUTTON_IDLE_TEXT: &str = "Copy Link";
-
-/// How long "Copied!"/"Copy failed" stays on the button before it reverts
-/// to [`COPY_BUTTON_IDLE_TEXT`] -- long enough to actually read, short
-/// enough that a second click shortly after isn't confusingly stuck on
-/// stale feedback from the first.
-const COPY_FEEDBACK_SECONDS: f64 = 1.5;
-
-/// Tracks the transient "just clicked" feedback state so
-/// [`update_copy_feedback`] knows what the button should say right now and
-/// when to revert it back to [`COPY_BUTTON_IDLE_TEXT`] -- separate from
-/// [`NetSession`] since this is pure UI-feedback timing, nothing else in
-/// the app cares about it. `None` means the button is showing its idle
-/// label; `Some((shown_at, message))` means it's showing `message` until
-/// `shown_at + COPY_FEEDBACK_SECONDS`.
-#[derive(Resource, Default)]
-pub(crate) struct CopyFeedback(Option<(f64, String)>);
-
-/// `Startup` system: spawns the always-present networking status readout
-/// (top-right, so it doesn't collide with the debug overlays' top-left
-/// stack — `fps_overlay.rs`, `touch.rs`). Chained after `setup_networking`
-/// (`main.rs`) purely for readability (it doesn't actually read
-/// `NetSession` yet — [`sync_net_ui_text`] does that every frame).
+/// `Startup` system: spawns the networking status readout (top-right, so it
+/// doesn't collide with the debug overlays' top-left stack —
+/// `fps_overlay.rs`, `touch.rs`). Starts hidden: this panel only surfaces
+/// *events worth reacting to* (peer connected/disconnected, errors) — see
+/// [`sync_net_ui_text`]. The old always-on "Share this link to play
+/// together: <URL>" text and in-canvas "Copy Link" button that used to live
+/// here are gone: on a phone the ~420px URL panel overlapped the top-left
+/// debug overlay into an unreadable jumble, and the URL itself was never
+/// selectable anyway (bevy_ui text is canvas pixels, not DOM text). The
+/// entire share flow is `web/index.html`'s controls-panel "copy invite
+/// link" row now.
+///
+/// Chained after `setup_networking` (`main.rs`) purely for readability (it
+/// doesn't actually read `NetSession` yet — [`sync_net_ui_text`] does that
+/// every frame).
 pub fn spawn_net_ui(mut commands: Commands) {
     commands
         .spawn((
@@ -627,148 +557,79 @@ pub fn spawn_net_ui(mut commands: Commands) {
                 ..default()
             },
             BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            Visibility::Hidden,
+            NetStatusPanel,
         ))
         .with_child((
-            Text::new("connecting..."),
+            Text::new(""),
             TextFont { font_size: 16.0, ..default() },
             TextColor(Color::srgb(0.6, 0.85, 1.0)),
             NetStatusText,
         ));
-
-    // Separate node from the status text above (not a child of it): bevy_ui
-    // text is drawn straight to the canvas, not real DOM text, so there is
-    // nothing for the browser's normal copy/selection handling to grab --
-    // this button is the actual way to get the invite link onto the
-    // clipboard. Hidden (`Display::None`) until `update_copy_button_visibility`
-    // finds a real link to copy; clicking before then would just copy
-    // nothing useful, so there's no point showing it yet.
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(46.0),
-                right: Val::Px(6.0),
-                padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
-                display: Display::None,
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.2, 0.4, 0.6, 0.85)),
-            Button,
-            CopyLinkButton,
-        ))
-        .with_child((
-            Text::new(COPY_BUTTON_IDLE_TEXT),
-            TextFont { font_size: 16.0, ..default() },
-            TextColor(Color::WHITE),
-            CopyLinkButtonLabel,
-        ));
 }
 
-/// `Update` system: shows the copy button only once there's an actual link
-/// to copy (hosting, with a broker-assigned id) — a joiner, or a host that
-/// hasn't received its id yet, has nothing useful to copy.
-pub fn update_copy_button_visibility(session: Res<NetSession>, mut node: Query<&mut Node, With<CopyLinkButton>>) {
-    let Ok(mut node) = node.single_mut() else { return };
-    let display = if session.current_link().is_some() { Display::Flex } else { Display::None };
-    if node.display != display {
-        node.display = display;
-    }
-}
-
-/// `Update` system: the actual copy action. `Interaction` is driven by
-/// mouse *and* touch alike (`bevy_ui::focus::ui_focus_system` reads
-/// `Res<Touches>` directly, not just `ButtonInput<MouseButton>`), so this
-/// needs no separate touch-handling path — the whole point of this button,
-/// since this app targets phones as much as desktop.
-///
-/// Calls `copy_to_clipboard` synchronously from inside this click-triggered
-/// system, in the same frame the `Interaction::Pressed` transition is
-/// observed — the browser Clipboard API only grants permission when
-/// invoked synchronously within a real user-gesture callstack, so this
-/// can't be deferred (e.g. queued and handled a frame later) without
-/// silently losing that permission.
-pub fn handle_copy_button_click(
-    session: Res<NetSession>,
-    mut feedback: ResMut<CopyFeedback>,
-    time: Res<Time>,
-    interactions: Query<&Interaction, (Changed<Interaction>, With<CopyLinkButton>)>,
-) {
-    let Ok(interaction) = interactions.single() else { return };
-    if *interaction != Interaction::Pressed {
-        return;
-    }
-    let Some(link) = session.current_link() else { return };
-    js_bridge::copy_to_clipboard(&link);
-    // Immediate feedback that the click registered, ahead of the async
-    // write actually resolving (typically near-instant, but the click and
-    // its result land on different frames regardless — see
-    // `update_copy_feedback`, which overwrites this once the real result
-    // arrives).
-    feedback.0 = Some((time.elapsed_secs_f64(), "Copying...".to_string()));
-}
-
-/// `Update` system: polls the async clipboard-write result
-/// (`takeClipboardStatus`) and drives the button label between its idle
-/// text and "Copied!"/"Copy failed" feedback, reverting automatically
-/// after `COPY_FEEDBACK_SECONDS` — separate from `handle_copy_button_click`
-/// since the result arrives on a later frame than the click that triggered
-/// it (the clipboard write is async even though *invoking* it must be
-/// synchronous — see that system's doc).
-pub fn update_copy_feedback(
-    time: Res<Time>,
-    mut feedback: ResMut<CopyFeedback>,
-    mut label: Query<&mut Text, With<CopyLinkButtonLabel>>,
-) {
-    let now = time.elapsed_secs_f64();
-    match js_bridge::take_clipboard_status() {
-        1 => feedback.0 = Some((now, "Copied!".to_string())),
-        2 => feedback.0 = Some((now, "Copy failed".to_string())),
-        _ => {}
-    }
-
-    let Ok(mut label) = label.single_mut() else { return };
-    match &feedback.0 {
-        Some((shown_at, message)) if now - shown_at < COPY_FEEDBACK_SECONDS => {
-            label.0 = message.clone();
-        }
-        Some(_) => {
-            feedback.0 = None;
-            label.0 = COPY_BUTTON_IDLE_TEXT.to_string();
-        }
-        None => {}
-    }
-}
+/// How long the "Player connected!" toast stays up. `Connected` is a
+/// steady *state* (it holds for the whole session), but as a *message*
+/// it's only news for a moment — unlike `Disconnected`/`Error`, which
+/// describe an ongoing actionable condition and therefore stay visible for
+/// as long as they hold.
+const CONNECTED_TOAST_SECONDS: f64 = 4.0;
 
 /// `Update` system: renders [`NetSession`]'s current state into
-/// [`NetStatusText`] — the one place a human (not just `net.rs` itself)
-/// finds out there's an invite link to share, or that a peer connected.
+/// [`NetStatusText`], hiding the panel entirely for the two "nothing to
+/// react to" states — `Idle`/`Hosting` are the steady state of every solo
+/// session from startup onward (every session hosts by default, module
+/// doc), so a visible readout for them is permanent screen clutter that
+/// says nothing actionable; the invite link lives in the controls panel
+/// (`spawn_net_ui`'s doc). Disconnected/Error show for as long as they
+/// hold; Connected shows as a transient toast ([`CONNECTED_TOAST_SECONDS`],
+/// re-armed on every fresh transition into `Connected`, so a reconnect
+/// announces itself again).
 ///
 /// Compares before assigning: writing through `Text`'s `DerefMut` marks the
 /// component `Changed` unconditionally, regardless of whether the new value
 /// actually differs (Bevy's change detection triggers on the mutable
 /// access itself, not a value-equality check) — this system runs every
-/// frame, and `session.status` sits at the same value (`Idle`, i.e.
-/// "connecting...") for the entire time a peer hasn't connected, so an
-/// unconditional write here was re-triggering bevy_text/bevy_ui's glyph
-/// reshaping and GPU bind-group upload every single frame for no reason.
-/// Confirmed directly this session: with the marcher's own (unrelated,
-/// separately fixed) GPU buffer leak eliminated and `as_bind_group` on all
-/// three marcher materials verified to fire zero times after startup, this
-/// was the actual remaining source of ongoing `createBindGroup` growth
-/// (measured in production, present even with the debug overlay disabled
-/// — this UI panel is always visible, unlike that overlay).
-pub fn sync_net_ui_text(session: Res<NetSession>, mut text: Query<&mut Text, With<NetStatusText>>) {
+/// frame at a steady status value, and an unconditional write here was
+/// re-triggering bevy_text/bevy_ui's glyph reshaping and GPU bind-group
+/// upload every single frame for no reason. Confirmed directly against
+/// production in an earlier session: with the marcher's own (unrelated,
+/// separately fixed) GPU buffer leak eliminated, this was the actual
+/// remaining source of ongoing `createBindGroup` growth.
+pub fn sync_net_ui_text(
+    session: Res<NetSession>,
+    time: Res<Time>,
+    mut connected_since: Local<Option<f64>>,
+    mut panels: Query<&mut Visibility, With<NetStatusPanel>>,
+    mut text: Query<&mut Text, With<NetStatusText>>,
+) {
+    let Ok(mut visibility) = panels.single_mut() else { return };
     let Ok(mut text) = text.single_mut() else { return };
+    let now = time.elapsed_secs_f64();
+    // Edge-detect the transition into `Connected` for the toast timer;
+    // leaving `Connected` clears it so a reconnect re-announces.
+    if session.status == NetStatus::Connected {
+        if connected_since.is_none() {
+            *connected_since = Some(now);
+        }
+    } else {
+        *connected_since = None;
+    }
     let new_text = match session.status {
-        NetStatus::Idle => "connecting...".to_string(),
-        NetStatus::Hosting => match session.current_link() {
-            Some(link) => format!("Share this link to play together:\n{link}"),
-            None => "starting host...".to_string(),
-        },
-        NetStatus::Connected => "Player connected!".to_string(),
-        NetStatus::Disconnected => "Other player disconnected — still playing solo.".to_string(),
-        NetStatus::Error => format!("Network error: {}", session.last_error),
+        NetStatus::Idle | NetStatus::Hosting => None,
+        NetStatus::Connected => connected_since
+            .filter(|&since| now - since < CONNECTED_TOAST_SECONDS)
+            .map(|_| "Player connected!".to_string()),
+        NetStatus::Disconnected => {
+            Some("Other player disconnected — still playing solo.".to_string())
+        }
+        NetStatus::Error => Some(format!("Network error: {}", session.last_error)),
     };
+    let desired = if new_text.is_some() { Visibility::Visible } else { Visibility::Hidden };
+    if *visibility != desired {
+        *visibility = desired;
+    }
+    let new_text = new_text.unwrap_or_default();
     if text.0 != new_text {
         text.0 = new_text;
     }

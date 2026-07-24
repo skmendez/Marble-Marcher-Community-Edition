@@ -38,10 +38,7 @@ use gpu::MarcherGpuPlugin;
 use gpu_profile::GpuProfilePlugin;
 use live_debug::{poll_live_debug_toggles, seed_live_debug_toggles};
 use mrrm::{resize_coarse_render_target, setup_mrrm_pipeline, sync_coarse_quad_scale, CoarseMarcherMaterial};
-use net::{
-    handle_copy_button_click, poll_net_status, setup_networking, spawn_net_ui, sync_net_ui_text,
-    update_copy_button_visibility, update_copy_feedback, CopyFeedback,
-};
+use net::{poll_net_status, setup_networking, spawn_net_ui, sync_net_ui_text};
 use param_ui::{param_ui_input, spawn_param_panel, update_param_panel_text};
 use perfprobe::{perfprobe_tick, spawn_perfprobe_overlay, update_perfprobe_overlay_text, PerfProbeState};
 use physics_sys::{marble_physics_tick, PendingSceneSync};
@@ -153,7 +150,6 @@ fn main() {
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<CameraOrbit>()
         .init_resource::<TouchDebugInfo>()
-        .init_resource::<CopyFeedback>()
         .init_resource::<PendingSceneSync>()
         .init_resource::<PerfProbeState>()
         // `setup` (below) inserts `SceneState`/`MarbleState`/
@@ -257,9 +253,6 @@ fn main() {
                     update_perfprobe_overlay_text,
                     draw_thrust_debug.run_if(|config: Res<Config>| config.debug_enabled),
                     poll_net_status,
-                    update_copy_button_visibility,
-                    handle_copy_button_click,
-                    update_copy_feedback,
                     sync_net_ui_text,
                 )
                     .chain(),
