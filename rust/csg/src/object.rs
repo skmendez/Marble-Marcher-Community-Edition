@@ -34,6 +34,37 @@ pub enum Object {
         base: Box<Object>,
         offset: ScalarValue,
     },
+    /// Hollow shell (no C++ counterpart): `de = |base.de| - thickness`,
+    /// i.e. the set of points within `thickness` of the base's *surface* --
+    /// a shell of total wall thickness `2·thickness`, walkable on the
+    /// outside and the inside alike. Unconditionally sound: every field in
+    /// this crate is 1-Lipschitz (the marching invariant), and for any
+    /// 1-Lipschitz `f`, `|f(p)| <= dist(p, {f = 0})` -- so `|de| - t` never
+    /// overestimates the distance to the shell, and it's *exact* wherever
+    /// the base's own field is exact.
+    Onion {
+        base: Box<Object>,
+        thickness: ScalarValue,
+    },
+    /// Linear interpolation between two objects: `de = mix(a.de, b.de, t)`,
+    /// `t` clamped to `[0, 1]`. A convex combination of 1-Lipschitz fields
+    /// is 1-Lipschitz, and any 1-Lipschitz field underestimates the
+    /// distance to its own zero set (see `Onion`'s doc), so the morph is a
+    /// **sound** DE at every `t` -- safe to march and collide against --
+    /// though not an exact SDF mid-blend (`|∇d| < 1` where the children's
+    /// gradients disagree; degenerating to near-0 exactly where a thin
+    /// feature is vanishing mid-morph). The clamp is load-bearing, not
+    /// cosmetic: extrapolating past `[0, 1]` makes the coefficient
+    /// magnitudes sum past 1, which breaks the Lipschitz bound and with it
+    /// soundness. With `t` as a `ScalarValue::Param` driven by a
+    /// tick-deterministic [`crate::expr::Expr`], this gives geometry that
+    /// morphs identically on every multiplayer peer through rollback, using
+    /// the animation machinery that already exists.
+    Morph {
+        a: Box<Object>,
+        b: Box<Object>,
+        t: ScalarValue,
+    },
 }
 
 impl Object {
@@ -61,6 +92,14 @@ impl Object {
             }
             Object::Offset { base, offset } => {
                 offset.handle_valid_for(slot_count) && base.handles_valid_for(slot_count)
+            }
+            Object::Onion { base, thickness } => {
+                thickness.handle_valid_for(slot_count) && base.handles_valid_for(slot_count)
+            }
+            Object::Morph { a, b, t } => {
+                t.handle_valid_for(slot_count)
+                    && a.handles_valid_for(slot_count)
+                    && b.handles_valid_for(slot_count)
             }
         }
     }
@@ -90,6 +129,17 @@ impl Object {
             // `offset / p.w` (`Offset(Sphere{r}, c)` == `Sphere{r + c}` at
             // any accumulated scale).
             Object::Offset { base, offset } => base.de(p, params) - offset.get(params) / p.w,
+            // `thickness` is in folded-local units, same as `Offset`'s
+            // `offset` -- hence the same `/ p.w`.
+            Object::Onion { base, thickness } => {
+                base.de(p, params).abs() - thickness.get(params) / p.w
+            }
+            // The `[0, 1]` clamp is a soundness requirement, not input
+            // hygiene -- see the variant's doc.
+            Object::Morph { a, b, t } => {
+                let t = t.get(params).clamp(0.0, 1.0);
+                (1.0 - t) * a.de(p, params) + t * b.de(p, params)
+            }
         }
     }
 
@@ -176,7 +226,84 @@ impl Object {
                 let side = if base.de(p, params) >= 0.0 { 1.0 } else { -1.0 };
                 np + dir * (side * offset.get(params) / len)
             }
+            // The nearest point on the shell is always on `p`'s *own* side
+            // of the base surface: the same-side face is `||a| - t|` away,
+            // the far face `|a| + t` -- so unlike `Offset`, no inside/
+            // outside sign flip. One formula covers outside the shell,
+            // inside the wall, and inside the base alike.
+            Object::Onion { base, thickness } => {
+                let np = base.nearest_point_scratch(p, params, hist);
+                let dir = p.truncate() - np;
+                let len = dir.length();
+                if len < 1e-9 {
+                    // `p` is (numerically) on the base surface -- the
+                    // shell's medial axis, where every direction ties; `np`
+                    // is within `thickness` of correct.
+                    return np;
+                }
+                np + dir * (thickness.get(params) / len)
+            }
+            Object::Morph { a, b, t } => {
+                let tv = t.get(params).clamp(0.0, 1.0);
+                // At the endpoints the morph *is* that child -- delegate
+                // exactly rather than paying (and slightly blurring
+                // through) the numerical projection below.
+                if tv <= 0.0 {
+                    a.nearest_point_scratch(p, params, hist)
+                } else if tv >= 1.0 {
+                    b.nearest_point_scratch(p, params, hist)
+                } else {
+                    // Mid-blend there is genuinely no closed form (the
+                    // surface is an implicit blend belonging to neither
+                    // child), so project onto the zero set numerically --
+                    // see `project_to_surface`'s doc for the accuracy
+                    // argument.
+                    self.project_to_surface(p, params)
+                }
+            }
         }
+    }
+
+    /// Nearest-point fallback for nodes whose surface has no closed form
+    /// (currently `Morph` mid-blend): damped Newton projection along the
+    /// numerically-estimated gradient, `x -= de(x) · ∇de/|∇de|`, using the
+    /// same 4-tap tetrahedral gradient stencil as the shader's
+    /// `calc_normal`.
+    ///
+    /// Accuracy: physics only asks for a nearest point once a sample is in
+    /// contact range (`de < marble radius`, `physics::collide`), so the
+    /// iteration starts already near the surface, where Newton on a sound
+    /// 1-Lipschitz field converges quadratically -- three steps lands far
+    /// below the smallest marble radius (0.02) for smooth blends (verified
+    /// by the analytic-morph tests below). The degenerate-gradient guard
+    /// covers the one place a morph's gradient legitimately collapses
+    /// toward zero: where a thin feature is mid-vanish, in which case `p`'s
+    /// current projection is returned as-is rather than dividing by ~0.
+    fn project_to_surface(&self, p: Vec4, params: &Params) -> Vec3 {
+        const K: f32 = 0.577_350_3; // 1/sqrt(3), unit tetrahedron vertex
+        let mut x = p.truncate();
+        for _ in 0..3 {
+            let d = self.de(x.extend(p.w), params);
+            // Same order of magnitude as the shader's normal-estimation
+            // epsilon; scaled up with distance from the origin so the
+            // finite differences stay above f32 noise on large-coordinate
+            // scenes.
+            let eps = 1e-4 * x.length().max(1.0);
+            let e1 = Vec3::new(K, -K, -K) * eps;
+            let e2 = Vec3::new(-K, -K, K) * eps;
+            let e3 = Vec3::new(-K, K, -K) * eps;
+            let e4 = Vec3::new(K, K, K) * eps;
+            let g = e1 * self.de((x + e1).extend(p.w), params)
+                + e2 * self.de((x + e2).extend(p.w), params)
+                + e3 * self.de((x + e3).extend(p.w), params)
+                + e4 * self.de((x + e4).extend(p.w), params);
+            let glen = g.length();
+            if glen < 1e-12 {
+                break;
+            }
+            x -= g * (d / glen);
+        }
+        x
     }
 
     /// A world-space `(center, radius)` bounding sphere for this object, or
@@ -224,6 +351,24 @@ impl Object {
                 let (c, r) = base.bounding_sphere(params)?;
                 Some((c, r + offset.get(params).max(0.0)))
             }
+            // The shell reaches `thickness` beyond the base surface, which
+            // the inflated-solid bound covers; the inner face only removes
+            // material. (Non-positive thickness means an empty shell --
+            // clamp so it can't shrink the pad below zero.)
+            Object::Onion { base, thickness } => {
+                let (c, r) = base.bounding_sphere(params)?;
+                Some((c, r + thickness.get(params).max(0.0)))
+            }
+            // Sound at every `t`: `mix(a, b, t) < 0` requires at least one
+            // of `a`/`b` to be negative, so the morph's solid is a subset
+            // of the two children's solids' union regardless of `t` --
+            // enclose both. Either child unbounded makes the morph
+            // potentially unbounded.
+            Object::Morph { a, b, t: _ } => {
+                let ba = a.bounding_sphere(params)?;
+                let bb = b.bounding_sphere(params)?;
+                Some(enclosing_sphere(ba, bb))
+            }
         }
     }
 
@@ -270,6 +415,17 @@ impl Object {
                 out.push(6);
                 offset.encode(out);
                 base.encode(out);
+            }
+            Object::Onion { base, thickness } => {
+                out.push(7);
+                thickness.encode(out);
+                base.encode(out);
+            }
+            Object::Morph { a, b, t } => {
+                out.push(8);
+                t.encode(out);
+                a.encode(out);
+                b.encode(out);
             }
         }
     }
@@ -329,6 +485,17 @@ impl Object {
                 let (offset, pos) = ScalarValue::decode_at(bytes, pos)?;
                 let (base, pos) = Object::decode_at(bytes, pos)?;
                 (Object::Offset { base: Box::new(base), offset }, pos)
+            }
+            7 => {
+                let (thickness, pos) = ScalarValue::decode_at(bytes, pos)?;
+                let (base, pos) = Object::decode_at(bytes, pos)?;
+                (Object::Onion { base: Box::new(base), thickness }, pos)
+            }
+            8 => {
+                let (t, pos) = ScalarValue::decode_at(bytes, pos)?;
+                let (a, pos) = Object::decode_at(bytes, pos)?;
+                let (b, pos) = Object::decode_at(bytes, pos)?;
+                (Object::Morph { a: Box::new(a), b: Box::new(b), t }, pos)
             }
             _ => return None,
         };
@@ -715,6 +882,196 @@ mod tests {
         let p = corner + diag * 0.75;
         let d = obj.de(p.extend(1.0), &params);
         assert!((d - 0.25).abs() < 1e-6, "rounded-corner de: {d}");
+    }
+
+    fn onion(base: Object, t: f32) -> Object {
+        Object::Onion {
+            base: Box::new(base),
+            thickness: ScalarValue::Const(t),
+        }
+    }
+
+    fn morph(a: Object, b: Object, t: f32) -> Object {
+        Object::Morph {
+            a: Box::new(a),
+            b: Box::new(b),
+            t: ScalarValue::Const(t),
+        }
+    }
+
+    /// A spherical shell has a closed-form CSG equivalent --
+    /// `Onion(Sphere{r}, t)` must equal `Difference(Sphere{r+t},
+    /// Sphere{r-t})` *everywhere* (their fields agree exactly: both reduce
+    /// to `max(|p|-r-t, r-t-|p|)` = `||p|-r| - t`), which pins the whole
+    /// `de` arm against an independently-computed exact answer.
+    #[test]
+    fn onion_sphere_matches_difference_of_spheres_exactly() {
+        let params = Params::new();
+        let shell = onion(sphere(2.0), 0.3);
+        let equivalent = Object::Difference(Box::new(sphere(2.3)), Box::new(sphere(1.7)));
+        for p in [
+            Vec4::new(5.0, 0.0, 0.0, 1.0),   // outside everything
+            Vec4::new(2.1, 0.4, -0.2, 1.0),  // inside the wall
+            Vec4::new(0.6, 0.5, 0.2, 1.0),   // inside the hollow
+            Vec4::new(2.3, 0.0, 0.0, 1.0),   // on the outer face
+            Vec4::new(3.0, -1.0, 2.0, 2.0),  // scaled w
+        ] {
+            let a = shell.de(p, &params);
+            let b = equivalent.de(p, &params);
+            assert!((a - b).abs() < 1e-6, "at {p:?}: onion={a} difference={b}");
+        }
+    }
+
+    #[test]
+    fn onion_nearest_point_hits_the_nearer_face_in_every_region() {
+        let params = Params::new();
+        let shell = onion(sphere(2.0), 0.3);
+        // Outside the shell: outer face.
+        let np = shell.nearest_point(Vec4::new(5.0, 0.0, 0.0, 1.0), &params);
+        assert!((np - Vec3::new(2.3, 0.0, 0.0)).length() < 1e-5, "outside: {np:?}");
+        // Inside the hollow: inner face.
+        let np = shell.nearest_point(Vec4::new(1.0, 0.0, 0.0, 1.0), &params);
+        assert!((np - Vec3::new(1.7, 0.0, 0.0)).length() < 1e-5, "hollow: {np:?}");
+        // Inside the wall, nearer the outer face.
+        let np = shell.nearest_point(Vec4::new(2.1, 0.0, 0.0, 1.0), &params);
+        assert!((np - Vec3::new(2.3, 0.0, 0.0)).length() < 1e-5, "in wall: {np:?}");
+    }
+
+    #[test]
+    fn onion_de_is_exact_under_a_scaling_fold() {
+        let params = Params::new();
+        let fold = || Fold::ScaleTranslate {
+            scale: ScalarValue::Const(2.0),
+            shift: Vec3Value::Const(Vec3::new(0.5, -1.0, 0.25)),
+        };
+        let onion_in_fold = Object::Fractal {
+            fold: fold(),
+            base: Box::new(onion(sphere(1.0), 0.25)),
+        };
+        let equivalent = Object::Fractal {
+            fold: fold(),
+            base: Box::new(Object::Difference(Box::new(sphere(1.25)), Box::new(sphere(0.75)))),
+        };
+        for p in [
+            Vec4::new(3.0, 1.0, -2.0, 1.0),
+            Vec4::new(0.1, 0.6, 0.0, 1.0),
+            Vec4::new(-0.3, 0.5, -0.1, 1.0),
+        ] {
+            let a = onion_in_fold.de(p, &params);
+            let b = equivalent.de(p, &params);
+            assert!((a - b).abs() < 1e-6, "at {p:?}: onion-in-fold={a} equivalent={b}");
+        }
+    }
+
+    #[test]
+    fn onion_bounding_sphere_pads_by_thickness() {
+        let params = Params::new();
+        let (c, r) = onion(sphere(2.0), 0.3).bounding_sphere(&params).unwrap();
+        assert_eq!(c, Vec3::ZERO);
+        assert!((r - 2.3).abs() < 1e-6);
+    }
+
+    /// At the endpoints the morph must *be* the corresponding child --
+    /// exact `de` and exact (delegated, not projected) `nearest_point`.
+    #[test]
+    fn morph_endpoints_match_children_exactly() {
+        let params = Params::new();
+        let probes = [
+            Vec4::new(3.0, 0.5, -1.0, 1.0),
+            Vec4::new(0.4, 0.2, 0.1, 1.0),
+            Vec4::new(-1.5, 2.0, 0.7, 2.0),
+        ];
+        let at_zero = morph(sphere(1.0), cuboid(Vec3::splat(1.0)), 0.0);
+        let at_one = morph(sphere(1.0), cuboid(Vec3::splat(1.0)), 1.0);
+        for p in probes {
+            assert!((at_zero.de(p, &params) - sphere(1.0).de(p, &params)).abs() < 1e-6);
+            assert!((at_one.de(p, &params) - cuboid(Vec3::splat(1.0)).de(p, &params)).abs() < 1e-6);
+        }
+        let p = Vec4::new(3.0, 0.5, -1.0, 1.0);
+        assert_eq!(at_zero.nearest_point(p, &params), sphere(1.0).nearest_point(p, &params));
+        assert_eq!(
+            at_one.nearest_point(p, &params),
+            cuboid(Vec3::splat(1.0)).nearest_point(p, &params)
+        );
+        // Out-of-range `t` clamps (a soundness requirement, the variant's
+        // doc) -- `t = 1.5` behaves exactly like `t = 1`.
+        let clamped = morph(sphere(1.0), cuboid(Vec3::splat(1.0)), 1.5);
+        assert!((clamped.de(p, &params) - cuboid(Vec3::splat(1.0)).de(p, &params)).abs() < 1e-6);
+    }
+
+    /// Concentric spheres are the analytic case: `mix(|p|-r1, |p|-r2, t)`
+    /// = `|p| - mix(r1, r2, t)`, an exact sphere SDF -- so both the morph
+    /// `de` and the Newton-projected `nearest_point` have a known exact
+    /// answer mid-blend, pinning the projection's real accuracy (not just
+    /// its self-consistency).
+    #[test]
+    fn morph_concentric_spheres_is_the_interpolated_sphere() {
+        let params = Params::new();
+        let m = morph(sphere(1.0), sphere(2.0), 0.3);
+        let expected = sphere(1.3);
+        for p in [
+            Vec4::new(3.0, 0.0, 0.0, 1.0),
+            Vec4::new(0.5, 0.4, -0.1, 1.0),
+            Vec4::new(-2.0, 1.0, 0.5, 2.0),
+        ] {
+            assert!((m.de(p, &params) - expected.de(p, &params)).abs() < 1e-6, "de at {p:?}");
+        }
+        let np = m.nearest_point(Vec4::new(3.0, 0.0, 0.0, 1.0), &params);
+        assert!((np - Vec3::new(1.3, 0.0, 0.0)).length() < 1e-3, "outside np: {np:?}");
+        let np = m.nearest_point(Vec4::new(0.5, 0.0, 0.0, 1.0), &params);
+        assert!((np - Vec3::new(1.3, 0.0, 0.0)).length() < 1e-3, "inside np: {np:?}");
+    }
+
+    /// Mid-blend of genuinely different shapes has no closed form to pin
+    /// against, so check the two properties collision response actually
+    /// relies on: the projected point sits on the morph surface
+    /// (`de(np) ~= 0`), and its distance from `p` is consistent with
+    /// `de(p)` (the same |p-np|-vs-de sanity the demo-scene test applies).
+    #[test]
+    fn morph_nearest_point_is_consistent_mid_blend() {
+        let params = Params::new();
+        let m = morph(sphere(1.0), cuboid(Vec3::splat(1.0)), 0.5);
+        for probe in [
+            Vec3::new(1.3, 0.2, 0.1),
+            Vec3::new(0.8, 0.8, 0.3),
+            Vec3::new(0.0, 1.2, 0.0),
+            Vec3::new(0.6, 0.6, 0.6),
+        ] {
+            let p = probe.extend(1.0);
+            let d = m.de(p, &params);
+            let np = m.nearest_point(p, &params);
+            let residual = m.de(np.extend(1.0), &params).abs();
+            assert!(residual < 2e-3, "probe {probe:?}: np {np:?} residual {residual}");
+            // `de` is a sound *underestimate* mid-blend (`|∇d| < 1` where
+            // the children's gradients disagree), so the true travel to the
+            // surface legitimately exceeds `|de|` -- assert exactly the
+            // soundness direction (never a surface closer than `de`
+            // promised), plus the same loose 2x upper factor the
+            // demo-scene consistency test uses.
+            let travel = (probe - np).length();
+            assert!(
+                travel + 1e-4 >= d.abs(),
+                "probe {probe:?}: found a surface point closer than de promised: \
+                 |p-np|={travel} vs |de|={}",
+                d.abs()
+            );
+            assert!(
+                travel <= 2.0 * d.abs().max(1e-3),
+                "probe {probe:?}: |p-np|={travel} wildly exceeds |de|={}",
+                d.abs()
+            );
+        }
+    }
+
+    #[test]
+    fn morph_bounding_sphere_encloses_both_children() {
+        let params = Params::new();
+        let m = morph(sphere(1.0), cuboid(Vec3::splat(2.0)), 0.5);
+        let (c, r) = m.bounding_sphere(&params).unwrap();
+        let (ca, ra) = sphere(1.0).bounding_sphere(&params).unwrap();
+        let (cb, rb) = cuboid(Vec3::splat(2.0)).bounding_sphere(&params).unwrap();
+        assert!(c.distance(ca) + ra <= r + 1e-4);
+        assert!(c.distance(cb) + rb <= r + 1e-4);
     }
 
     #[test]

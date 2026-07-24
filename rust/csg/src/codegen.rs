@@ -214,6 +214,42 @@ impl CodeWriter {
                 self.emit_object(base);
                 self.writeln(&format!("d = d - {} / {w_saved};", offset.wgsl()));
             }
+            Object::Onion { base, thickness } => {
+                // Same entry-time-`p.w` discipline as the `Offset` arm.
+                let w_saved = self.fresh("w_save");
+                self.writeln(&format!("let {w_saved} = p.w;"));
+                self.emit_object(base);
+                self.writeln(&format!("d = abs(d) - {} / {w_saved};", thickness.wgsl()));
+            }
+            // `emit_combine`'s save/restore shape, but the merge step is a
+            // `mix` instead of a comparison -- including the color pass's
+            // orbit, which must *blend* by the same factor rather than pick
+            // a side (a picked orbit would pop at `t = 0.5` where neither
+            // child "wins"). The `[0, 1]` clamp mirrors `Object::de`'s
+            // Morph arm; it is what keeps the emitted field 1-Lipschitz
+            // (sound) for out-of-range `t` params.
+            Object::Morph { a, b, t } => {
+                let p_saved = self.fresh("p_save");
+                self.writeln(&format!("let {p_saved} = p;"));
+                self.emit_object(a);
+                let dl = self.fresh("dl");
+                self.writeln(&format!("let {dl} = d;"));
+                self.writeln(&format!("p = {p_saved};"));
+                let ol = if self.color_pass {
+                    let name = self.fresh("ol");
+                    self.writeln(&format!("let {name} = orbit;"));
+                    Some(name)
+                } else {
+                    None
+                };
+                self.emit_object(b);
+                let tm = self.fresh("tm");
+                self.writeln(&format!("let {tm} = clamp({}, 0.0, 1.0);", t.wgsl()));
+                self.writeln(&format!("d = mix({dl}, d, {tm});"));
+                if let Some(ol) = &ol {
+                    self.writeln(&format!("orbit = mix({ol}, orbit, {tm});"));
+                }
+            }
         }
     }
 
@@ -2116,6 +2152,59 @@ struct VertexOutput {
         assert!(src.contains("let w_save_0 = p.w;"), "{src}");
         assert!(src.contains("d = d - 0.5 / w_save_0;"), "{src}");
         assert!(!src.contains("/ p.w;"), "must not divide by mutated p.w:\n{src}");
+    }
+
+    #[test]
+    fn onion_emission_takes_abs_before_the_saved_w_subtraction() {
+        let obj = Object::Onion {
+            base: Box::new(sphere(2.0)),
+            thickness: ScalarValue::Const(0.3),
+        };
+        let src = generate_scene_functions(&obj);
+        assert!(src.contains("d = abs(d) - 0.3 / w_save_0;"), "{src}");
+    }
+
+    #[test]
+    fn morph_emission_mixes_d_always_and_orbit_only_in_color_pass() {
+        let obj = Object::Morph {
+            a: Box::new(sphere(1.0)),
+            b: Box::new(cuboid(glam::Vec3::ONE)),
+            t: ScalarValue::Const(0.5),
+        };
+        let src = generate_scene_functions(&obj);
+        let split = src.find("fn col_scene").expect("col_scene present");
+        let (de_part, col_part) = src.split_at(split);
+        assert!(de_part.contains("d = mix(dl_"), "{de_part}");
+        assert!(de_part.contains(", 0.0, 1.0);"), "t must be clamped:\n{de_part}");
+        assert!(!de_part.contains("orbit = mix("), "{de_part}");
+        assert!(col_part.contains("d = mix(dl_"), "{col_part}");
+        assert!(col_part.contains("orbit = mix("), "{col_part}");
+    }
+
+    #[test]
+    fn onion_and_morph_shader_validates() {
+        // A morph whose children include an onion-of-fractal and a nested
+        // morph -- exercises the fresh-name discipline (nested p_save/dl/tm
+        // locals) plus the abs/w_save emission, through all four generated
+        // shader variants.
+        let mut params = Params::new();
+        let (classic_obj, _handles) = scenes::classic(&mut params);
+        let obj = Object::Morph {
+            a: Box::new(Object::Onion {
+                base: Box::new(classic_obj),
+                thickness: ScalarValue::Const(0.05),
+            }),
+            b: Box::new(Object::Morph {
+                a: Box::new(sphere(1.0)),
+                b: Box::new(cuboid(glam::Vec3::ONE)),
+                t: ScalarValue::Const(0.25),
+            }),
+            t: ScalarValue::Const(0.5),
+        };
+        validate_wgsl(&full_source(&obj));
+        validate_wgsl(&full_coarse_source(&obj));
+        validate_wgsl(&full_shadow_source(&obj));
+        validate_wgsl(&full_stepdata_source(&obj));
     }
 
     #[test]

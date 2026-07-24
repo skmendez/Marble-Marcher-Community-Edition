@@ -165,6 +165,24 @@ mod tests {
     }
 
     #[test]
+    fn onion_and_morph_round_trip() {
+        assert_object_round_trips(&Object::Onion {
+            base: Box::new(Object::Sphere { radius: ScalarValue::Const(2.0) }),
+            thickness: ScalarValue::Const(0.3),
+        });
+        let mut params = Params::new();
+        let t = params.alloc_scalar(0.5);
+        assert_object_round_trips(&Object::Morph {
+            a: Box::new(Object::Sphere { radius: ScalarValue::Const(1.0) }),
+            b: Box::new(Object::Onion {
+                base: Box::new(Object::Cuboid { half_extent: Vec3Value::Const(Vec3::ONE) }),
+                thickness: ScalarValue::Const(0.1),
+            }),
+            t: ScalarValue::Param(t),
+        });
+    }
+
+    #[test]
     fn deeply_nested_tree_round_trips() {
         let nested = Object::Union(
             Box::new(Object::Fractal {
