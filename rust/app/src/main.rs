@@ -118,6 +118,58 @@ fn main() {
                 // `WindowResized` events flow, resize-follow is free.
                 fit_canvas_to_parent: true,
                 present_mode: present_mode(&config),
+                // Live-site macOS crash investigation (external-display
+                // WindowServer hangs): a real user's `chrome://gpu` log
+                // showed `SharedImageManager::ProduceOverlay: ... non-
+                // existent mailbox` / "Invalid mailbox" firing every single
+                // rendered frame, forever, paired with a `GPU process crash
+                // count: 1`; matching macOS crash reports (`.ips` stackshots)
+                // show WindowServer's main thread wedged against its
+                // *external-display* CoreAnimation compositor thread
+                // specifically (both of the user's displays were external).
+                // `ProduceOverlay` is Chromium trying to hand our canvas's
+                // backing SharedImage straight to the OS compositor as a
+                // hardware overlay/direct-scanout plane (skipping
+                // Chromium's own GPU-process composite step) -- a real
+                // power/perf optimization for a fullscreen, alpha-ignored
+                // canvas exactly like ours (`CompositeAlphaMode::Auto`'s
+                // default, which wgpu's web backend always maps to
+                // `GPUCanvasAlphaMode::Opaque` -- wgpu-24.0.5's
+                // `backend/webgpu.rs::configure`). "Opaque, alpha channel
+                // ignored, sole fullscreen content" is the textbook profile
+                // overlay/direct-scanout paths target (no per-pixel
+                // blending needed against anything beneath), so it's a
+                // plausible, if unconfirmed, contributor to *why* this
+                // canvas specifically gets promoted down that path for
+                // this user.
+                //
+                // `PreMultiplied` is the one other alpha mode wgpu's web
+                // backend actually accepts without panicking (`PostMultiplied`/
+                // `Inherit` panic there -- same `configure` fn) -- it marks
+                // the canvas's swap-chain texture as alpha-*respected*
+                // during compositing rather than force-ignored. Every
+                // fragment shader this app ships (`csg::codegen`'s
+                // generated fine-pass shader, `render.rs`'s
+                // `PRESENT_SHADER_WGSL`) always writes alpha = 1.0, so this
+                // is a *provably zero-pixel-difference* change on every
+                // backend (premultiplying by alpha=1 is the identity) --
+                // switching it can't visibly regress anything. Whether it
+                // actually discourages macOS's overlay-promotion heuristic
+                // is NOT confirmed -- no Mac (let alone Mac + external
+                // display) hardware was available to test against, and
+                // it's plausible platform overlay/scanout paths handle
+                // premultiplied surfaces just as readily. This is our
+                // best-evidenced, strictly-safe lever over the one WebGPU
+                // surface property this app's own code controls that
+                // plausibly bears on overlay eligibility; if the freeze
+                // persists after this ships, the next things to try are
+                // (a) reproducing with only the laptop's built-in display
+                // active, no external monitor (the crash reports'
+                // "external-display compositor thread" detail is the
+                // strongest lead this investigation found), and (b) filing
+                // this as a Chromium bug with the `chrome://gpu` log +
+                // crash reports already in hand.
+                composite_alpha_mode: bevy::window::CompositeAlphaMode::PreMultiplied,
                 ..default()
             }),
             ..default()

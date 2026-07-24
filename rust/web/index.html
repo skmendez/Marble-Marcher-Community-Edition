@@ -32,7 +32,32 @@
       z-index: 1000;
       max-height: 70vh;
       overflow-y: auto;
-      overscroll-behavior: contain;
+      /* `overscroll-behavior: contain` removed (macOS live-freeze
+         investigation): a real user's `chrome://gpu` log showed Chromium's
+         `SharedImageManager::ProduceOverlay` failing on our canvas's
+         SharedImage every single rendered frame, forever, alongside a
+         recorded GPU process crash and matching macOS `.ips` crash reports
+         showing WindowServer's main thread wedged against its *external-
+         display* CoreAnimation compositor thread. UTC-timestamp
+         correlation against the crash placed this squarely after
+         `overscroll-behavior: contain` (and this container's
+         `overflow-y: auto`) landed on this always-present, high-`z-index`,
+         fixed-position element that sits directly on top of the canvas
+         (`f04a1cc`) -- both are well-known Chromium triggers for promoting
+         an element to its own isolated compositing layer with scroll-
+         boundary isolation, which is a plausible way to confuse the
+         compositor's layer reconciliation for a canvas Chrome is
+         independently trying to promote to a direct hardware overlay.
+         `overflow-y: auto` alone is kept (removing it too would reopen the
+         invisible-panel-on-phones bug `1eb092c` fixed -- a closed panel
+         taller than `max-height` needs *some* clipping/scroll behavior),
+         but the more aggressive `overscroll-behavior: contain` scroll-
+         isolation hint isn't load-bearing for anything this panel actually
+         needs (nothing here relies on containing scroll-chaining to the
+         page), so it's the one dropped. NOT a confirmed fix -- no macOS +
+         external-display hardware was available to verify against; if the
+         freeze recurs after this ships, `overflow-y: auto` itself becomes
+         the next suspect. */
     }
     /* Checkbox/row hit targets are desktop-mouse-sized by default; give
        coarse (touch) pointers slightly bigger ones. */
