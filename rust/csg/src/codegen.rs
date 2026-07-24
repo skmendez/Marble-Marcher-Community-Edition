@@ -202,6 +202,18 @@ impl CodeWriter {
             Object::Difference(left, right) => {
                 self.emit_combine(left, right, Combine::Difference)
             }
+            Object::Offset { base, offset } => {
+                // Same local-units-over-p.w reasoning as `Object::de`'s
+                // Offset arm: the base's `d` is already `/ p.w`-scaled, and
+                // the divisor must be *this* node's entry-time `p.w` -- a
+                // `Fractal` base's emitted folds mutate `p` (including `w`)
+                // in place with no restore, so save it first (same
+                // save-around-a-child shape as `emit_combine`'s `p_save`).
+                let w_saved = self.fresh("w_save");
+                self.writeln(&format!("let {w_saved} = p.w;"));
+                self.emit_object(base);
+                self.writeln(&format!("d = d - {} / {w_saved};", offset.wgsl()));
+            }
         }
     }
 
@@ -1927,6 +1939,48 @@ struct VertexOutput {
             src.contains("fn col_scene(p_in: vec4<f32>) -> vec4<f32> {"),
             "{src}"
         );
+    }
+
+    #[test]
+    fn offset_emission_divides_by_saved_entry_w() {
+        // An Offset around a Fractal base whose folds rescale `p.w`: the
+        // emitted subtraction must divide by the saved entry-time `w`, not
+        // the post-fold `p.w` (see `emit_object`'s Offset arm).
+        let obj = Object::Offset {
+            base: Box::new(Object::Fractal {
+                fold: crate::Fold::ScaleTranslate {
+                    scale: ScalarValue::Const(2.0),
+                    shift: Vec3Value::Const(glam::Vec3::ZERO),
+                },
+                base: Box::new(sphere(1.0)),
+            }),
+            offset: ScalarValue::Const(0.5),
+        };
+        let src = generate_scene_functions(&obj);
+        assert!(src.contains("let w_save_0 = p.w;"), "{src}");
+        assert!(src.contains("d = d - 0.5 / w_save_0;"), "{src}");
+        assert!(!src.contains("/ p.w;"), "must not divide by mutated p.w:\n{src}");
+    }
+
+    #[test]
+    fn offset_shader_validates() {
+        let obj = Object::Union(
+            Box::new(Object::Offset {
+                base: Box::new(cuboid(glam::Vec3::ONE)),
+                offset: ScalarValue::Const(0.25),
+            }),
+            Box::new(Object::Offset {
+                base: Box::new(Object::Offset {
+                    base: Box::new(sphere(1.0)),
+                    offset: ScalarValue::Const(0.5),
+                }),
+                offset: ScalarValue::Const(-0.1),
+            }),
+        );
+        validate_wgsl(&full_source(&obj));
+        validate_wgsl(&full_coarse_source(&obj));
+        validate_wgsl(&full_shadow_source(&obj));
+        validate_wgsl(&full_stepdata_source(&obj));
     }
 
     #[test]

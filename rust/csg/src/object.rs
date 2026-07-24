@@ -22,6 +22,18 @@ pub enum Object {
     Intersect(Box<Object>, Box<Object>),
     /// src/fractals/ObjectDifference.hpp
     Difference(Box<Object>, Box<Object>),
+    /// Surface offset (no C++ counterpart): `de = base.de - offset`, i.e.
+    /// the base inflated outward by `offset` everywhere (the Minkowski sum
+    /// with a radius-`offset` ball), or eroded inward for a negative
+    /// `offset`. Subtracting a *constant* from a distance field preserves
+    /// its gradient exactly (unlike adding another spatially-varying field,
+    /// which would need a Lipschitz correction), so an `Offset` of an exact
+    /// child DE is itself exact -- and inflating a sharp edge rounds it,
+    /// which is the classic "rounded box" construction.
+    Offset {
+        base: Box<Object>,
+        offset: ScalarValue,
+    },
 }
 
 impl Object {
@@ -47,6 +59,9 @@ impl Object {
             Object::Union(left, right) | Object::Intersect(left, right) | Object::Difference(left, right) => {
                 left.handles_valid_for(slot_count) && right.handles_valid_for(slot_count)
             }
+            Object::Offset { base, offset } => {
+                offset.handle_valid_for(slot_count) && base.handles_valid_for(slot_count)
+            }
         }
     }
 
@@ -68,6 +83,13 @@ impl Object {
             Object::Union(left, right) => left.de(p, params).min(right.de(p, params)),
             Object::Intersect(left, right) => left.de(p, params).max(right.de(p, params)),
             Object::Difference(left, right) => left.de(p, params).max(-right.de(p, params)),
+            // `offset` is in the same (folded-local) units as `Sphere`'s
+            // radius / `Cuboid`'s half-extent, so it scales by `p.w` the same
+            // way: the base's returned `de` is already divided by `p.w`, and
+            // a local-units inflation shrinks that world-space distance by
+            // `offset / p.w` (`Offset(Sphere{r}, c)` == `Sphere{r + c}` at
+            // any accumulated scale).
+            Object::Offset { base, offset } => base.de(p, params) - offset.get(params) / p.w,
         }
     }
 
@@ -132,6 +154,28 @@ impl Object {
                     right.nearest_point_scratch(p, params, hist)
                 }
             }
+            // The nearest point on the offset surface lies on the line
+            // through `p` and the base's nearest point, shifted along the
+            // base's outward direction by `offset`: toward `p` when `p` is
+            // outside the base, away from it when inside. Exact for an
+            // inflation of an exact base; an erosion (negative offset) can
+            // recede past a thin feature's medial axis, where this is only
+            // an approximation -- fine for collision resolution, which only
+            // needs a push-out direction consistent with `de`.
+            Object::Offset { base, offset } => {
+                let np = base.nearest_point_scratch(p, params, hist);
+                let dir = p.truncate() - np;
+                let len = dir.length();
+                if len < 1e-9 {
+                    // `p` is (numerically) on the base surface: no
+                    // well-defined outward direction from the nearest-point
+                    // pair alone; the un-offset point is the best answer
+                    // available and is within `offset` of correct.
+                    return np;
+                }
+                let side = if base.de(p, params) >= 0.0 { 1.0 } else { -1.0 };
+                np + dir * (side * offset.get(params) / len)
+            }
         }
     }
 
@@ -170,6 +214,16 @@ impl Object {
             }
             // Subtracting can only shrink the set.
             Object::Difference(left, _right) => left.bounding_sphere(params),
+            // Inflation grows the set by exactly `offset` in every
+            // direction, so pad the child's radius by it. An erosion
+            // (negative offset) only shrinks the set, so the child's own
+            // bound already covers it -- clamp rather than subtract, since
+            // the child bound's center generally isn't the body's and
+            // shrinking the sphere could cut off real geometry.
+            Object::Offset { base, offset } => {
+                let (c, r) = base.bounding_sphere(params)?;
+                Some((c, r + offset.get(params).max(0.0)))
+            }
         }
     }
 
@@ -211,6 +265,11 @@ impl Object {
                 out.push(5);
                 left.encode(out);
                 right.encode(out);
+            }
+            Object::Offset { base, offset } => {
+                out.push(6);
+                offset.encode(out);
+                base.encode(out);
             }
         }
     }
@@ -265,6 +324,11 @@ impl Object {
                 let (left, pos) = Object::decode_at(bytes, pos)?;
                 let (right, pos) = Object::decode_at(bytes, pos)?;
                 (Object::Difference(Box::new(left), Box::new(right)), pos)
+            }
+            6 => {
+                let (offset, pos) = ScalarValue::decode_at(bytes, pos)?;
+                let (base, pos) = Object::decode_at(bytes, pos)?;
+                (Object::Offset { base: Box::new(base), offset }, pos)
             }
             _ => return None,
         };
@@ -548,6 +612,109 @@ mod tests {
         let (sponge, h4) = menger_sponge(&mut p4);
         set_menger_params(&mut p4, &h4, 12, Vec3::new(1.0, 0.5, 0.2));
         assert_sound("menger_sponge", &sponge, &p4, 30, 0.1);
+    }
+
+    fn offset(base: Object, c: f32) -> Object {
+        Object::Offset {
+            base: Box::new(base),
+            offset: ScalarValue::Const(c),
+        }
+    }
+
+    /// `Offset(Sphere{r}, c)` must be indistinguishable from `Sphere{r+c}`
+    /// -- `de` at outside, inside, and surface points, including a scaled
+    /// `p.w`, and for a negative (eroding) offset too.
+    #[test]
+    fn offset_sphere_matches_larger_sphere() {
+        let params = Params::new();
+        let inflated = offset(sphere(1.0), 0.5);
+        let eroded = offset(sphere(2.0), -0.5);
+        let equivalent = sphere(1.5);
+        for p in [
+            Vec4::new(5.0, 0.0, 0.0, 1.0),
+            Vec4::new(0.3, 0.4, 0.0, 1.0),
+            Vec4::new(1.5, 0.0, 0.0, 1.0),
+            Vec4::new(3.0, -2.0, 1.0, 2.0), // scaled w
+        ] {
+            let expected = equivalent.de(p, &params);
+            assert!((inflated.de(p, &params) - expected).abs() < 1e-6, "inflated at {p:?}");
+            assert!((eroded.de(p, &params) - expected).abs() < 1e-6, "eroded at {p:?}");
+        }
+    }
+
+    /// The offset is in the same folded-local units as a primitive's own
+    /// size parameters, so under a scaling fold `Offset(Sphere{r}, c)` must
+    /// still equal `Sphere{r+c}` *inside the same fold* -- this is the
+    /// `/ p.w` in the `de` arm (and the `w_save` in codegen's).
+    #[test]
+    fn offset_de_is_exact_under_a_scaling_fold() {
+        let params = Params::new();
+        let fold = || Fold::ScaleTranslate {
+            scale: ScalarValue::Const(2.0),
+            shift: Vec3Value::Const(Vec3::new(0.5, -1.0, 0.25)),
+        };
+        let offset_in_fold = Object::Fractal {
+            fold: fold(),
+            base: Box::new(offset(sphere(1.0), 0.5)),
+        };
+        let equivalent = Object::Fractal {
+            fold: fold(),
+            base: Box::new(sphere(1.5)),
+        };
+        for p in [
+            Vec4::new(3.0, 1.0, -2.0, 1.0),
+            Vec4::new(0.1, 0.2, 0.0, 1.0),
+            Vec4::new(-1.0, 4.0, 2.0, 1.0),
+        ] {
+            let a = offset_in_fold.de(p, &params);
+            let b = equivalent.de(p, &params);
+            assert!((a - b).abs() < 1e-6, "at {p:?}: offset-in-fold={a} equivalent={b}");
+        }
+    }
+
+    #[test]
+    fn offset_nearest_point_outside_and_inside() {
+        let params = Params::new();
+        let obj = offset(sphere(1.0), 0.5);
+        // Outside: nearest point on the inflated (radius 1.5) sphere.
+        let np = obj.nearest_point(Vec4::new(3.0, 0.0, 0.0, 1.0), &params);
+        assert!((np - Vec3::new(1.5, 0.0, 0.0)).length() < 1e-6, "outside: {np:?}");
+        // Inside the base: surface moved *away*, still at radius 1.5.
+        let np = obj.nearest_point(Vec4::new(0.2, 0.0, 0.0, 1.0), &params);
+        assert!((np - Vec3::new(1.5, 0.0, 0.0)).length() < 1e-6, "inside: {np:?}");
+        // Between the base surface and the inflated surface (inside the
+        // inflated solid, outside the base): same surface point.
+        let np = obj.nearest_point(Vec4::new(1.2, 0.0, 0.0, 1.0), &params);
+        assert!((np - Vec3::new(1.5, 0.0, 0.0)).length() < 1e-6, "in shell: {np:?}");
+    }
+
+    #[test]
+    fn offset_bounding_sphere_pads_only_for_inflation() {
+        let params = Params::new();
+        let (c, r) = offset(sphere(2.0), 0.5).bounding_sphere(&params).unwrap();
+        assert_eq!(c, Vec3::ZERO);
+        assert!((r - 2.5).abs() < 1e-6);
+        // Erosion shrinks the set; the child's bound must be kept, not
+        // shrunk (see the bounding_sphere arm's comment).
+        let (c, r) = offset(sphere(2.0), -0.5).bounding_sphere(&params).unwrap();
+        assert_eq!(c, Vec3::ZERO);
+        assert!((r - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn offset_rounds_a_cuboid_corner() {
+        // Inflating is a Minkowski sum with a ball: past a corner, the
+        // surface is at `corner + offset` along the diagonal, not at the
+        // sharp cuboid's own inflated corner point.
+        let params = Params::new();
+        let obj = offset(cuboid(Vec3::ONE), 0.5);
+        let diag = Vec3::splat(1.0 / 3.0_f32.sqrt());
+        let corner = Vec3::ONE;
+        // A point along the corner diagonal, 0.5 + 0.25 past the corner:
+        // de should be 0.25 (0.5 of the gap is eaten by the rounding).
+        let p = corner + diag * 0.75;
+        let d = obj.de(p.extend(1.0), &params);
+        assert!((d - 0.25).abs() < 1e-6, "rounded-corner de: {d}");
     }
 
     #[test]

@@ -151,6 +151,20 @@ mod tests {
     }
 
     #[test]
+    fn offset_round_trips() {
+        assert_object_round_trips(&Object::Offset {
+            base: Box::new(Object::Cuboid { half_extent: Vec3Value::Const(Vec3::ONE) }),
+            offset: ScalarValue::Const(0.25),
+        });
+        let mut params = Params::new();
+        let c = params.alloc_scalar(0.5);
+        assert_object_round_trips(&Object::Offset {
+            base: Box::new(Object::Sphere { radius: ScalarValue::Const(1.0) }),
+            offset: ScalarValue::Param(c),
+        });
+    }
+
+    #[test]
     fn deeply_nested_tree_round_trips() {
         let nested = Object::Union(
             Box::new(Object::Fractal {
