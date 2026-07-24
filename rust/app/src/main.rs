@@ -84,6 +84,28 @@ fn present_mode(config: &Config) -> bevy::window::PresentMode {
     }
 }
 
+/// Web-only override, `Auto` everywhere else: `PreMultiplied` is the
+/// macOS-overlay-freeze mitigation for the *browser canvas* (the long
+/// rationale on the `composite_alpha_mode:` field above), and wgpu's web
+/// backend accepts it -- but a native Vulkan surface advertises its own
+/// supported composite-alpha set, and llvmpipe's (this project's headless
+/// screenshot/CI environment) does not include `PreMultiplied`:
+/// configuring it panics inside `bevy_render`'s `create_surfaces` on the
+/// very first frame, taking down every native run (caught immediately by
+/// the headless screenshot script after the unconditional version of this
+/// landed). `Auto` preserves the exact pre-mitigation behavior on native,
+/// where the macOS/Chromium overlay path this works around doesn't exist.
+fn composite_alpha_mode() -> bevy::window::CompositeAlphaMode {
+    #[cfg(target_arch = "wasm32")]
+    {
+        bevy::window::CompositeAlphaMode::PreMultiplied
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        bevy::window::CompositeAlphaMode::Auto
+    }
+}
+
 fn main() {
     // Read once, here, rather than as a `Startup` system: `present_mode`
     // has to feed into `WindowPlugin` before `App::new()` even runs, so no
@@ -169,7 +191,7 @@ fn main() {
                 // strongest lead this investigation found), and (b) filing
                 // this as a Chromium bug with the `chrome://gpu` log +
                 // crash reports already in hand.
-                composite_alpha_mode: bevy::window::CompositeAlphaMode::PreMultiplied,
+                composite_alpha_mode: composite_alpha_mode(),
                 ..default()
             }),
             ..default()
