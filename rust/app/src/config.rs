@@ -111,6 +111,7 @@ mod tests {
 
     #[test]
     fn scene_defaults_to_menger_oscillating_sphere_when_absent() {
+        assert_eq!(SceneKind::from_value(Some("hollow_donut")), SceneKind::HollowDonut);
         assert_eq!(SceneKind::from_value(None), SceneKind::MengerOscillatingSphere);
     }
 }

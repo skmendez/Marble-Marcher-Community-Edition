@@ -1,7 +1,7 @@
 //! M2: the `Object` enum — primitives, CSG combiners, `Fractal`.
 //! See rust/DESIGN.md §3–4 and the C++ sources in src/fractals/Object*.hpp, Fractal.hpp.
 
-use glam::{Vec3, Vec4};
+use glam::{Vec2, Vec3, Vec4};
 
 use crate::{fold::Fold, Params, ScalarValue, Vec3Value};
 
@@ -65,6 +65,15 @@ pub enum Object {
         b: Box<Object>,
         t: ScalarValue,
     },
+    /// A torus (no C++ counterpart) around the Y axis: the ring of radius
+    /// `major` in the XZ plane, swept by a tube of radius `minor`. Exact
+    /// SDF (`length(vec2(length(p.xz) - major, p.y)) - minor`), with an
+    /// exact closed-form nearest point: project onto the ring circle, then
+    /// onto the tube surface around that ring point.
+    Torus {
+        major: ScalarValue,
+        minor: ScalarValue,
+    },
 }
 
 impl Object {
@@ -100,6 +109,9 @@ impl Object {
                 t.handle_valid_for(slot_count)
                     && a.handles_valid_for(slot_count)
                     && b.handles_valid_for(slot_count)
+            }
+            Object::Torus { major, minor } => {
+                major.handle_valid_for(slot_count) && minor.handle_valid_for(slot_count)
             }
         }
     }
@@ -139,6 +151,13 @@ impl Object {
             Object::Morph { a, b, t } => {
                 let t = t.get(params).clamp(0.0, 1.0);
                 (1.0 - t) * a.de(p, params) + t * b.de(p, params)
+            }
+            Object::Torus { major, minor } => {
+                let q = Vec2::new(
+                    Vec2::new(p.x, p.z).length() - major.get(params),
+                    p.y,
+                );
+                (q.length() - minor.get(params)) / p.w
             }
         }
     }
@@ -261,6 +280,25 @@ impl Object {
                     self.project_to_surface(p, params)
                 }
             }
+            // Project onto the ring circle, then onto the tube around that
+            // ring point -- exact. Two degeneracies, both on measure-zero
+            // sets: `p` on the Y axis (every ring point ties -- pick +X's),
+            // and `p` exactly on the ring circle (every tube direction
+            // ties -- pick the outward in-plane one).
+            Object::Torus { major, minor } => {
+                let maj = major.get(params);
+                let min_r = minor.get(params);
+                let xz = Vec2::new(p.x, p.z);
+                let ring_dir = if xz.length() > 1e-9 { xz.normalize() } else { Vec2::X };
+                let ring_point = Vec3::new(ring_dir.x * maj, 0.0, ring_dir.y * maj);
+                let d = p.truncate() - ring_point;
+                let len = d.length();
+                if len < 1e-9 {
+                    ring_point + Vec3::new(ring_dir.x, 0.0, ring_dir.y) * min_r
+                } else {
+                    ring_point + d * (min_r / len)
+                }
+            }
         }
     }
 
@@ -369,6 +407,9 @@ impl Object {
                 let bb = b.bounding_sphere(params)?;
                 Some(enclosing_sphere(ba, bb))
             }
+            Object::Torus { major, minor } => {
+                Some((Vec3::ZERO, major.get(params) + minor.get(params)))
+            }
         }
     }
 
@@ -426,6 +467,11 @@ impl Object {
                 t.encode(out);
                 a.encode(out);
                 b.encode(out);
+            }
+            Object::Torus { major, minor } => {
+                out.push(9);
+                major.encode(out);
+                minor.encode(out);
             }
         }
     }
@@ -496,6 +542,11 @@ impl Object {
                 let (a, pos) = Object::decode_at(bytes, pos)?;
                 let (b, pos) = Object::decode_at(bytes, pos)?;
                 (Object::Morph { a: Box::new(a), b: Box::new(b), t }, pos)
+            }
+            9 => {
+                let (major, pos) = ScalarValue::decode_at(bytes, pos)?;
+                let (minor, pos) = ScalarValue::decode_at(bytes, pos)?;
+                (Object::Torus { major, minor }, pos)
             }
             _ => return None,
         };
@@ -1072,6 +1123,64 @@ mod tests {
         let (cb, rb) = cuboid(Vec3::splat(2.0)).bounding_sphere(&params).unwrap();
         assert!(c.distance(ca) + ra <= r + 1e-4);
         assert!(c.distance(cb) + rb <= r + 1e-4);
+    }
+
+    fn torus(major: f32, minor: f32) -> Object {
+        Object::Torus {
+            major: ScalarValue::Const(major),
+            minor: ScalarValue::Const(minor),
+        }
+    }
+
+    #[test]
+    fn torus_de_closed_form() {
+        let params = Params::new();
+        let t = torus(3.0, 1.0);
+        // On the ring circle: max depth inside the tube.
+        assert!((t.de(Vec4::new(3.0, 0.0, 0.0, 1.0), &params) - (-1.0)).abs() < 1e-6);
+        // On the tube surface (outer equator).
+        assert!(t.de(Vec4::new(4.0, 0.0, 0.0, 1.0), &params).abs() < 1e-6);
+        // Straight above the ring: q = (0, 1) -> on the surface too.
+        assert!(t.de(Vec4::new(3.0, 1.0, 0.0, 1.0), &params).abs() < 1e-6);
+        // At the world origin (the donut hole's center): nearest surface is
+        // the tube's inner equator, major - minor = 2 away.
+        assert!((t.de(Vec4::new(0.0, 0.0, 0.0, 1.0), &params) - 2.0).abs() < 1e-6);
+        // Ring symmetry: same values anywhere around the ring.
+        let k = 3.0 / 2.0_f32.sqrt();
+        assert!((t.de(Vec4::new(k, 0.0, k, 1.0), &params) - (-1.0)).abs() < 1e-6);
+        // Scaled-w: de divides by p.w.
+        assert!((t.de(Vec4::new(0.0, 0.0, 0.0, 2.0), &params) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn torus_nearest_point_projects_ring_then_tube() {
+        let params = Params::new();
+        let t = torus(3.0, 1.0);
+        // Outside, in the ring plane: nearest is the outer equator.
+        let np = t.nearest_point(Vec4::new(6.0, 0.0, 0.0, 1.0), &params);
+        assert!((np - Vec3::new(4.0, 0.0, 0.0)).length() < 1e-5, "{np:?}");
+        // Inside the tube, off-center toward the top: straight up to the
+        // tube surface above the ring point.
+        let np = t.nearest_point(Vec4::new(3.0, 0.4, 0.0, 1.0), &params);
+        assert!((np - Vec3::new(3.0, 1.0, 0.0)).length() < 1e-5, "{np:?}");
+        // On the Y axis (degenerate ring direction): must still return a
+        // finite point that's actually on the surface.
+        let np = t.nearest_point(Vec4::new(0.0, 0.5, 0.0, 1.0), &params);
+        assert!(np.is_finite());
+        assert!(t.de(np.extend(1.0), &params).abs() < 1e-5, "axis-degenerate np off-surface: {np:?}");
+        // nearest-point/de consistency off-axis.
+        let p = Vec4::new(1.0, 2.0, -2.0, 1.0);
+        let np = t.nearest_point(p, &params);
+        let d = t.de(p, &params);
+        assert!(((p.truncate() - np).length() - d.abs()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn torus_bounding_sphere_is_major_plus_minor() {
+        let params = Params::new();
+        let (c, r) = torus(3.0, 1.0).bounding_sphere(&params).unwrap();
+        assert_eq!(c, Vec3::ZERO);
+        assert!((r - 4.0).abs() < 1e-6);
     }
 
     #[test]

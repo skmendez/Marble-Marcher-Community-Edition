@@ -165,6 +165,19 @@ mod tests {
     }
 
     #[test]
+    fn torus_and_hollow_donut_round_trip() {
+        assert_object_round_trips(&Object::Torus {
+            major: ScalarValue::Const(3.0),
+            minor: ScalarValue::Const(1.0),
+        });
+        // The real scene tree: param-driven Onion(Torus) inside the
+        // color-fold wrapper.
+        let mut params = Params::new();
+        let (object, _handles) = scenes::hollow_donut(&mut params);
+        assert_object_round_trips(&object);
+    }
+
+    #[test]
     fn onion_and_morph_round_trip() {
         assert_object_round_trips(&Object::Onion {
             base: Box::new(Object::Sphere { radius: ScalarValue::Const(2.0) }),

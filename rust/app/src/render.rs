@@ -54,9 +54,9 @@ use marble_csg::codegen::generate_shader;
 use marble_csg::expr::Expr;
 use marble_csg::physics::{Marble, PhysicsConfig};
 use marble_csg::scenes::{
-    beware_of_bumps, classic, demo_scene, menger_oscillating_sphere, menger_sphere, menger_sponge,
-    set_fractal_params, set_menger_params, ClassicHandles, MengerHandles,
-    MengerOscillatingSphereHandles, MENGER_BITE_MIN_RADIUS,
+    beware_of_bumps, classic, demo_scene, hollow_donut, menger_oscillating_sphere, menger_sphere,
+    menger_sponge, set_fractal_params, set_menger_params, ClassicHandles, HollowDonutHandles,
+    MengerHandles, MengerOscillatingSphereHandles, MENGER_BITE_MIN_RADIUS,
 };
 use marble_csg::{Object, Params, ScalarParam, Scene};
 
@@ -101,6 +101,12 @@ pub enum SceneKind {
     /// (`marble_csg`'s `*Value::Param`/`Params`) animating actual geometry,
     /// not just a fractal fold's rotation/color/iteration-count.
     MengerOscillatingSphere,
+    /// [`marble_csg::scenes::hollow_donut`] — an `Onion(Torus)` shell the
+    /// marble travels around the *inside* of, like a closed ring-shaped
+    /// tunnel; also the first scene built from the shell/torus nodes rather
+    /// than folds. All three dimensions are live params (the params panel
+    /// can resize the donut while playing).
+    HollowDonut,
 }
 
 /// Marble spawn parameters for a scene: start position, radius, kill-plane
@@ -126,6 +132,7 @@ impl SceneKind {
             Some("menger_sponge") => Self::MengerSponge,
             Some("menger_sphere") => Self::MengerSphere,
             Some("menger_oscillating_sphere") => Self::MengerOscillatingSphere,
+            Some("hollow_donut") => Self::HollowDonut,
             _ => Self::MengerOscillatingSphere,
         }
     }
@@ -187,6 +194,17 @@ impl SceneKind {
             // centered puts the player inside the hollowing-out effect
             // itself instead of watching it from outside.
             Self::MengerOscillatingSphere => MarbleSpawn { start: Vec3::ZERO, rad: 0.15, kill_y: -50.0 },
+            // The center of the tube at the ring's +X point: the freest
+            // spot inside the tunnel (shell `de` there is
+            // `DONUT_MINOR_RADIUS - DONUT_THICKNESS = 0.85`, comfortably
+            // clear of `rad`). `kill_y` is unreachable from inside a
+            // closed tube -- Rolling mode just settles the marble at the
+            // tube's bottom instead of ever falling out.
+            Self::HollowDonut => MarbleSpawn {
+                start: Vec3::new(marble_csg::scenes::DONUT_MAJOR_RADIUS, 0.0, 0.0),
+                rad: 0.15,
+                kill_y: -50.0,
+            },
         }
     }
 }
@@ -207,6 +225,8 @@ pub enum SceneHandles {
     /// exposes only the inner `menger` handles (the animated radius would
     /// fight the physics tick's per-tick overwrite -- `param_ui`'s doc).
     MengerOscillatingSphere(MengerOscillatingSphereHandles),
+    /// [`SceneKind::HollowDonut`]'s ring/tube/wall dimensions.
+    HollowDonut(HollowDonutHandles),
 }
 
 /// Fixed weak handle for the generated ray-marcher shader. A startup system
@@ -1051,6 +1071,18 @@ pub fn setup(
         // happening, so there's no need to zoom out to see it happen.
         camera_orbit.distance = 1.2;
     }
+    if kind == SceneKind::HollowDonut {
+        // The camera lives *inside* the tube with the marble (interior free
+        // radius `DONUT_MINOR_RADIUS - DONUT_THICKNESS = 0.85`), so the
+        // orbit distance must stay under that or the eye embeds in the
+        // shell wall (the same embedded-camera speckle failure the Menger
+        // distance tuning above documents). `0.6` from a tube-center spawn
+        // leaves `~0.25` of wall clearance at any orbit angle; a mild
+        // yaw/pitch angles the ring's curve into view rather than staring
+        // straight down the tube axis.
+        camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(0.5, 0.2);
+        camera_orbit.distance = 0.6;
+    }
 
     let mut animations: Vec<(ScalarParam, Expr)> = Vec::new();
     let (object, handles) = match kind {
@@ -1108,6 +1140,10 @@ pub fn setup(
             params.set_scalar(osc_handles.radius, MENGER_BITE_MIN_RADIUS);
             animations.push((osc_handles.radius, osc_handles.radius_anim.clone()));
             (object, SceneHandles::MengerOscillatingSphere(osc_handles))
+        }
+        SceneKind::HollowDonut => {
+            let (object, donut_handles) = hollow_donut(&mut params);
+            (object, SceneHandles::HollowDonut(donut_handles))
         }
     };
 

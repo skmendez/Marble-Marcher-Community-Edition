@@ -307,6 +307,54 @@ pub fn menger_oscillating_sphere(params: &mut Params) -> (Object, MengerOscillat
     (object, handles)
 }
 
+/// Parameter handles for [`hollow_donut`], so the params UI (and any future
+/// animation) can resize the donut live without a shader/tree rebuild.
+#[derive(Clone, Copy, Debug)]
+pub struct HollowDonutHandles {
+    pub major: ScalarParam,
+    pub minor: ScalarParam,
+    pub thickness: ScalarParam,
+}
+
+/// [`hollow_donut`]'s stock dimensions: ring radius 3, tube radius 1, wall
+/// thickness 0.15 -- leaving a free interior tube of radius
+/// `1 - 0.15 = 0.85` for the marble to travel around inside.
+pub const DONUT_MAJOR_RADIUS: f32 = 3.0;
+pub const DONUT_MINOR_RADIUS: f32 = 1.0;
+pub const DONUT_THICKNESS: f32 = 0.15;
+
+/// Flat frosting-pink surface color, applied the same way `creme_spheres`
+/// colors itself: a single constant `OrbitInit` (no `OrbitMax`
+/// accumulation), which `col_scene` returns as-is for every hit point.
+const DONUT_COLOR: Vec3 = Vec3::new(0.95, 0.62, 0.72);
+
+/// A hollow donut: `Onion(Torus)` -- the shell of points within
+/// `thickness` of the torus surface, i.e. a donut-shaped **tunnel**. The
+/// marble plays *inside* the tube (at the ring circle the shell's `de` is
+/// `minor - thickness`, comfortably positive), circulating around the ring
+/// like a closed hamster-tube circuit; physics collides against the same
+/// exact shell field the shader renders (`Object::Onion`'s doc for the
+/// exactness argument). All three dimensions are runtime `Param`s so the
+/// params panel can resize the donut live.
+pub fn hollow_donut(params: &mut Params) -> (Object, HollowDonutHandles) {
+    let major = params.alloc_scalar(DONUT_MAJOR_RADIUS);
+    let minor = params.alloc_scalar(DONUT_MINOR_RADIUS);
+    let thickness = params.alloc_scalar(DONUT_THICKNESS);
+    let handles = HollowDonutHandles { major, minor, thickness };
+    let shell = Object::Onion {
+        base: Box::new(Object::Torus {
+            major: ScalarValue::Param(major),
+            minor: ScalarValue::Param(minor),
+        }),
+        thickness: ScalarValue::Param(thickness),
+    };
+    let object = Object::Fractal {
+        fold: Fold::OrbitInit(Vec3Value::Const(DONUT_COLOR)),
+        base: Box::new(shell),
+    };
+    (object, handles)
+}
+
 /// Writes a full parameter set for the classic fractal tree built by
 /// [`classic`]/[`demo_scene`]. `ang1`/`ang2` are turned into rotation
 /// matrices via [`rotation_mat2`].
@@ -570,6 +618,37 @@ mod tests {
         // ...and strictly less than the corner distance (face_reach * sqrt(3)),
         // so the corners still survive being bitten at MAX_RADIUS.
         assert!(MENGER_BITE_MAX_RADIUS < face_reach * 3.0_f32.sqrt());
+    }
+
+    #[test]
+    fn hollow_donut_is_a_playable_tunnel() {
+        let mut params = Params::new();
+        let (object, handles) = hollow_donut(&mut params);
+
+        // The ring-center spawn point sits in free space with the full
+        // interior clearance (minor - thickness).
+        let d = object.de(Vec4::new(DONUT_MAJOR_RADIUS, 0.0, 0.0, 1.0), &params);
+        assert!((d - (DONUT_MINOR_RADIUS - DONUT_THICKNESS)).abs() < 1e-6, "spawn de={d}");
+        // The wall is solid: a point on the torus surface is inside the shell.
+        let d = object.de(Vec4::new(DONUT_MAJOR_RADIUS + DONUT_MINOR_RADIUS, 0.0, 0.0, 1.0), &params);
+        assert!((d - (-DONUT_THICKNESS)).abs() < 1e-6, "wall de={d}");
+        // Outside the donut entirely: positive, roughly the gap distance.
+        let d = object.de(Vec4::new(10.0, 0.0, 0.0, 1.0), &params);
+        assert!(d > 5.0, "outside de={d}");
+        // The donut hole's center is also free space (it's outside the tube).
+        let d = object.de(Vec4::new(0.0, 0.0, 0.0, 1.0), &params);
+        assert!(d > 1.0, "hole-center de={d}");
+
+        // Finite bound covering the whole shell.
+        let (c, r) = object.bounding_sphere(&params).unwrap();
+        assert_eq!(c, Vec3::ZERO);
+        assert!((r - (DONUT_MAJOR_RADIUS + DONUT_MINOR_RADIUS + DONUT_THICKNESS)).abs() < 1e-5);
+
+        // The handles genuinely drive the geometry: growing the tube radius
+        // increases the spawn point's clearance by the same amount.
+        params.set_scalar(handles.minor, DONUT_MINOR_RADIUS + 0.5);
+        let d = object.de(Vec4::new(DONUT_MAJOR_RADIUS, 0.0, 0.0, 1.0), &params);
+        assert!((d - (DONUT_MINOR_RADIUS + 0.5 - DONUT_THICKNESS)).abs() < 1e-6);
     }
 
     #[test]

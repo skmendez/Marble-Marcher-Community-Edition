@@ -193,6 +193,13 @@ impl CodeWriter {
             Object::Cuboid { half_extent } => {
                 self.writeln(&format!("d = de_box(p, {});", half_extent.wgsl()));
             }
+            Object::Torus { major, minor } => {
+                self.writeln(&format!(
+                    "d = de_torus(p, {}, {});",
+                    major.wgsl(),
+                    minor.wgsl()
+                ));
+            }
             Object::Fractal { fold, base } => {
                 self.emit_fold(fold);
                 self.emit_object(base);
@@ -367,6 +374,13 @@ fn de_sphere(p: vec4<f32>, r: f32) -> f32 {
 fn de_box(p: vec4<f32>, s: vec3<f32>) -> f32 {
     let a = abs(p.xyz) - s;
     return (min(max(max(a.x, a.y), a.z), 0.0) + length(max(a, vec3<f32>(0.0)))) / p.w;
+}
+
+// Torus around the Y axis: ring radius `major` in the XZ plane, tube
+// radius `minor` (mirrors `Object::Torus`'s CPU `de` exactly).
+fn de_torus(p: vec4<f32>, major: f32, minor: f32) -> f32 {
+    let q = vec2<f32>(length(p.xz) - major, p.y);
+    return (length(q) - minor) / p.w;
 }
 
 fn menger_fold(p: ptr<function, vec4<f32>>) {
@@ -2179,6 +2193,24 @@ struct VertexOutput {
         assert!(!de_part.contains("orbit = mix("), "{de_part}");
         assert!(col_part.contains("d = mix(dl_"), "{col_part}");
         assert!(col_part.contains("orbit = mix("), "{col_part}");
+    }
+
+    #[test]
+    fn torus_emission_and_hollow_donut_shader_validate() {
+        let obj = Object::Torus {
+            major: ScalarValue::Const(3.0),
+            minor: ScalarValue::Const(1.0),
+        };
+        let src = generate_scene_functions(&obj);
+        assert!(src.contains("d = de_torus(p, 3.0, 1.0);"), "{src}");
+
+        // The real hollow-donut scene tree, through all four shader variants.
+        let mut params = Params::new();
+        let (donut, _handles) = scenes::hollow_donut(&mut params);
+        validate_wgsl(&full_source(&donut));
+        validate_wgsl(&full_coarse_source(&donut));
+        validate_wgsl(&full_shadow_source(&donut));
+        validate_wgsl(&full_stepdata_source(&donut));
     }
 
     #[test]

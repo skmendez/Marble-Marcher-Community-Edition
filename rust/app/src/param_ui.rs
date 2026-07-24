@@ -43,7 +43,7 @@
 //! depth/color instead).
 
 use bevy::prelude::*;
-use marble_csg::scenes::{rotation_mat2, ClassicHandles, MengerHandles};
+use marble_csg::scenes::{rotation_mat2, ClassicHandles, HollowDonutHandles, MengerHandles};
 use marble_csg::{IntParam, Mat2Param, Params, ScalarParam, Vec3Param};
 
 use crate::gpu::MarcherFrameData;
@@ -172,12 +172,21 @@ fn build_entries(handles: &SceneHandles, params: &Params) -> Vec<ParamEntry> {
             entries.push(ParamEntry::new(name, ParamBinding::Vec3Component(h.color, i), params, 0.0, 1.0, 0.005));
         }
     };
+    let donut = |entries: &mut Vec<ParamEntry>, h: &HollowDonutHandles| {
+        // `minor`'s floor stays above `thickness`'s ceiling plus the marble
+        // radius (0.15), so no slider position can close the tube's free
+        // interior around the marble entirely.
+        entries.push(ParamEntry::new("major", ParamBinding::Scalar(h.major), params, 1.5, 6.0, 0.01));
+        entries.push(ParamEntry::new("minor", ParamBinding::Scalar(h.minor), params, 0.7, 2.0, 0.005));
+        entries.push(ParamEntry::new("thick", ParamBinding::Scalar(h.thickness), params, 0.05, 0.4, 0.002));
+    };
     match handles {
         SceneHandles::Classic(h) => classic(&mut entries, h),
         SceneHandles::Menger(h) => menger(&mut entries, h),
         // The bite radius is Expr-animated (module doc) -- only the sponge's
         // own params are editable here.
         SceneHandles::MengerOscillatingSphere(h) => menger(&mut entries, &h.menger),
+        SceneHandles::HollowDonut(h) => donut(&mut entries, h),
     }
     entries
 }
