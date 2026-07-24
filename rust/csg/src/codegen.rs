@@ -889,6 +889,24 @@ fn calc_normal(p: vec3<f32>, eps: f32) -> vec3<f32> {
 // (see callers' doc) both terminates the march once further stepping
 // can't change anything visible and is used as the base occlusion test
 // (matching MMCE's `pos.w < max(fovray*dir.w, MIN_DIST)`).
+// A ray that exhausts SHADOW_STEPS without either hitting an occluder or
+// escaping past MAX_DIST reports **occluded** (0.0), not whatever partial
+// visibility it had accumulated so far. Without this, enclosed geometry
+// produces scalloped false-light bands: inside a closed shell (the
+// hollow-donut scene) every step's `h` is bounded by the cavity radius, so
+// 16 steps can never carry the ray to MAX_DIST -- every interior ray
+// exhausts mid-flight, and the sawtooth iso-contours of \"how far did my
+// budget happen to get\" render as jagged shadow lines on smooth walls
+// (root-caused empirically: the artifact survives ?shadowlod=0 and doesn't
+// match the ?stepheat=1 contours, and vanishes at SHADOW_STEPS = 64).
+// Treating exhaustion as occlusion is also simply the honest answer -- the
+// march could not verify that light reaches this point. Open scenes are
+// unaffected in practice (outside geometry `h` grows rapidly, so
+// sun-visible rays escape well within budget -- why 16 steps looked fine
+// on every fractal scene and only the donut's smooth enclosed interior
+// exposed it); deep crevices get slightly darker, which is the more
+// correct direction. Penumbra edges keep their smooth arcsine remap: rays
+// that genuinely escape still return their accumulated soft visibility.
 fn shadow(ro: vec3<f32>, rd: vec3<f32>, pixel_angle: f32) -> f32 {
     var pos = ro;
     var t = 0.0;
@@ -896,6 +914,7 @@ fn shadow(ro: vec3<f32>, rd: vec3<f32>, pixel_angle: f32) -> f32 {
     var light_visibility = 1.0;
     var ph = 1e5;
     var d_de_dt = 0.0;
+    var escaped = false;
     for (var i = 0; i < SHADOW_STEPS; i++) {
         t += h;
         pos += rd * h;
@@ -910,11 +929,15 @@ fn shadow(ro: vec3<f32>, rd: vec3<f32>, pixel_angle: f32) -> f32 {
         ph = h;
 
         if (t > MAX_DIST) {
+            escaped = true;
             break;
         }
         if (h < max(t * pixel_angle, MIN_HIT_DIST)) {
             return 0.0;
         }
+    }
+    if (!escaped) {
+        return 0.0;
     }
     light_visibility = clamp(light_visibility, 0.0, 1.0);
     // Same \"looks better and is more physically accurate for a circular
