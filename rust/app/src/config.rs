@@ -73,6 +73,13 @@ pub struct Config {
     /// on top (`Settings.h`'s `exposure`/`auto_exposure_*`); this is the
     /// fixed-value starting point.
     pub exposure: f32,
+    /// `?material_gamma=<f>`/`MM_MATERIAL_GAMMA=<f>` -- the terrain-albedo
+    /// gamma boost (`albedo = pow(albedo, 1/this)`, rides in
+    /// `SceneUniforms::misc3.z`). Default 0.5 (albedo squared), matching
+    /// the C++ original's shipped `gamma_material` default; `1.0` disables
+    /// the boost for A/B comparison. Same parse-fallback convention as
+    /// `exposure`.
+    pub material_gamma: f32,
 }
 
 impl Config {
@@ -96,6 +103,10 @@ impl Config {
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| *v > 0.0)
                 .unwrap_or(1.0),
+            material_gamma: query_value("material_gamma", "MM_MATERIAL_GAMMA")
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(0.5),
         }
     }
 }

@@ -321,7 +321,7 @@ enum Combine {
 /// this uniform was never populated), which `ray_sphere_clip` (`MARCH_CORE`)
 /// treats as "don't clip, march the full range" rather than "everything
 /// misses". `misc3.x` is the fine pass's debug-view-mode selector (fine
-/// pass only -- see `MARCHER`'s `fragment`; z/w unused, added as its own
+/// pass only -- see `MARCHER`'s `fragment`; `w` unused, added as its own
 /// field rather than squeezed into `misc`/`misc2` since both of those are
 /// already fully occupied): `0` off, `1` the fine pass's own per-pixel
 /// ray-march step-count heatmap (the original `?stepheat=1` view), `2` the
@@ -333,7 +333,10 @@ enum Combine {
 /// debug flag here. `misc3.y` is the fine pass's exposure multiplier for
 /// the ACES tonemap (`MARCHER`'s `tonemap`; `?exposure=`/`MM_EXPOSURE`,
 /// default 1.0 -- non-positive values fall back to 1.0 in the shader so an
-/// unset uniform can't black the frame out).
+/// unset uniform can't black the frame out). `misc3.z` is the fine pass's
+/// material gamma for the terrain-albedo boost (`MARCHER`'s `fragment`;
+/// `?material_gamma=`/`MM_MATERIAL_GAMMA`, default 0.5 = albedo squared,
+/// same non-positive-means-unset guard).
 ///
 /// The single authoritative field list for the GPU `SceneUniforms` ABI --
 /// every `vec4<f32>`, same order the Rust-side `render.rs::SceneUniforms`
@@ -1523,7 +1526,23 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         // folded p component is negative and no later iteration's max
         // overrides it) -- a negative `base` would go on to make `color`
         // negative and NaN in `tonemap`'s `pow`.
-        let base = clamp(col.rgb / (1.0 + abs(col.rgb)), vec3<f32>(0.0), vec3<f32>(1.0));
+        let base_compressed = clamp(col.rgb / (1.0 + abs(col.rgb)), vec3<f32>(0.0), vec3<f32>(1.0));
+        // Albedo gamma boost, ported from MMCE's `lighting()`
+        // (utility/shading.glsl: `albedo = pow(albedo, 1/gamma_material)`,
+        // shipped default `gamma_material = 0.5` -- i.e. the albedo is
+        // *squared*, with the original's own comment reading \"square it to
+        // make the fractals more colorfull\"). Squaring a [0,1) albedo
+        // deepens mids and amplifies channel ratios (saturation), the
+        // second-biggest contributor to the C++ look after the ACES curve.
+        // Rides in `misc3.z` (`?material_gamma=`/`MM_MATERIAL_GAMMA`), same
+        // fallback-guard convention as `tonemap`'s `misc3.y` exposure:
+        // non-positive means unset, use the 0.5 default. Terrain albedo
+        // only -- the marble's cubemap color and the flat outline/debug
+        // colors are authored display values, not fractal orbit output, and
+        // MMCE's own gamma applies only in its fractal-surface `lighting()`
+        // path too.
+        let material_gamma = select(0.5, scene.misc3.z, scene.misc3.z > 0.0);
+        let base = pow(base_compressed, vec3<f32>(1.0 / material_gamma));
         let diffuse = max(dot(n, scene.sun.xyz), 0.0);
         // `scene.misc2.y` is the `MM_SHADOW_LOD` on/off flag (same
         // uniform-flag convention as MRRM's `misc.w`, for the same

@@ -1638,7 +1638,12 @@ fn update_frame_data_impl(
         // `MARCHER::fragment`'s doc) -- coarse/shadow never read `misc3`,
         // so `base`'s default `0.0` there is fine as leftover unread
         // padding, same as every other fine-only field here.
-        misc3: Vec4::new(toggles.view_mode.as_uniform_value(), config.exposure, 0.0, 0.0),
+        misc3: Vec4::new(
+            toggles.view_mode.as_uniform_value(),
+            config.exposure,
+            config.material_gamma,
+            0.0,
+        ),
         ..base
     };
 
