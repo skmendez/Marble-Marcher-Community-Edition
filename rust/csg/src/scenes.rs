@@ -345,15 +345,35 @@ const DONUT_BASE_COLOR: Vec3 = Vec3::new(1.0, 0.12, 0.08);
 /// fold: `b <- z` with a deliberately large coefficient (2.2, not a
 /// subtle 0.4) -- the shader Reinhard-compresses orbit into `v/(1+v)`, so
 /// a large coefficient completes the dark->bright ramp within ~10 degrees
-/// past each of the 8 wedge seams and *saturates* elsewhere: warm amber
-/// rib lines on an otherwise violet-magenta body (the saturated blue over
-/// the base's warm undertone). Verified across screenshot rounds: gentle
-/// coefficients simply do not survive the compression -- a 45-degree-wide
-/// soft gradient never reads as banding at all.
+/// of each rib and *saturates* elsewhere. Verified across screenshot
+/// rounds: gentle coefficients simply do not survive the compression.
+///
+/// **This yields 4 ribs, not 8** (a correction to this doc's earlier
+/// claim, prompted by counting them in an exterior screenshot). The three
+/// plane folds generate the dihedral group D4: 8 wedge *copies*, but the
+/// two edges of the fundamental wedge are not equivalent -- they lie on
+/// two different mirror-plane families. `z_folded = 0` (rib: stripe term
+/// vanishes, crimson base shows) happens only on the x/z-axis mirrors,
+/// whose orbit is the **4 cardinal angles**; the diagonal mirrors carry
+/// `z_folded = max` (fully saturated blue), orbit = the 4 diagonal
+/// angles. Equivalently: folding makes any function of folded coordinates
+/// mirror-symmetric across every seam, so a monotone ramp in `z` unfolds
+/// to a *triangle wave* -- one valley + one peak per 90 degrees. The 8
+/// skylights don't share this halving because their cutter sits at the
+/// wedge's *interior* mid-angle (22.5deg), a generic point whose D4 orbit
+/// is the full 8; wedge-*edge* features always come in 4s. (To actually
+/// get 8 ribs: add a fourth plane fold at 22.5deg -- D8, 16 copies, rib
+/// orbit = cardinals + diagonals = 8 -- and re-seat the skylight cutter
+/// *on* the new mirror plane so its multiplicity stays 8 rather than
+/// doubling to 16.)
 const DONUT_STRIPE_COLOR: Vec3 = Vec3::new(0.0, 0.0, 2.2);
 
-/// How many skylights/stripe repeats around the ring: 3 plane folds halve
-/// the angular domain three times, `2^3 = 8` copies of the fold wedge.
+/// How many skylights around the ring: 3 plane folds halve the angular
+/// domain three times, `2^3 = 8` copies of the fold wedge, and the cutter
+/// sits at the wedge's interior mid-angle, whose orbit is the full 8.
+/// NOTE this is the *skylight* count, not the stripe-rib count -- ribs
+/// live on wedge *edges* and come in 4s (see [`DONUT_STRIPE_COLOR`]'s
+/// orbit-size explanation).
 pub const DONUT_SYMMETRY: usize = 8;
 
 /// The skylight cutter sphere: centered at the fold wedge's mid-angle
@@ -407,10 +427,12 @@ pub const DONUT_SKYLIGHT_HEIGHT: f32 = 1.0;
 ///    sun/sky light pour in (bright pools on the tunnel floor, and a
 ///    rhythm of landmarks that makes travel around the ring legible).
 ///  - **Stripes**: an `OrbitMax` placed *after* the plane folds samples
-///    the wedge-folded position, so the albedo carries the same 8-fold
-///    angular banding ([`DONUT_STRIPE_COLOR`]) -- the bands recede around
-///    the tunnel's curve, which is what actually reads as "inside a
-///    donut" instead of "inside a vague pale tube".
+///    the wedge-folded position -- a triangle wave around the ring: 4
+///    crimson ribs at the cardinal angles, saturated violet between
+///    ([`DONUT_STRIPE_COLOR`]'s doc explains the orbit-size math of why
+///    ribs come in 4s while skylights come in 8s). The bands recede
+///    around the tunnel's curve, which is what actually reads as "inside
+///    a donut" instead of "inside a vague pale tube".
 pub fn hollow_donut(params: &mut Params) -> (Object, HollowDonutHandles) {
     use std::f32::consts::FRAC_PI_8;
 
@@ -463,9 +485,10 @@ pub fn hollow_donut(params: &mut Params) -> (Object, HollowDonutHandles) {
             normal: Vec3Value::Const(Vec3::new(sqrt_half, 0.0, -sqrt_half)),
             offset: ScalarValue::Const(0.0),
         },
-        // Final-wedge-depth stripe sample -- 8 crisp rib lines (see
-        // DONUT_STRIPE_COLOR's doc; the base color is the rib color, this
-        // paints the violet body between them).
+        // Final-wedge-depth stripe sample -- 4 crisp rib lines at the
+        // cardinal angles (see DONUT_STRIPE_COLOR's doc for why 4, not 8;
+        // the base color is the rib color, this paints the violet body
+        // between them).
         Fold::OrbitMax(Vec3Value::Const(DONUT_STRIPE_COLOR)),
     ]);
 
