@@ -31,7 +31,7 @@ use bevy::window::WindowResolution;
 
 use camera::{orbit_camera_input, CameraOrbit};
 use config::Config;
-use debug_gizmos::draw_thrust_debug;
+use debug_gizmos::{draw_thrust_debug, setup_thrust_debug_arrows};
 use debug_screenshot::DebugScreenshotPlugin;
 use fps_overlay::FpsOverlayPlugin;
 use gpu::MarcherGpuPlugin;
@@ -191,6 +191,11 @@ fn main() {
                 // `MultiplayerSession` (the sim's live params) -- hence
                 // inside this chain, after `setup`.
                 spawn_param_panel,
+                // Spawns the 3 persistent thrust-debug arrow entities
+                // (`debug_gizmos.rs`'s module doc) -- only needs `Config`,
+                // same as `seed_live_debug_toggles` above; placed last
+                // purely by convention, nothing later depends on it.
+                setup_thrust_debug_arrows,
             )
                 .chain(),
         )
