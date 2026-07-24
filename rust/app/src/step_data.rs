@@ -39,6 +39,13 @@
 //! `update_frame_data_impl`; this module adds zero new per-frame CPU-side
 //! uniform writes.
 //!
+//! Also reads the shadow pass's own render target (`shadow_pass::
+//! ShadowRenderTarget`), alongside the coarse one, since the real fine pass's
+//! warm-start now prefers the shadow pass's own march distance over the
+//! coarse guess when it hit something (`marble_csg::codegen::MARCHER`'s
+//! doc) -- this pass has to read the same texture to stay a faithful proxy
+//! for the real fine pass's step count.
+//!
 //! Readback uses Bevy's own public `bevy_render::gpu_readback` machinery
 //! directly (`Readback`/`ReadbackComplete`), not a hand-rolled
 //! `map_async`/channel pipeline the way `gpu_profile.rs` had to build:
@@ -121,13 +128,16 @@ const STEPDATA_SHADER_HANDLE: Handle<Shader> = weak_handle!("2c9f4e6a-8b1d-4f7c-
 /// come from `gpu::MarcherGpuBuffers`'s persistent shared buffers -- the
 /// *same* `fine_scene` uniform the real fine pass's own material reads
 /// (module doc's "Crucially" paragraph) -- binding 2 is the MRRM coarse
-/// pass's cached hit-distance texture (needed to warm-start identically to
-/// the fine pass). No shadow-texture/marble-buffer/marble-cubemap bindings:
-/// none of those affect step count, so this material's bind-group layout is
-/// deliberately smaller than `FineMarcherMaterial`'s.
+/// pass's cached hit-distance texture, binding 3 is the shadow pass's cached
+/// visibility/traveled-distance texture (both needed to warm-start
+/// identically to the fine pass, `MARCHER`'s doc on the shadow-tier
+/// warm-start). Still no marble-buffer/marble-cubemap bindings: those affect
+/// shading, not step count, so this material's bind-group layout stays
+/// smaller than `FineMarcherMaterial`'s in that one respect.
 #[derive(Asset, TypePath, Clone)]
 pub struct StepDataMaterial {
     pub coarse: Handle<Image>,
+    pub shadow: Handle<Image>,
 }
 
 impl AsBindGroup for StepDataMaterial {
@@ -151,10 +161,16 @@ impl AsBindGroup for StepDataMaterial {
         let scene = buffers.fine_scene.binding().ok_or(AsBindGroupError::RetryNextUpdate)?;
         let params = buffers.params.binding().ok_or(AsBindGroupError::RetryNextUpdate)?;
         let coarse = images.get(&self.coarse).ok_or(AsBindGroupError::RetryNextUpdate)?;
+        let shadow = images.get(&self.shadow).ok_or(AsBindGroupError::RetryNextUpdate)?;
         let bind_group = render_device.create_bind_group(
             Self::label(),
             layout,
-            &BindGroupEntries::with_indices(((0, scene), (1, params), (2, &coarse.texture_view))),
+            &BindGroupEntries::with_indices((
+                (0, scene),
+                (1, params),
+                (2, &coarse.texture_view),
+                (3, &shadow.texture_view),
+            )),
         );
         Ok(PreparedBindGroup { bindings: BindingResources(Vec::new()), bind_group, data: () })
     }
@@ -179,6 +195,7 @@ impl AsBindGroup for StepDataMaterial {
                 (0, uniform_buffer::<SceneUniforms>(false)),
                 (1, storage_buffer_read_only::<Vec<Vec4>>(false)),
                 (2, texture_2d(TextureSampleType::Float { filterable: true })),
+                (3, texture_2d(TextureSampleType::Float { filterable: true })),
             ),
         )
         .to_vec()
@@ -256,12 +273,15 @@ fn make_stepdata_render_target_image(size: UVec2) -> Image {
 
 /// `Startup` system, chained after `mrrm::setup_mrrm_pipeline` (needs
 /// `CoarseRenderTarget` to already exist for this pass's own `coarse_tex`
-/// binding). Only spawns this pass's camera/quad/readback at all when
-/// `Config.gpu_profile_enabled` is true at startup -- true no-op otherwise:
-/// no camera, no render-graph subgraph, no readback, matching the standard
-/// every other profiling feature in this app already holds itself to.
+/// binding) and `shadow_pass::setup_shadow_pipeline` (needs
+/// `ShadowRenderTarget` likewise, for `shadow_tex` -- `main.rs`'s startup
+/// chain already runs mrrm -> shadow -> step_data in that order). Only spawns
+/// this pass's camera/quad/readback at all when `Config.gpu_profile_enabled`
+/// is true at startup -- true no-op otherwise: no camera, no render-graph
+/// subgraph, no readback, matching the standard every other profiling
+/// feature in this app already holds itself to.
 ///
-/// Eight `SystemParam`s is one over clippy's default `too_many_arguments`
+/// Nine `SystemParam`s is over clippy's default `too_many_arguments`
 /// threshold -- same situation, same reasoning, as `mrrm::setup_mrrm_pipeline`:
 /// splitting this into multiple chained systems just to dodge the lint
 /// would need an intermediate resource purely to shuttle values between
@@ -275,6 +295,7 @@ pub fn setup_step_data_pipeline(
     mut shaders: ResMut<Assets<Shader>>,
     mut images: ResMut<Assets<Image>>,
     coarse_render_target: Res<CoarseRenderTarget>,
+    shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
     mp: Res<MultiplayerSession>,
 ) {
     if !config.gpu_profile_enabled {
@@ -285,7 +306,10 @@ pub fn setup_step_data_pipeline(
     shaders.insert(STEPDATA_SHADER_HANDLE.id(), Shader::from_wgsl(wgsl, "generated://marcher_stepdata.wgsl"));
 
     let image_handle = images.add(make_stepdata_render_target_image(STEPDATA_TARGET_SIZE));
-    let material = materials.add(StepDataMaterial { coarse: coarse_render_target.image.clone() });
+    let material = materials.add(StepDataMaterial {
+        coarse: coarse_render_target.image.clone(),
+        shadow: shadow_render_target.image.clone(),
+    });
 
     commands
         .spawn((

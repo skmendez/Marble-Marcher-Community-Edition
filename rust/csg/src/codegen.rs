@@ -479,6 +479,20 @@ const OVERRELAX: f32 = 1.4;
 // (near-)zero extremely close to the camera/light. MMCE's equivalent is a
 // `MIN_DIST` uniform; we don't have one, so this is a fixed small constant.
 const MIN_HIT_DIST: f32 = 1e-5;
+// Threshold for recognizing `COARSE_MARCHER`'s R-channel miss sentinel
+// (`-1.0`, its doc) when reading the coarse render target back, e.g.
+// `MARCHER`'s sky-miss-skip check -- deliberately *not* a bare `<= 0.0` test: a genuine
+// hit's reported distance is `march_scene`'s `candidate_t`, which for
+// domain-repeated (`Fold::Repeat`-heavy) scenes with a badly cheapened
+// coarse-iteration DE (verified live: the `demo` scene) can itself land at
+// or slightly below zero via the over-relaxed march's backtrack-on-overstep
+// step (`t += (1.0 - omega) * prev_h`, which *decreases* `t`) -- a real,
+// if degenerate, hit, not the `-1.0` sentinel. `<= 0.0` would misclassify
+// that as a miss (confirmed live: it did, rendering the whole `demo` scene
+// as flat sky before this threshold was tightened). `-0.5` sits comfortably
+// below any plausible near-zero backtrack overshoot while still well above
+// the exact `-1.0` sentinel, so it only ever matches a genuine miss.
+const COARSE_MISS_SENTINEL_THRESHOLD: f32 = -0.5;
 
 fn map(p: vec3<f32>) -> f32 {
     return de_scene(vec4<f32>(p, 1.0));
@@ -1155,6 +1169,25 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         // was verified with trustworthy: only this one value differs
         // between the two runs.
         var t0 = clip.x;
+        // True only when every one of the coarse pre-pass's 3x3 texels
+        // neighboring this pixel's own texel reports a genuine miss (the
+        // `-1.0` sentinel `COARSE_MARCHER` writes on both a bounding-sphere
+        // clip fail and an exhausted march -- see its doc). Skips the whole
+        // terrain march below (`MAX_STEPS` worth of wasted stepping through
+        // open sky) when true: a confirmed miss across a 3x3 neighborhood at
+        // the coarse pass's 1/8-linear (64x fewer pixels) resolution is
+        // extremely unlikely to be hiding a real fine-resolution surface --
+        // every one of those 9 coarse rays would have to have missed
+        // geometry a fine ray through the same texel finds, despite the
+        // coarse pass's own (cheapened, but still real) fractal evaluation.
+        // Deliberately doesn't touch the marble hit-test above (already run,
+        // unconditionally, before this block even starts) or the
+        // marble/outline shading below -- a marble can still be in frame
+        // over a terrain-confirmed-empty background; this only ever
+        // short-circuits the *terrain* `hit_frac` to false, exactly what a
+        // from-scratch march that ran to `MAX_STEPS` and found nothing would
+        // have produced anyway, just without spending the steps.
+        var sky_confirmed_miss = false;
         if (scene.misc.w > 0.5) {
             let coarse_dims = vec2<i32>(textureDimensions(coarse_tex));
             let texel = clamp(
@@ -1163,7 +1196,53 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
                 coarse_dims - vec2<i32>(1),
             );
             let coarse_t = textureLoad(coarse_tex, texel, 0).r;
-            if (coarse_t > 0.0) {
+
+            // 3x3 neighborhood read for the sky-miss-skip check above --
+            // each tap independently clamped to the texture bounds (same
+            // clamp-to-edge convention as the center texel just above), so
+            // an edge/corner pixel just re-samples its own row/column
+            // instead of wrapping or reading garbage.
+            let coarse_dims_max = coarse_dims - vec2<i32>(1);
+            let cn_nw = textureLoad(coarse_tex, clamp(texel + vec2<i32>(-1, -1), vec2<i32>(0), coarse_dims_max), 0).r;
+            let cn_n  = textureLoad(coarse_tex, clamp(texel + vec2<i32>( 0, -1), vec2<i32>(0), coarse_dims_max), 0).r;
+            let cn_ne = textureLoad(coarse_tex, clamp(texel + vec2<i32>( 1, -1), vec2<i32>(0), coarse_dims_max), 0).r;
+            let cn_w  = textureLoad(coarse_tex, clamp(texel + vec2<i32>(-1,  0), vec2<i32>(0), coarse_dims_max), 0).r;
+            let cn_e  = textureLoad(coarse_tex, clamp(texel + vec2<i32>( 1,  0), vec2<i32>(0), coarse_dims_max), 0).r;
+            let cn_sw = textureLoad(coarse_tex, clamp(texel + vec2<i32>(-1,  1), vec2<i32>(0), coarse_dims_max), 0).r;
+            let cn_s  = textureLoad(coarse_tex, clamp(texel + vec2<i32>( 0,  1), vec2<i32>(0), coarse_dims_max), 0).r;
+            let cn_se = textureLoad(coarse_tex, clamp(texel + vec2<i32>( 1,  1), vec2<i32>(0), coarse_dims_max), 0).r;
+            sky_confirmed_miss = coarse_t <= COARSE_MISS_SENTINEL_THRESHOLD
+                && cn_nw <= COARSE_MISS_SENTINEL_THRESHOLD && cn_n <= COARSE_MISS_SENTINEL_THRESHOLD && cn_ne <= COARSE_MISS_SENTINEL_THRESHOLD
+                && cn_w <= COARSE_MISS_SENTINEL_THRESHOLD                                             && cn_e <= COARSE_MISS_SENTINEL_THRESHOLD
+                && cn_sw <= COARSE_MISS_SENTINEL_THRESHOLD && cn_s <= COARSE_MISS_SENTINEL_THRESHOLD && cn_se <= COARSE_MISS_SENTINEL_THRESHOLD;
+
+            let coarse_pixel_angle = 2.0 * half_fov / max(f32(coarse_dims.y), 1.0);
+            // Shadow-tier warm-start: the half-resolution shadow/AO pass
+            // (`shadow_pass.rs`/`SHADOW_MARCHER`) already ran its own march
+            // at 4x pixel density vs. the coarse pass's 64x -- a strictly
+            // tighter, more spatially-accurate starting-distance guess than
+            // the coarse pass's, whenever it actually hit something. Its `A`
+            // channel is `MAX_DIST` on a miss (`SHADOW_MARCHER`'s doc -- not
+            // a negative sentinel, since `sample_shadow`'s far-away
+            // down-weighting wants a large, not negative, value there), so
+            // \"did it hit\" is a plain `< MAX_DIST` check; preferred outright
+            // over the coarser guess (not blended) when true, same
+            // single-warm-start-winner simplicity as MRRM's own
+            // coarse-vs-camera choice. Falls back to the coarse guess above
+            // when the shadow pass's own march missed too. Same back-off-by-
+            // one-texel's-angular-footprint reasoning as the coarse guess,
+            // just at this pass's own (denser) resolution.
+            let shadow_dims = vec2<i32>(textureDimensions(shadow_tex));
+            let shadow_texel = clamp(
+                vec2<i32>(mesh.uv * vec2<f32>(shadow_dims)),
+                vec2<i32>(0),
+                shadow_dims - vec2<i32>(1),
+            );
+            let shadow_td = textureLoad(shadow_tex, shadow_texel, 0).a;
+            if (shadow_td < MAX_DIST) {
+                let shadow_pixel_angle = 2.0 * half_fov / max(f32(shadow_dims.y), 1.0);
+                t0 = max(t0, shadow_td - shadow_td * shadow_pixel_angle);
+            } else if (coarse_t > 0.0) {
                 // Back off by roughly one coarse-pixel's angular footprint at
                 // that depth, computed from the coarse pass's *own* resolution
                 // (`coarse_dims`, not this pass's `pixel_angle`) -- a real
@@ -1174,9 +1253,36 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
                 // past by starting exactly on top of (or beyond) the coarse
                 // guess. The over-relaxed march's backtrack-on-overstep handles
                 // the rest -- see `march_scene`'s doc.
-                let coarse_pixel_angle = 2.0 * half_fov / max(f32(coarse_dims.y), 1.0);
                 t0 = max(t0, coarse_t - coarse_t * coarse_pixel_angle);
             }
+        }
+
+        // Safety corroboration against `COARSE_MARCHER`'s cheapened-
+        // iteration DE being systematically *wrong* (not just imprecise)
+        // for domain-repeated (`Fold::Repeat`-heavy) scenes -- verified
+        // live against a real build: on the `demo` scene (`classic()`
+        // unioned with `creme_spheres()`'s domain-repeated sphere lattice),
+        // the coarse pass's reduced iteration count (`COARSE_ITERATION_DIVISOR`)
+        // reports a confirmed miss for essentially *every* pixel, even
+        // though the real, full-fidelity surface is right there -- without
+        // this check, `sky_confirmed_miss` would skip the terrain march for
+        // the whole frame and render it as flat sky, a real (not just
+        // slower-than-hoped) correctness regression, not merely the
+        // already-known-and-out-of-scope \"no MRRM speedup on this scene\"
+        // finding. A single extra `map()` call here, using *this* pass's own
+        // full-fidelity `de_scene` (not the coarse pass's reduced-iteration
+        // copy), directly measures the real distance to geometry at the
+        // march's own starting point, independent of whatever went wrong in
+        // the coarse pass -- a tiny fixed cost next to the up-to-
+        // `fine_max_steps` march it's guarding against wrongly skipping.
+        // The generous 8x margin over the normal hit threshold errs toward
+        // *not* trusting the skip (falling through to a real march, always
+        // safe -- see `march_scene`'s doc) whenever the probe finds anything
+        // even plausibly close, rather than toward saving the last few
+        // percent of steps on a hair-trigger threshold.
+        if (sky_confirmed_miss) {
+            let sky_probe_d = map(ro + rd * t0);
+            sky_confirmed_miss = sky_probe_d > max(t0 * pixel_angle, MIN_HIT_DIST) * 8.0;
         }
 
         // `scene.misc2.z`: `?perfprobe=`'s runtime fine-pass step-budget
@@ -1186,10 +1292,12 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         // march's step count for one probe window, to measure how much of
         // the fine pass's GPU cost the step budget itself accounts for.
         fine_max_steps = select(FINE_MAX_STEPS, i32(scene.misc2.z), scene.misc2.z > 0.5);
-        let march = march_scene(ro, rd, t0, pixel_angle, clip.y, fine_max_steps);
-        t = march.t;
-        hit_frac = march.hit;
-        iters = march.iters;
+        if (!sky_confirmed_miss) {
+            let march = march_scene(ro, rd, t0, pixel_angle, clip.y, fine_max_steps);
+            t = march.t;
+            hit_frac = march.hit;
+            iters = march.iters;
+        }
     }
 
     // The globally-nearest candidate (across every marble's own body-or-
@@ -1378,10 +1486,11 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
 ";
 
 /// A small auxiliary pass (`rust/app/src/step_data.rs`) that runs the exact
-/// same terrain march the fine pass (`MARCHER`) does -- same MRRM warm-start
-/// (reading the *same* `coarse_tex`, the *same* `scene.misc.w` flag, the
-/// *same* shared `fine_scene` uniform buffer), same `fine_max_steps` budget
-/// -- but into a tiny fixed-size render target, writing the raw step count
+/// same terrain march the fine pass (`MARCHER`) does -- same MRRM warm-start,
+/// same sky-miss-skip, same shadow-tier warm-start (reading the *same*
+/// `coarse_tex`/`shadow_tex`, the *same* `scene.misc.w` flag, the *same*
+/// shared `fine_scene` uniform buffer), same `fine_max_steps` budget -- but
+/// into a tiny fixed-size render target, writing the raw step count
 /// (`f32(iters)`) as data instead of a shaded/heatmap color. `?gpuprofile=1`'s
 /// overlay reads this small target back to the CPU and averages it as a
 /// statistical estimate of the real fine pass's per-pixel step-count
@@ -1390,6 +1499,10 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
 /// march itself, stripped of every fine-pass concern that doesn't affect
 /// `iters`: no marble/outline hit-testing, no shading, no `?stepheat=1`
 /// coloring, none of which change how many steps the terrain march takes).
+/// Needs `shadow_tex` now (added alongside the fine pass's shadow-tier
+/// warm-start reuse) even though this pass does no shading of its own --
+/// otherwise this proxy would silently under-count relative to the real fine
+/// pass whenever the shadow warm-start wins over the coarse one.
 /// A ray that misses the bounding sphere entirely (`clip.x > clip.y`, the
 /// march block below never runs) naturally reports `0` -- correct, since no
 /// march step was ever spent on it, same as `MARCHER`'s own `var iters = 0;`
@@ -1412,12 +1525,12 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
 
     var iters = 0;
     if (clip.x <= clip.y) {
-        // Identical MRRM warm-start to `MARCHER`'s own -- see that
-        // fragment's doc for the exact reasoning behind the backoff
-        // formula; kept byte-for-byte the same here so this pass is a
-        // faithful proxy for the real fine pass's step count, not an
-        // approximation of it.
+        // Identical MRRM warm-start/sky-miss-skip/shadow-tier warm-start to
+        // `MARCHER`'s own -- see that fragment's doc for the exact reasoning;
+        // kept byte-for-byte the same here so this pass is a faithful proxy
+        // for the real fine pass's step count, not an approximation of it.
         var t0 = clip.x;
+        var sky_confirmed_miss = false;
         if (scene.misc.w > 0.5) {
             let coarse_dims = vec2<i32>(textureDimensions(coarse_tex));
             let texel = clamp(
@@ -1426,14 +1539,49 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
                 coarse_dims - vec2<i32>(1),
             );
             let coarse_t = textureLoad(coarse_tex, texel, 0).r;
-            if (coarse_t > 0.0) {
-                let coarse_pixel_angle = 2.0 * half_fov / max(f32(coarse_dims.y), 1.0);
+
+            let coarse_dims_max = coarse_dims - vec2<i32>(1);
+            let cn_nw = textureLoad(coarse_tex, clamp(texel + vec2<i32>(-1, -1), vec2<i32>(0), coarse_dims_max), 0).r;
+            let cn_n  = textureLoad(coarse_tex, clamp(texel + vec2<i32>( 0, -1), vec2<i32>(0), coarse_dims_max), 0).r;
+            let cn_ne = textureLoad(coarse_tex, clamp(texel + vec2<i32>( 1, -1), vec2<i32>(0), coarse_dims_max), 0).r;
+            let cn_w  = textureLoad(coarse_tex, clamp(texel + vec2<i32>(-1,  0), vec2<i32>(0), coarse_dims_max), 0).r;
+            let cn_e  = textureLoad(coarse_tex, clamp(texel + vec2<i32>( 1,  0), vec2<i32>(0), coarse_dims_max), 0).r;
+            let cn_sw = textureLoad(coarse_tex, clamp(texel + vec2<i32>(-1,  1), vec2<i32>(0), coarse_dims_max), 0).r;
+            let cn_s  = textureLoad(coarse_tex, clamp(texel + vec2<i32>( 0,  1), vec2<i32>(0), coarse_dims_max), 0).r;
+            let cn_se = textureLoad(coarse_tex, clamp(texel + vec2<i32>( 1,  1), vec2<i32>(0), coarse_dims_max), 0).r;
+            sky_confirmed_miss = coarse_t <= COARSE_MISS_SENTINEL_THRESHOLD
+                && cn_nw <= COARSE_MISS_SENTINEL_THRESHOLD && cn_n <= COARSE_MISS_SENTINEL_THRESHOLD && cn_ne <= COARSE_MISS_SENTINEL_THRESHOLD
+                && cn_w <= COARSE_MISS_SENTINEL_THRESHOLD                                             && cn_e <= COARSE_MISS_SENTINEL_THRESHOLD
+                && cn_sw <= COARSE_MISS_SENTINEL_THRESHOLD && cn_s <= COARSE_MISS_SENTINEL_THRESHOLD && cn_se <= COARSE_MISS_SENTINEL_THRESHOLD;
+
+            let coarse_pixel_angle = 2.0 * half_fov / max(f32(coarse_dims.y), 1.0);
+            let shadow_dims = vec2<i32>(textureDimensions(shadow_tex));
+            let shadow_texel = clamp(
+                vec2<i32>(mesh.uv * vec2<f32>(shadow_dims)),
+                vec2<i32>(0),
+                shadow_dims - vec2<i32>(1),
+            );
+            let shadow_td = textureLoad(shadow_tex, shadow_texel, 0).a;
+            if (shadow_td < MAX_DIST) {
+                let shadow_pixel_angle = 2.0 * half_fov / max(f32(shadow_dims.y), 1.0);
+                t0 = max(t0, shadow_td - shadow_td * shadow_pixel_angle);
+            } else if (coarse_t > 0.0) {
                 t0 = max(t0, coarse_t - coarse_t * coarse_pixel_angle);
             }
         }
+        // Same full-fidelity-`map()` safety corroboration as `MARCHER`'s own
+        // -- see that fragment's doc for why this is load-bearing, not just
+        // an extra-cautious nicety (the `demo` scene's coarse pass reports a
+        // confirmed miss for essentially every pixel).
+        if (sky_confirmed_miss) {
+            let sky_probe_d = map(ro + rd * t0);
+            sky_confirmed_miss = sky_probe_d > max(t0 * pixel_angle, MIN_HIT_DIST) * 8.0;
+        }
         let fine_max_steps = select(FINE_MAX_STEPS, i32(scene.misc2.z), scene.misc2.z > 0.5);
-        let march = march_scene(ro, rd, t0, pixel_angle, clip.y, fine_max_steps);
-        iters = march.iters;
+        if (!sky_confirmed_miss) {
+            let march = march_scene(ro, rd, t0, pixel_angle, clip.y, fine_max_steps);
+            iters = march.iters;
+        }
     }
 
     return vec4<f32>(f32(iters), 0.0, 0.0, 1.0);
@@ -1522,19 +1670,25 @@ pub fn generate_shader(obj: &Object) -> String {
 /// Full fragment shader for the small auxiliary step-count-data pass
 /// (`rust/app/src/step_data.rs`, `?gpuprofile=1`'s cumulative-step-count
 /// estimate): import line, bindings, the MRRM coarse-texture binding (needs
-/// `coarse_tex` -- must warm-start identically to the fine pass), the *full
-/// fidelity* scene functions (`generate_scene_functions`, divisor 1, NOT
+/// `coarse_tex` -- must warm-start identically to the fine pass) and the
+/// shadow-texture binding (needs `shadow_tex` too, now that the fine pass's
+/// warm-start prefers the shadow pass's own march distance when it hit
+/// something -- `STEPDATA_MARCHER`'s doc), the *full fidelity* scene
+/// functions (`generate_scene_functions`, divisor 1, NOT
 /// `COARSE_ITERATION_DIVISOR` -- this pass exists to proxy the *fine* pass's
 /// step count, not the coarse pass's own reduced-detail march), shared march
-/// core, and the `STEPDATA_MARCHER` entry. No shadow-texture/marble-buffer/
-/// marble-cubemap bindings -- none of those affect step count, so this
-/// pass's bind-group layout is deliberately smaller than the fine pass's.
+/// core, and the `STEPDATA_MARCHER` entry. Still no marble-buffer/
+/// marble-cubemap bindings -- those affect shading, not step count, so this
+/// pass's bind-group layout stays smaller than the fine pass's in that one
+/// respect.
 pub fn generate_stepdata_shader(obj: &Object) -> String {
     let mut s = String::new();
     s.push_str("#import bevy_sprite::mesh2d_vertex_output::VertexOutput\n\n");
     s.push_str(&generate_library());
     s.push('\n');
     s.push_str(COARSE_TEXTURE_BINDING);
+    s.push('\n');
+    s.push_str(SHADOW_TEXTURE_BINDING);
     s.push('\n');
     s.push_str(&generate_scene_functions(obj));
     s.push_str("\n\n");
@@ -1896,17 +2050,19 @@ struct VertexOutput {
     }
 
     #[test]
-    fn stepdata_shader_has_coarse_texture_binding_but_no_shadow_or_marble_bindings() {
+    fn stepdata_shader_has_coarse_and_shadow_texture_bindings_but_no_marble_bindings() {
         // The stepdata pass must warm-start identically to the fine pass
-        // (needs `coarse_tex`), but doesn't shade anything, so it must not
-        // reference the shadow texture or marble cubemap bindings either --
-        // referencing either would be a real bind-group-layout mismatch
-        // (`step_data::StepDataMaterial` declares neither).
+        // (needs `coarse_tex` for MRRM/sky-miss-skip and `shadow_tex` for the
+        // shadow-tier warm-start, `STEPDATA_MARCHER`'s doc), but doesn't
+        // shade anything, so it must not reference the marble buffer or
+        // marble cubemap bindings -- referencing either would be a real
+        // bind-group-layout mismatch (`step_data::StepDataMaterial` declares
+        // neither).
         let mut params = Params::new();
         let (obj, _handles) = scenes::demo_scene(&mut params);
         let src = generate_stepdata_shader(&obj);
         assert!(src.contains("coarse_tex"), "stepdata shader must reference coarse_tex:\n{src}");
-        assert!(!src.contains("shadow_tex"), "stepdata shader must not reference shadow_tex:\n{src}");
+        assert!(src.contains("shadow_tex"), "stepdata shader must reference shadow_tex:\n{src}");
         assert!(!src.contains("marble_cubemap"), "stepdata shader must not reference marble_cubemap:\n{src}");
     }
 
