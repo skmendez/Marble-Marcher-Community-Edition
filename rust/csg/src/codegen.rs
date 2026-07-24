@@ -265,10 +265,17 @@ enum Combine {
 /// unbounded -- `marble_csg::Object::bounding_sphere` returned `None` -- or
 /// this uniform was never populated), which `ray_sphere_clip` (`MARCH_CORE`)
 /// treats as "don't clip, march the full range" rather than "everything
-/// misses". `misc3.x` is the `?stepheat=1` ray-march step-count heatmap
-/// debug flag (fine pass only -- see `MARCHER`'s `fragment`; y/z/w unused,
-/// added as its own field rather than squeezed into `misc`/`misc2` since
-/// both of those are already fully occupied).
+/// misses". `misc3.x` is the fine pass's debug-view-mode selector (fine
+/// pass only -- see `MARCHER`'s `fragment`; y/z/w unused, added as its own
+/// field rather than squeezed into `misc`/`misc2` since both of those are
+/// already fully occupied): `0` off, `1` the fine pass's own per-pixel
+/// ray-march step-count heatmap (the original `?stepheat=1` view), `2` the
+/// MRRM coarse pre-pass's own per-texel step count upscaled onto the fine
+/// image, `3` the coarse pre-pass's own cached hit distance upscaled the
+/// same way -- see `rust/app/src/live_debug.rs`'s `DebugViewMode` for the
+/// Rust-side enum this integer encodes, and why it's a live, no-reload
+/// toggle rather than a `Config`-seeded-at-startup one like every other
+/// debug flag here.
 ///
 /// The single authoritative field list for the GPU `SceneUniforms` ABI --
 /// every `vec4<f32>`, same order the Rust-side `render.rs::SceneUniforms`
@@ -638,11 +645,19 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(-1.0, 0.0, 0.0, 1.0);
     }
 
+    // G channel: this pass's own `iters` count, for the fine pass's
+    // `CoarseStepHeat` debug view (`scene.misc3.x == 2`, `MARCHER`'s
+    // `fragment`) -- R/B/A keep their original meaning (hit distance / 0.0 /
+    // 1.0) unchanged; G was unused before this, so this is additive, not a
+    // format change (`CoarseRenderTarget`'s `Rgba16Float` target already has
+    // room, `mrrm.rs`). A miss reports `MAX_STEPS` here (the full budget was
+    // spent and still found nothing), matching a genuinely maximal-cost
+    // pixel rather than the misleading \"0 steps\" a bare default would imply.
     let result = march_scene(ro, rd, clip.x, pixel_angle, clip.y, MAX_STEPS);
     if (result.hit) {
-        return vec4<f32>(result.t, 0.0, 0.0, 1.0);
+        return vec4<f32>(result.t, f32(result.iters), 0.0, 1.0);
     }
-    return vec4<f32>(-1.0, 0.0, 0.0, 1.0);
+    return vec4<f32>(-1.0, f32(MAX_STEPS), 0.0, 1.0);
 }
 ";
 
@@ -944,8 +959,61 @@ fn step_heat_color(frac: f32) -> vec3<f32> {
     return mix(mid, hot, (f - 0.5) * 2.0);
 }
 
+// View mode 3 (`CoarseStepDistance`, `scene.misc3.x == 3`): color-codes the
+// MRRM coarse pre-pass's own cached hit distance (`coarse_tex`'s R channel)
+// -- lets a texel-to-texel-inconsistent (aliased) pattern in this value be
+// spotted directly, rather than only inferred from its downstream effect on
+// step count. Normalized against twice the scene's own bounding-sphere
+// radius (a scene-relative reference distance that adapts across this app's
+// very differently-scaled scenes without a magic absolute constant),
+// falling back to half `MAX_DIST` for a genuinely unbounded scene
+// (`scene.bounding.w <= 0.0`, `ray_sphere_clip`'s doc). Deliberately a
+// distinct color family (teal -> white -> magenta) from `step_heat_color`'s
+// blue -> yellow -> red, so the two views are never visually ambiguous with
+// each other if a screenshot from one is looked at without its query
+// string handy.
+fn coarse_distance_color(dist: f32) -> vec3<f32> {
+    let reference = select(MAX_DIST * 0.5, scene.bounding.w * 2.0, scene.bounding.w > 0.0);
+    let f = clamp(dist / max(reference, MIN_HIT_DIST), 0.0, 1.0);
+    let near = vec3<f32>(0.0, 0.35, 0.35);
+    let mid = vec3<f32>(1.0, 1.0, 1.0);
+    let far = vec3<f32>(0.35, 0.0, 0.35);
+    if (f < 0.5) {
+        return mix(near, mid, f * 2.0);
+    }
+    return mix(mid, far, (f - 0.5) * 2.0);
+}
+
 @fragment
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
+    // View modes 2 (`CoarseStepHeat`) and 3 (`CoarseStepDistance`,
+    // `live_debug.rs`'s `DebugViewMode`) only ever need `mesh.uv` to look up
+    // the coarse pre-pass's own cached output for this pixel's texel, so
+    // they return here before any of the real march setup below (`ndc`/
+    // `ro`/`rd`/`clip`) -- deliberately a separate early-exit rather than
+    // threading a branch through the marble/terrain/outline shading further
+    // down, since these two views visualize the *coarse* pass's own numbers
+    // untouched by anything the fine pass itself does. Mode 1
+    // (`FineStepHeat`) is unaffected: it's handled by the existing
+    // `scene.misc3.x > 0.5` checks later in this function, which now only
+    // ever see mode 1 by the time they run, since modes 2/3 never reach
+    // them.
+    if (scene.misc3.x > 1.5) {
+        let coarse_dims = vec2<i32>(textureDimensions(coarse_tex));
+        let texel = clamp(vec2<i32>(mesh.uv * vec2<f32>(coarse_dims)), vec2<i32>(0), coarse_dims - vec2<i32>(1));
+        let sample = textureLoad(coarse_tex, texel, 0);
+        if (sample.r <= 0.0) {
+            // Coarse pass's own miss sentinel (`-1.0` in R, `mrrm.rs`'s
+            // doc) -- render as flat black in both modes rather than a
+            // meaningless color from a negative/`MAX_STEPS` value.
+            return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        }
+        if (scene.misc3.x > 2.5) {
+            return vec4<f32>(coarse_distance_color(sample.r), 1.0);
+        }
+        return vec4<f32>(step_heat_color(sample.g / f32(MAX_STEPS)), 1.0);
+    }
+
     let ndc = vec2<f32>(mesh.uv.x * 2.0 - 1.0, 1.0 - mesh.uv.y * 2.0);
     let aspect = scene.misc.x;
     let ro = scene.cam_pos.xyz;

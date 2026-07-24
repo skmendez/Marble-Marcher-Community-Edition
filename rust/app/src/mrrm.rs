@@ -12,8 +12,10 @@
 //! `Camera.order` (lowest first):
 //!  1. **This module's coarse pass** (`CoarseCamera`/`CoarseQuad`): marches
 //!     `de_scene` from `t=0` into a small offscreen `Rgba16Float` render
-//!     target (the hit distance in R, `-1.0` sentinel on a miss, G/B/A
-//!     unused), using its *own* resolution's cone angle
+//!     target (the hit distance in R, `-1.0` sentinel on a miss; G is this
+//!     march's own `iters` count, `MAX_STEPS` on a miss -- read by the fine
+//!     pass's `CoarseStepHeat` debug view, `render.rs`'s `live_debug.rs`
+//!     doc; B/A unused), using its *own* resolution's cone angle
 //!     (`update_coarse_material`'s `misc.z`) -- skips all shading (no
 //!     normals/color/shadow).
 //!  2. **`shadow_pass.rs`'s half-resolution shadow/AO pass**: also

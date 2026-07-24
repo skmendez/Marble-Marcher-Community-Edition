@@ -353,6 +353,17 @@ pub(crate) mod js_bridge {
         // there's no separate `supported` flag to thread through here.
         #[wasm_bindgen(js_namespace = mmNet, js_name = reportStepData)]
         pub fn report_step_data(avg_iters_per_px: f64, estimated_total_steps: f64);
+        // Live (no-reload) debug toggles (`live_debug.rs`) -- unlike every
+        // other call in this block, these are getters *polled* every frame
+        // rather than fire-and-forget pushes: `web/index.html`'s dat.gui
+        // panel mutates a plain JS object in place with no `onChange`
+        // handler, so Rust has to read it back each frame to notice a
+        // change, instead of the reload-then-re-parse-the-URL flow every
+        // other `Config` flag uses.
+        #[wasm_bindgen(js_namespace = mmNet, js_name = liveMrrmEnabled)]
+        pub fn live_mrrm_enabled() -> bool;
+        #[wasm_bindgen(js_namespace = mmNet, js_name = liveViewMode)]
+        pub fn live_view_mode() -> i32;
     }
 }
 
@@ -393,6 +404,18 @@ pub(crate) mod js_bridge {
     }
     pub fn report_pass_timings(_supported: bool, _coarse_ms: f64, _shadow_ms: f64, _fine_ms: f64, _present_ms: f64) {}
     pub fn report_step_data(_avg_iters_per_px: f64, _estimated_total_steps: f64) {}
+    // Never actually called on native: `live_debug.rs`'s
+    // `poll_live_debug_toggles` is a true no-op there, so these exist only
+    // to keep this stub module's shape matching the wasm one; values are
+    // inert, hence the `allow`.
+    #[allow(dead_code)]
+    pub fn live_mrrm_enabled() -> bool {
+        true
+    }
+    #[allow(dead_code)]
+    pub fn live_view_mode() -> i32 {
+        0
+    }
 }
 
 /// This client's role in the current (at most 2-player) session, mirroring

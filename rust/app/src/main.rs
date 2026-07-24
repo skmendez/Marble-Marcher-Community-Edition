@@ -13,6 +13,7 @@ mod debug_screenshot;
 mod fps_overlay;
 mod gpu;
 mod gpu_profile;
+mod live_debug;
 mod mrrm;
 mod net;
 mod perfprobe;
@@ -34,6 +35,7 @@ use debug_screenshot::DebugScreenshotPlugin;
 use fps_overlay::FpsOverlayPlugin;
 use gpu::MarcherGpuPlugin;
 use gpu_profile::GpuProfilePlugin;
+use live_debug::{poll_live_debug_toggles, seed_live_debug_toggles};
 use mrrm::{resize_coarse_render_target, setup_mrrm_pipeline, sync_coarse_quad_scale, CoarseMarcherMaterial};
 use net::{
     handle_copy_button_click, poll_net_status, setup_networking, spawn_net_ui, sync_net_ui_text,
@@ -175,6 +177,11 @@ fn main() {
         .add_systems(
             Startup,
             (
+                // Only needs `Config`, already inserted above (not a
+                // `Startup` system's output) -- placed first purely by
+                // convention, not because anything later in this chain
+                // depends on `LiveDebugToggles` existing yet.
+                seed_live_debug_toggles,
                 setup,
                 setup_mrrm_pipeline,
                 setup_shadow_pipeline,
@@ -224,6 +231,10 @@ fn main() {
                 )
                     .chain(),
                 (
+                    // Must run before `update_frame_data`: a same-frame
+                    // `mrrm`/view-mode toggle (`live_debug.rs`) needs to
+                    // reach this frame's uniforms, not land one frame late.
+                    poll_live_debug_toggles,
                     // Writes all three passes' uniforms + the marble list
                     // into `MarcherFrameData` (render.rs) -- replaced the
                     // three per-pass `update_material`/

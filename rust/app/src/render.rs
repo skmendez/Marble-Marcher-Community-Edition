@@ -292,12 +292,17 @@ mod scene_uniforms_impl {
         /// Same value on every pass's material (computed once from the
         /// scene tree at setup time, `SceneState::bounding_sphere`).
         pub bounding: Vec4,
-        /// x the `?stepheat=1` ray-march step-count heatmap debug flag
-        /// (fine pass's material only, same uniform-flag convention as
-        /// `misc.w`'s MRRM flag -- `config::Config::step_heat_enabled`, see
-        /// `codegen.rs`'s `MARCHER::fragment`); y/z/w unused. Its own field
-        /// rather than a `misc`/`misc2` lane since both of those are
-        /// already fully occupied.
+        /// x the fine pass's debug-view-mode selector (fine pass's material
+        /// only): `0` off, `1` the original `?stepheat=1` fine-pass step-count
+        /// heatmap, `2` the MRRM coarse pre-pass's own step count upscaled
+        /// onto the fine image, `3` the coarse pre-pass's own cached hit
+        /// distance upscaled likewise -- see `live_debug.rs`'s
+        /// `DebugViewMode` (the live-toggleable Rust-side source of this
+        /// value, seeded from but no longer tied to
+        /// `config::Config::step_heat_enabled`) and `codegen.rs`'s
+        /// `MARCHER::fragment`. y/z/w unused. Its own field rather than a
+        /// `misc`/`misc2` lane since both of those are already fully
+        /// occupied.
         pub misc3: Vec4,
     }
 
@@ -1467,6 +1472,7 @@ pub fn update_frame_data(
     marble_state: Res<MarbleState>,
     mp: Res<MultiplayerSession>,
     config: Res<crate::config::Config>,
+    toggles: Res<crate::live_debug::LiveDebugToggles>,
     windows: Query<&Window, With<PrimaryWindow>>,
     fine_render_target: Res<FineRenderTarget>,
     coarse_render_target: Res<crate::mrrm::CoarseRenderTarget>,
@@ -1484,6 +1490,7 @@ pub fn update_frame_data(
         marble_state,
         mp,
         config,
+        toggles,
         windows,
         fine_render_target,
         coarse_render_target,
@@ -1512,6 +1519,7 @@ fn update_frame_data_impl(
     marble_state: Res<MarbleState>,
     mp: Res<MultiplayerSession>,
     config: Res<crate::config::Config>,
+    toggles: Res<crate::live_debug::LiveDebugToggles>,
     windows: Query<&Window, With<PrimaryWindow>>,
     fine_render_target: Res<FineRenderTarget>,
     coarse_render_target: Res<crate::mrrm::CoarseRenderTarget>,
@@ -1582,13 +1590,14 @@ fn update_frame_data_impl(
         sun: beware_of_bumps::sun_dir().extend(0.0),
         sun_col: beware_of_bumps::SUN_COL.extend(0.0),
         bg_col: beware_of_bumps::BG.extend(0.0),
-        // w: MRRM on/off (`crate::mrrm::mrrm_enabled`) -- a uniform flag
+        // w: MRRM on/off, live-toggleable with no reload
+        // (`live_debug::LiveDebugToggles::mrrm_enabled`) -- a uniform flag
         // rather than skipping the coarse pass/texture binding entirely,
         // so every frame's cameras/passes are identical whether MRRM is
-        // on or off and an `MM_MRRM=0` vs `MM_MRRM=1` A/B screenshot
-        // comparison at a fixed camera state only ever differs in this
-        // one value (see `mrrm::mrrm_enabled`'s doc).
-        misc: Vec4::new(aspect, t, resolution_height, if config.mrrm_enabled { 1.0 } else { 0.0 }),
+        // on or off and an off-vs-on A/B screenshot comparison at a fixed
+        // camera state only ever differs in this one value (see
+        // `mrrm::mrrm_enabled`'s doc).
+        misc: Vec4::new(aspect, t, resolution_height, if toggles.mrrm_enabled { 1.0 } else { 0.0 }),
         // x: the shadow pass's own render-target height (`sample_shadow`'s
         // `sz` computation), y: `MM_SHADOW_LOD` on/off (same
         // A/B-comparability reasoning as MRRM's `misc.w` above), z: the
@@ -1600,11 +1609,12 @@ fn update_frame_data_impl(
             perfprobe.fine_max_steps_override,
             marble_rotation,
         ),
-        // x: `?stepheat=1` ray-march step-count heatmap debug flag (fine
-        // pass's material only, `MARCHER::fragment`'s doc) -- coarse/shadow
-        // never read `misc3`, so `base`'s default `0.0` there is fine as
-        // leftover unread padding, same as every other fine-only field here.
-        misc3: Vec4::new(if config.step_heat_enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0),
+        // x: the fine pass's debug-view-mode selector, live-toggleable with
+        // no reload (`live_debug::LiveDebugToggles::view_mode`,
+        // `MARCHER::fragment`'s doc) -- coarse/shadow never read `misc3`,
+        // so `base`'s default `0.0` there is fine as leftover unread
+        // padding, same as every other fine-only field here.
+        misc3: Vec4::new(toggles.view_mode.as_uniform_value(), 0.0, 0.0, 0.0),
         ..base
     };
 
@@ -1625,15 +1635,16 @@ fn update_frame_data_impl(
 
     frame.shadow = SceneUniforms {
         sun: beware_of_bumps::sun_dir().extend(0.0),
-        // w: the same MRRM flag the fine pass gets -- the shadow shader's
-        // own coarse warm-start read is gated on it too (`marble_csg::codegen`'s
-        // `SHADOW_MARCHER`), so `?mrrm=0` disables the coarse-guess data
-        // flow in *every* consumer, not just the fine pass.
+        // w: the same live-toggleable MRRM flag the fine pass gets -- the
+        // shadow shader's own coarse warm-start read is gated on it too
+        // (`marble_csg::codegen`'s `SHADOW_MARCHER`), so toggling `mrrm`
+        // off disables the coarse-guess data flow in *every* consumer, not
+        // just the fine pass.
         misc: Vec4::new(
             aspect,
             t,
             shadow_render_target.size.y as f32,
-            if config.mrrm_enabled { 1.0 } else { 0.0 },
+            if toggles.mrrm_enabled { 1.0 } else { 0.0 },
         ),
         ..base
     };

@@ -60,18 +60,18 @@
       // `String(value)`, e.g. a bool that encodes as "0"/"1" rather than
       // "false"/"true"). `options`: dropdown choices for 'enum' fields
       // (`SceneKind::from_value`'s exact accepted strings, render.rs).
+      //
+      // `mrrm` and `stepheat` are NOT here: they moved to the live (no
+      // reload) panel below (`live_debug.rs`'s `LiveDebugToggles`) since
+      // debugging MRRM's coarse-warm-start behavior needs to flip these
+      // mid-session without losing camera position. Every other flag stays
+      // reload-based -- see this panel's own doc just above.
       const FIELDS = [
         {
           key: "scene",
           type: "enum",
           options: ["menger_oscillating_sphere", "demo", "classic_only", "menger_sponge", "menger_sphere"],
           parse: (v) => (v === null ? "menger_oscillating_sphere" : v),
-        },
-        {
-          key: "mrrm",
-          type: "bool",
-          parse: (v) => v !== "0", // absent/anything-but-"0" => on (default on)
-          serialize: (v) => (v ? "1" : "0"),
         },
         {
           key: "shadowlod",
@@ -113,12 +113,6 @@
           parse: (v) => v === "1", // default off
           serialize: (v) => (v ? "1" : "0"),
         },
-        {
-          key: "stepheat",
-          type: "bool",
-          parse: (v) => v === "1", // default off
-          serialize: (v) => (v ? "1" : "0"),
-        },
       ];
 
       const state = {};
@@ -154,6 +148,40 @@
           field.type === "enum" ? gui.add(state, field.key, field.options) : gui.add(state, field.key);
         controller.onFinishChange(applyChange);
       }
+
+      // Live (no-reload) debug toggles (`live_debug.rs`'s
+      // `LiveDebugToggles`) -- added to the same dat.gui panel as the
+      // reload-based flags above, but deliberately with no
+      // `onFinishChange`/`applyChange` wiring: `window.mmLiveDebug` is a
+      // plain object dat.gui mutates in place, polled fresh every frame by
+      // Rust (`net.rs`'s `js_bridge::live_mrrm_enabled`/`live_view_mode`),
+      // so a change here takes effect on the very next frame with no
+      // navigation at all. Seeded once from the same query params so a
+      // shared `?mrrm=0`/`?stepheat=1` link still opens in the expected
+      // state.
+      window.mmLiveDebug = {
+        mrrm: params.get("mrrm") !== "0", // absent/anything-but-"0" => on (default on)
+        viewMode: params.get("stepheat") === "1" ? 1 : 0, // legacy ?stepheat=1 seeds FineStepHeat
+      };
+      // Object-mapped dropdown (dat.gui's `gui.add(obj, key, {label: value})`
+      // form): values are `live_debug.rs`'s `DebugViewMode::as_uniform_value`
+      // wire encoding exactly (0..=3) -- keep in sync if that enum grows.
+      const VIEW_MODE_OPTIONS = {
+        Off: 0,
+        "Fine step heat": 1,
+        "Coarse step heat": 2,
+        "Coarse step distance": 3,
+      };
+      gui.add(window.mmLiveDebug, "mrrm").name("mrrm (live)");
+      gui.add(window.mmLiveDebug, "viewMode", VIEW_MODE_OPTIONS).name("view mode (live)");
+
+      // Polled every frame from Rust (`net.rs`'s `js_bridge`) -- getters,
+      // not pushes, unlike every other `window.mmNet.*` assignment in this
+      // file (`reportPassTimings`/`reportStepData` below), since this is
+      // Rust pulling current JS state rather than JS pushing a computed
+      // result to Rust.
+      window.mmNet.liveMrrmEnabled = () => window.mmLiveDebug.mrrm;
+      window.mmNet.liveViewMode = () => window.mmLiveDebug.viewMode;
     })();
   </script>
   <!-- GPU per-pass timestamp profiling overlay (gpu_profile.rs). Only
