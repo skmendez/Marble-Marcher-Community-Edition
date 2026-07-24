@@ -359,14 +359,33 @@ const DONUT_STRIPE_OCT: Vec3 = Vec3::new(0.0, 0.0, 2.2);
 pub const DONUT_SYMMETRY: usize = 8;
 
 /// The skylight cutter sphere: centered at the fold wedge's mid-angle
-/// (`PI / 8`), just above the tube's top surface, sized to pierce the wall
-/// clean through (wall spans `minor ± thickness` vertically at the ring
-/// radius; the sphere spans `DONUT_SKYLIGHT_HEIGHT ± DONUT_SKYLIGHT_RADIUS`).
-/// Positioned from the stock dimension constants, not the live params -- a
-/// params-panel resize moves the wall but not the skylights, which is fine
-/// for a tuning tool (the holes just get deeper/shallower).
-pub const DONUT_SKYLIGHT_RADIUS: f32 = 0.5;
-pub const DONUT_SKYLIGHT_HEIGHT: f32 = 1.3;
+/// (`PI / 8`) at mid-wall height, sized so the marble can actually pass
+/// through. **The sizing constraint is volumetric, not visual**: a hole
+/// whose *rim* is wider than the marble can still be impassable, because
+/// the marble's center must keep `de >= marble_rad` along a continuous
+/// path, and near the inner wall face the free space is the *cutter
+/// sphere's* shallow cap, not the rim circle. Along the hole axis the
+/// clearance bottoms out at the handoff between tube-interior clearance
+/// and cutter-void clearance:
+///
+/// ```text
+/// min de = ((minor - thickness) - (HEIGHT - RADIUS)) / 2
+///        = (0.85 - 0.4) / 2 = 0.225
+/// ```
+///
+/// comfortably above the 0.15 marble radius (`render.rs`'s HollowDonut
+/// `spawn_params`). The first shipped values (radius 0.5, height 1.3 --
+/// centered *above* the wall) failed exactly this: rim aperture 0.218
+/// looked passable, but the axis clearance bottomed out at 0.05, a
+/// too-tight band the marble could never cross (reported live as "it
+/// looks like it should fit, but it doesn't"). Guarded by the
+/// `skylights_are_marble_passable` test below. Positioned from the stock
+/// dimension constants, not the live params -- a params-panel resize moves
+/// the wall but not the skylights, which is fine for a tuning tool (at the
+/// thickness slider's max the holes go impassable again; dev knob, dev
+/// consequences).
+pub const DONUT_SKYLIGHT_RADIUS: f32 = 0.6;
+pub const DONUT_SKYLIGHT_HEIGHT: f32 = 1.0;
 
 /// A hollow donut: `Onion(Torus)` -- the shell of points within
 /// `thickness` of the torus surface, i.e. a donut-shaped **tunnel**. The
@@ -789,6 +808,45 @@ mod tests {
         let floor = Vec4::new(DONUT_MAJOR_RADIUS, -DONUT_MINOR_RADIUS, 0.0, 1.0);
         let d = object.de(floor, &params);
         assert!(d < -0.05, "floor should still be solid, de={d}");
+    }
+
+    /// The marble (radius 0.15, `render.rs`'s HollowDonut `spawn_params`)
+    /// must be able to fly out through a skylight: `physics::collide`
+    /// resolves a contact whenever `de < rad`, so passability means a
+    /// continuous center path from inside the tube to open air with
+    /// `de >= rad` (plus margin) everywhere along it. This is a *stronger*
+    /// condition than the hole's rim being wider than the marble -- the
+    /// first shipped skylight had a passable-looking 0.218 rim aperture but
+    /// a 0.05 clearance pinch along the axis (see
+    /// [`DONUT_SKYLIGHT_RADIUS`]'s doc), which this test would have caught.
+    #[test]
+    fn hollow_donut_skylights_are_marble_passable() {
+        use std::f32::consts::FRAC_PI_8;
+        const MARBLE_RAD: f32 = 0.15;
+        const MARGIN: f32 = 0.05;
+
+        let mut params = Params::new();
+        let (object, _handles) = hollow_donut(&mut params);
+        let (sin, cos) = FRAC_PI_8.sin_cos();
+        // The hole's axis: vertically through the cutter center, from the
+        // tube's midline out to clearly-open air above the donut.
+        let mut min_de = f32::MAX;
+        let mut min_y = 0.0;
+        let mut y = 0.0;
+        while y <= 2.0 {
+            let p = Vec4::new(DONUT_MAJOR_RADIUS * cos, y, DONUT_MAJOR_RADIUS * sin, 1.0);
+            let d = object.de(p, &params);
+            if d < min_de {
+                min_de = d;
+                min_y = y;
+            }
+            y += 0.005;
+        }
+        assert!(
+            min_de >= MARBLE_RAD + MARGIN,
+            "skylight pinches to de={min_de} at y={min_y}: the marble (rad {MARBLE_RAD}) \
+             cannot pass -- see DONUT_SKYLIGHT_RADIUS's doc for the clearance formula"
+        );
     }
 
     #[test]
