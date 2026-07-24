@@ -324,25 +324,22 @@ pub const DONUT_MINOR_RADIUS: f32 = 1.0;
 pub const DONUT_THICKNESS: f32 = 0.15;
 
 /// Base albedo, set by `OrbitInit` before the angular folds -- this is the
-/// **seam rib color** (warm amber): at every wedge seam the stripe term
+/// **seam rib color** (crimson): at every wedge seam the stripe term
 /// below is ~0 and the base shows through unmodified. Channel values are
 /// chosen *for what survives the shader's albedo pipeline* (Reinhard
-/// compression `v/(1+v)`, then the material-gamma squaring): `r = 1.5`
-/// compresses+squares to ~0.36 and `g = 0.8` to ~0.19 -- a rich
-/// amber-brown -- where a "tasteful" `r = 0.5` would crush to ~0.11,
-/// near-black.
+/// compression `v/(1+v)`, material-gamma squaring, lighting, ACES) --
+/// `(1.0, 0.12, 0.08)` lands at ~display-RGB `(0.72, 0.10, 0.07)` under
+/// full sun and a dimmer version of the same hue under interior ambient.
 ///
-/// Deliberately **no height/green term anywhere in this palette**. An
-/// earlier version lifted `g` by `y * 0.9` (quadrant-depth `OrbitMax`) as
-/// an interior ceiling cue, and it backfired on the *exterior*:
-/// `OrbitMax` hard-ties channels to axes (`r <- x`, `g <- y`, `b <- z`),
-/// so a height cue can only ever paint green -- and on the donut's outer
-/// top surface (`y ~= 1.15`) it hit full strength exactly where the seams
-/// zero the blue channel, rendering the seam ribs as garish yellow-green
-/// rings (reported from an exterior screenshot). The palette is now a
-/// strict warm<->violet axis -- no combination of viewpoint and position
-/// can produce yellow/green from it.
-const DONUT_BASE_COLOR: Vec3 = Vec3::new(1.5, 0.8, 0.05);
+/// The green channel is deliberately near-zero, and this is the load-
+/// bearing choice (learned across two rounds of yellow-band reports from
+/// exterior screenshots): any rib color with meaningful green content
+/// reads *yellow-gold* under direct sun once lighting and ACES lift it --
+/// the first round's `g <- y*0.9` height term and the second round's
+/// "amber" base (`g = 0.8`) both produced the same yellow rings that way.
+/// A strict red<->blue palette (crimson ribs, violet body) has no path to
+/// yellow or green from any viewpoint or lighting.
+const DONUT_BASE_COLOR: Vec3 = Vec3::new(1.0, 0.12, 0.08);
 
 /// The single `OrbitMax` stripe term, applied after the final (octant)
 /// fold: `b <- z` with a deliberately large coefficient (2.2, not a
