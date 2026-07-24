@@ -490,6 +490,91 @@ pub fn hollow_donut(params: &mut Params) -> (Object, HollowDonutHandles) {
     (object, handles)
 }
 
+/// Parameter handles for [`cube_sphere_morph`]: the morph parameter and
+/// the [`Expr`] that drives it -- register `(t, t_anim.clone())` into the
+/// scene's animation table so it's evaluated once per simulated tick,
+/// live and through rollback resimulation alike (same pattern as
+/// [`MengerOscillatingSphereHandles`]).
+#[derive(Clone, Debug)]
+pub struct CubeSphereMorphHandles {
+    pub t: ScalarParam,
+    pub t_anim: Expr,
+}
+
+/// Half-extent of the cube and radius of the sphere -- "the same size".
+pub const MORPH_HALF_SIZE: f32 = 1.0;
+
+/// Full cycle length in simulated ticks: hold cube 3s, morph 3s, hold
+/// sphere 3s, morph back 3s = 12s at the app's fixed 60Hz tick rate.
+const MORPH_PERIOD_TICKS: f32 = 12.0 * 60.0;
+
+/// Deep blue (cube) and crimson (sphere), pre-albedo-pipeline values --
+/// same channel logic as the donut palettes: what matters is what
+/// survives Reinhard compression + material-gamma squaring + ACES, and
+/// near-zero green keeps both colors clean under direct sun.
+const MORPH_CUBE_COLOR: Vec3 = Vec3::new(0.10, 0.12, 2.2);
+const MORPH_SPHERE_COLOR: Vec3 = Vec3::new(1.3, 0.05, 0.06);
+
+/// A blue cube that periodically melts into a red sphere and back
+/// ([`Object::Morph`] with an [`Expr`]-driven `t`):
+///
+/// ```text
+/// t(tick) = clamp(0.5 - cos(2*PI*tick / PERIOD) / sqrt(2), 0, 1)
+/// ```
+///
+/// The clamped cosine is the whole hold/ramp schedule in one closed form:
+/// with amplitude `1/sqrt(2)`, the expression sits at/below 0 for a
+/// quarter period (3s, held as the cube), rises smoothly for a quarter
+/// (cosine-eased morph -- gentler than a linear ramp at both ends),
+/// saturates at/above 1 for a quarter (held as the sphere), and eases
+/// back. `arccos(0.5 / (1/sqrt(2))) = PI/4` is exactly what makes the
+/// hold and ramp windows equal. Tick 0 lands mid-cube-hold (`t = 0`,
+/// matching the param's initial value, so the first pre-tick frame isn't
+/// briefly wrong -- the `menger_oscillating_sphere` convention).
+///
+/// The colors crossfade in sync with the geometry for free:
+/// `Object::Morph`'s color-pass emission blends `orbit` between the two
+/// branches by the same clamped `t` it uses for the distance mix, so the
+/// cube's blue `OrbitInit` and the sphere's red one meet mid-morph as a
+/// purple in-between -- no separate color animation needed.
+pub fn cube_sphere_morph(params: &mut Params) -> (Object, CubeSphereMorphHandles) {
+    let t = params.alloc_scalar(0.0);
+    let omega = std::f32::consts::TAU / MORPH_PERIOD_TICKS;
+    let angle = Expr::Mul(Box::new(Expr::Tick), Box::new(Expr::Const(omega)));
+    let wave = Expr::Sub(
+        Box::new(Expr::Const(0.5)),
+        Box::new(Expr::Mul(
+            Box::new(Expr::Const(std::f32::consts::FRAC_1_SQRT_2)),
+            Box::new(Expr::Cos(Box::new(angle))),
+        )),
+    );
+    let t_anim = Expr::Clamp(
+        Box::new(wave),
+        Box::new(Expr::Const(0.0)),
+        Box::new(Expr::Const(1.0)),
+    );
+    let handles = CubeSphereMorphHandles { t, t_anim };
+
+    let cube = Object::Fractal {
+        fold: Fold::OrbitInit(Vec3Value::Const(MORPH_CUBE_COLOR)),
+        base: Box::new(Object::Cuboid {
+            half_extent: Vec3Value::Const(Vec3::splat(MORPH_HALF_SIZE)),
+        }),
+    };
+    let sphere = Object::Fractal {
+        fold: Fold::OrbitInit(Vec3Value::Const(MORPH_SPHERE_COLOR)),
+        base: Box::new(Object::Sphere {
+            radius: ScalarValue::Const(MORPH_HALF_SIZE),
+        }),
+    };
+    let object = Object::Morph {
+        a: Box::new(cube),
+        b: Box::new(sphere),
+        t: ScalarValue::Param(t),
+    };
+    (object, handles)
+}
+
 /// Writes a full parameter set for the classic fractal tree built by
 /// [`classic`]/[`demo_scene`]. `ang1`/`ang2` are turned into rotation
 /// matrices via [`rotation_mat2`].
@@ -858,6 +943,53 @@ mod tests {
             "skylight pinches to de={min_de} at y={min_y}: the marble (rad {MARBLE_RAD}) \
              cannot pass -- see DONUT_SKYLIGHT_RADIUS's doc for the clearance formula"
         );
+    }
+
+    #[test]
+    fn cube_sphere_morph_schedule_holds_and_ramps_on_the_12s_cycle() {
+        let mut params = Params::new();
+        let (object, handles) = cube_sphere_morph(&mut params);
+        let anim = &handles.t_anim;
+
+        // Quarter-period landmarks at 60Hz: hold-cube is ticks (-90, 90)
+        // around 0, ramp up (90, 270), hold-sphere (270, 450), ramp down
+        // (450, 630).
+        assert!(anim.eval(0).abs() < 1e-6, "tick 0 must be fully cube");
+        assert!(anim.eval(80).abs() < 1e-6, "still held as cube near the hold's edge");
+        assert!((anim.eval(180) - 0.5).abs() < 1e-3, "mid-ramp at the eighth-period point");
+        assert!((anim.eval(360) - 1.0).abs() < 1e-6, "fully sphere at the half period");
+        assert!((anim.eval(430) - 1.0).abs() < 1e-6, "still held as sphere");
+        assert!((anim.eval(540) - 0.5).abs() < 1e-3, "mid-ramp back");
+        assert!(anim.eval(700).abs() < 1e-6, "back to cube before the period ends");
+        // Periodicity (within f32 slack of the big-tick trig argument).
+        assert!((anim.eval(123) - anim.eval(123 + 720)).abs() < 1e-3);
+
+        // Ramps must be monotone -- the clamp must never let the cosine
+        // wave wiggle t backwards mid-transition.
+        let mut prev = anim.eval(90);
+        for tick in 91..270 {
+            let v = anim.eval(tick);
+            assert!(v >= prev - 1e-6, "ramp not monotone at tick {tick}: {v} < {prev}");
+            prev = v;
+        }
+
+        // Endpoint geometry: with t forced to the extremes, the morph is
+        // exactly the cube / exactly the sphere.
+        let cube = Object::Cuboid { half_extent: Vec3Value::Const(Vec3::splat(MORPH_HALF_SIZE)) };
+        let sphere = Object::Sphere { radius: ScalarValue::Const(MORPH_HALF_SIZE) };
+        let probes = [
+            Vec4::new(2.0, 0.4, -0.3, 1.0),
+            Vec4::new(0.9, 0.9, 0.9, 1.0),
+            Vec4::new(0.2, 0.1, 0.0, 1.0),
+        ];
+        params.set_scalar(handles.t, 0.0);
+        for p in probes {
+            assert!((object.de(p, &params) - cube.de(p, &params)).abs() < 1e-6);
+        }
+        params.set_scalar(handles.t, 1.0);
+        for p in probes {
+            assert!((object.de(p, &params) - sphere.de(p, &params)).abs() < 1e-6);
+        }
     }
 
     #[test]

@@ -191,6 +191,10 @@ fn build_entries(handles: &SceneHandles, params: &Params) -> Vec<ParamEntry> {
         // own params are editable here.
         SceneHandles::MengerOscillatingSphere(h) => menger(&mut entries, &h.menger),
         SceneHandles::HollowDonut(h) => donut(&mut entries, h),
+        // The morph parameter is Expr-animated (overwritten every physics
+        // tick), so exposing it would just fight the animation -- same
+        // reasoning as the oscillating bite radius (module doc).
+        SceneHandles::CubeSphereMorph(_) => {}
     }
     entries
 }

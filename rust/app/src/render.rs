@@ -54,9 +54,10 @@ use marble_csg::codegen::generate_shader;
 use marble_csg::expr::Expr;
 use marble_csg::physics::{Marble, PhysicsConfig};
 use marble_csg::scenes::{
-    beware_of_bumps, classic, demo_scene, hollow_donut, menger_oscillating_sphere, menger_sphere,
-    menger_sponge, set_fractal_params, set_menger_params, ClassicHandles, HollowDonutHandles,
-    MengerHandles, MengerOscillatingSphereHandles, MENGER_BITE_MIN_RADIUS,
+    beware_of_bumps, classic, cube_sphere_morph, demo_scene, hollow_donut,
+    menger_oscillating_sphere, menger_sphere, menger_sponge, set_fractal_params,
+    set_menger_params, ClassicHandles, CubeSphereMorphHandles, HollowDonutHandles, MengerHandles,
+    MengerOscillatingSphereHandles, MENGER_BITE_MIN_RADIUS,
 };
 use marble_csg::{Object, Params, ScalarParam, Scene};
 
@@ -107,6 +108,12 @@ pub enum SceneKind {
     /// than folds. All three dimensions are live params (the params panel
     /// can resize the donut while playing).
     HollowDonut,
+    /// [`marble_csg::scenes::cube_sphere_morph`] — a blue cube that melts
+    /// into a red sphere and back on a 12s cycle (hold 3s / morph 3s each
+    /// way), the `Object::Morph` + `Expr`-driven-`t` showcase: geometry
+    /// *and* color crossfade deterministically on the shared tick clock,
+    /// identical on every multiplayer peer through rollback.
+    CubeSphereMorph,
 }
 
 /// Marble spawn parameters for a scene: start position, radius, kill-plane
@@ -133,6 +140,7 @@ impl SceneKind {
             Some("menger_sphere") => Self::MengerSphere,
             Some("menger_oscillating_sphere") => Self::MengerOscillatingSphere,
             Some("hollow_donut") => Self::HollowDonut,
+            Some("cube_sphere_morph") => Self::CubeSphereMorph,
             _ => Self::MengerOscillatingSphere,
         }
     }
@@ -205,6 +213,15 @@ impl SceneKind {
                 rad: 0.15,
                 kill_y: -50.0,
             },
+            // Floats clear of the morphing shape at every phase: the
+            // farthest the surface ever reaches is the cube's corner
+            // (sqrt(3) * MORPH_HALF_SIZE ~= 1.73), well inside this
+            // spawn's 2.6 offset.
+            Self::CubeSphereMorph => MarbleSpawn {
+                start: Vec3::new(2.6, 0.0, 0.0),
+                rad: 0.15,
+                kill_y: -50.0,
+            },
         }
     }
 }
@@ -227,6 +244,10 @@ pub enum SceneHandles {
     MengerOscillatingSphere(MengerOscillatingSphereHandles),
     /// [`SceneKind::HollowDonut`]'s ring/tube/wall dimensions.
     HollowDonut(HollowDonutHandles),
+    /// [`SceneKind::CubeSphereMorph`]'s morph parameter -- animated (the
+    /// physics tick overwrites it every tick), so the params panel exposes
+    /// nothing for it, same reasoning as the oscillating bite radius.
+    CubeSphereMorph(CubeSphereMorphHandles),
 }
 
 /// Fixed weak handle for the generated ray-marcher shader. A startup system
@@ -1071,6 +1092,13 @@ pub fn setup(
         // happening, so there's no need to zoom out to see it happen.
         camera_orbit.distance = 1.2;
     }
+    if kind == SceneKind::CubeSphereMorph {
+        // Frame the 2-unit-wide morphing shape with the marble in the
+        // foreground -- same close-orbit convention as the Menger scenes,
+        // pulled back for the larger subject.
+        camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35);
+        camera_orbit.distance = 4.5;
+    }
     if kind == SceneKind::HollowDonut {
         // The camera lives *inside* the tube with the marble (interior free
         // radius `DONUT_MINOR_RADIUS - DONUT_THICKNESS = 0.85`), so the
@@ -1144,6 +1172,15 @@ pub fn setup(
         SceneKind::HollowDonut => {
             let (object, donut_handles) = hollow_donut(&mut params);
             (object, SceneHandles::HollowDonut(donut_handles))
+        }
+        SceneKind::CubeSphereMorph => {
+            let (object, morph_handles) = cube_sphere_morph(&mut params);
+            // Initial value matches t_anim at tick 0 (fully cube) so the
+            // first pre-tick frame isn't briefly wrong -- the same
+            // convention as the oscillating bite sphere above.
+            params.set_scalar(morph_handles.t, 0.0);
+            animations.push((morph_handles.t, morph_handles.t_anim.clone()));
+            (object, SceneHandles::CubeSphereMorph(morph_handles))
         }
     };
 
