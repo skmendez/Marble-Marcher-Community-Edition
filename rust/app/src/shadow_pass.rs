@@ -310,6 +310,14 @@ pub fn resize_shadow_render_target(
     fine_quads: Query<&MeshMaterial2d<crate::render::FineMarcherMaterial>, With<crate::render::MarcherQuad>>,
     mut shadow_materials: ResMut<Assets<ShadowMarcherMaterial>>,
     mut fine_materials: ResMut<Assets<crate::render::FineMarcherMaterial>>,
+    // `step_data.rs`'s pass also warm-starts from the shadow target now (same
+    // reasoning as the fine pass above, `MARCHER`'s shadow-tier warm-start
+    // doc) -- this query is simply empty whenever `?gpuprofile=1` is off
+    // (that pass's quad never spawns), so this stays a true no-op in that
+    // case, same as `mrrm::resize_coarse_render_target`'s own step-data
+    // handling.
+    step_data_quads: Query<&MeshMaterial2d<crate::step_data::StepDataMaterial>, With<crate::step_data::StepDataQuad>>,
+    mut step_data_materials: ResMut<Assets<crate::step_data::StepDataMaterial>>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -346,6 +354,11 @@ pub fn resize_shadow_render_target(
     }
     for mesh_material in &fine_quads {
         if let Some(mat) = fine_materials.get_mut(&mesh_material.0) {
+            mat.shadow = new_handle.clone();
+        }
+    }
+    for mesh_material in &step_data_quads {
+        if let Some(mat) = step_data_materials.get_mut(&mesh_material.0) {
             mat.shadow = new_handle.clone();
         }
     }
