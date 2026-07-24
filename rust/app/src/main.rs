@@ -16,6 +16,7 @@ mod gpu_profile;
 mod live_debug;
 mod mrrm;
 mod net;
+mod param_ui;
 mod perfprobe;
 mod physics_sys;
 mod render;
@@ -41,6 +42,7 @@ use net::{
     handle_copy_button_click, poll_net_status, setup_networking, spawn_net_ui, sync_net_ui_text,
     update_copy_button_visibility, update_copy_feedback, CopyFeedback,
 };
+use param_ui::{param_ui_input, spawn_param_panel, update_param_panel_text};
 use perfprobe::{perfprobe_tick, spawn_perfprobe_overlay, update_perfprobe_overlay_text, PerfProbeState};
 use physics_sys::{marble_physics_tick, PendingSceneSync};
 use render::{
@@ -189,6 +191,10 @@ fn main() {
                 setup_networking,
                 spawn_net_ui,
                 spawn_perfprobe_overlay,
+                // Needs `setup`'s `SceneState` (handles) and
+                // `MultiplayerSession` (the sim's live params) -- hence
+                // inside this chain, after `setup`.
+                spawn_param_panel,
             )
                 .chain(),
         )
@@ -231,6 +237,11 @@ fn main() {
                 )
                     .chain(),
                 (
+                    // Must run before `update_frame_data`, same reasoning
+                    // as `poll_live_debug_toggles` below: a param edit's
+                    // params/bounding-sphere writes should reach this
+                    // frame's uniforms, not land one frame late.
+                    param_ui_input,
                     // Must run before `update_frame_data`: a same-frame
                     // `mrrm`/view-mode toggle (`live_debug.rs`) needs to
                     // reach this frame's uniforms, not land one frame late.
@@ -242,6 +253,7 @@ fn main() {
                     // systems when per-frame data moved to persistent GPU
                     // buffers (gpu.rs).
                     update_frame_data,
+                    update_param_panel_text,
                     update_perfprobe_overlay_text,
                     draw_thrust_debug.run_if(|config: Res<Config>| config.debug_enabled),
                     poll_net_status,

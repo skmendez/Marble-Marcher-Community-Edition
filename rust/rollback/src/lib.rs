@@ -80,7 +80,7 @@ use glam::Vec3;
 
 use marble_csg::expr::apply_animations;
 use marble_csg::physics::{step_marbles, Marble, PhysicsConfig, PlayerInput, StepEvent};
-use marble_csg::Scene;
+use marble_csg::{Params, Scene};
 
 /// Rollback's unit of time — one call to [`step_marbles`], not wall-clock
 /// time. Starts at `0` (the initial state, before any tick has been
@@ -279,6 +279,19 @@ impl RollbackSim {
     /// separately-tracked geometry/params — there's only ever one to send.
     pub fn scene(&self) -> &Scene {
         &self.scene
+    }
+
+    /// Mutable access to the scene's live parameter table, for local
+    /// interactive editing (the app's params UI panel). Narrow on purpose --
+    /// the tree/animations halves of the owned [`Scene`] stay swap-only via
+    /// [`Self::set_scene`], which maintains the paired tick/marble
+    /// invariants a wholesale replacement needs; a param *value* write has
+    /// no such pairing to maintain. Note an edit is plain local state, not
+    /// part of the input log: it is not replayed to other peers and stale
+    /// cached checksums are not invalidated, so callers should only edit
+    /// while unconnected (the app gates its UI on exactly that).
+    pub fn params_mut(&mut self) -> &mut Params {
+        &mut self.scene.params
     }
 
     /// Predicts player `player`'s input for `tick`: their most recent

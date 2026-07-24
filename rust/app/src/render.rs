@@ -191,31 +191,21 @@ impl SceneKind {
     }
 }
 
-/// The fractal-tree-specific parameter handles, so a future per-scene
-/// animation toggle can animate `ang1` for [`SceneKind::Demo`] without
-/// needing to know about [`MengerHandles`] (the static display fractals
-/// don't have an `ang1`).
+/// The fractal-tree-specific parameter handles, so a per-scene feature can
+/// address `ang1` for [`SceneKind::Demo`] by name without needing to know
+/// about [`MengerHandles`] (the static display fractals don't have an
+/// `ang1`). Read by `param_ui::build_entries` to build the live params
+/// panel's named entry list -- the anonymous `Params` slot table itself has
+/// no names/kinds/ranges to build a UI from.
 pub enum SceneHandles {
-    /// The `Demo`/`ClassicOnly` scenes' old wall-clock-driven `ang1` wobble
-    /// (`MM_ANIMATE_FRACTAL`) that used to read this back every frame was
-    /// removed (dead on the deployed web build, and wall-clock-driven
-    /// geometry animation is exactly the determinism anti-pattern this
-    /// session's `Expr`/tick-driven work has been eliminating elsewhere) --
-    /// not read anywhere now, kept for the same reason as the other two
-    /// variants below: a future, properly deterministic per-scene animation
-    /// toggle.
-    #[allow(dead_code)]
     Classic(ClassicHandles),
-    /// Not read anywhere yet — kept for a future depth/color animation
-    /// toggle on the static display fractals, symmetric to Classic's ang1.
-    #[allow(dead_code)]
     Menger(MengerHandles),
-    /// [`SceneKind::MengerOscillatingSphere`]'s handles -- the actual
-    /// animation lives in [`SceneState::animations`] now (populated from
-    /// [`MengerOscillatingSphereHandles::radius_anim`] once, in `setup`),
-    /// not read back out of here per frame; kept for parity with the other
-    /// variants and in case a future feature needs the raw handles again.
-    #[allow(dead_code)]
+    /// [`SceneKind::MengerOscillatingSphere`]'s handles -- the bite-radius
+    /// animation itself lives in the scene's animation table (populated
+    /// from [`MengerOscillatingSphereHandles::radius_anim`] once, in
+    /// `setup`), not read back out of here per frame; the params panel
+    /// exposes only the inner `menger` handles (the animated radius would
+    /// fight the physics tick's per-tick overwrite -- `param_ui`'s doc).
     MengerOscillatingSphere(MengerOscillatingSphereHandles),
 }
 
@@ -960,10 +950,8 @@ const MENGER_OSCILLATING_SPHERE_COLOR: Vec3 = Vec3::new(0.75, 0.25, 0.85);
 #[derive(Resource)]
 pub struct SceneState {
     pub kind: SceneKind,
-    /// Not read anywhere now (see [`SceneHandles`]'s own doc on why) --
-    /// kept alongside its variants for the same future-per-scene-toggle
-    /// reason.
-    #[allow(dead_code)]
+    /// Named, typed handles into the scene's params -- what
+    /// `param_ui::spawn_param_panel` builds the live params panel from.
     pub handles: SceneHandles,
     pub material: Handle<FineMarcherMaterial>,
     /// The scene's world-space bounding sphere (`object.bounding_sphere`),
@@ -983,7 +971,7 @@ pub struct SceneState {
 /// `object.bounding_sphere(params)` packed for `SceneUniforms::bounding`/
 /// `ray_sphere_clip` (`marble_csg::codegen`): `xyz = center, w = radius`,
 /// or an all-zero (`radius <= 0.0`, "no bound") vector on `None`.
-fn pack_bounding_sphere(object: &Object, params: &Params) -> Vec4 {
+pub fn pack_bounding_sphere(object: &Object, params: &Params) -> Vec4 {
     match object.bounding_sphere(params) {
         Some((center, radius)) => center.extend(radius),
         None => Vec4::ZERO,

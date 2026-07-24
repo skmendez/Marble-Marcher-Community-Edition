@@ -272,6 +272,15 @@ impl MultiplayerSession {
     pub fn take_pending_join(&mut self) -> Option<(Tick, Vec<Marble>)> {
         self.pending_join.take()
     }
+
+    /// Whether this session has never touched a network transport -- the
+    /// same `transport.is_none()` gate `marble_physics_tick_impl` applies
+    /// to the debug respawn key, exposed for `param_ui.rs`'s live param
+    /// editing, which is local-only state a connected peer would never see
+    /// (`RollbackSim::params_mut`'s doc) and so must stay solo-only.
+    pub fn is_solo(&self) -> bool {
+        self.transport.is_none()
+    }
 }
 
 /// The host's most recently received-but-not-yet-applied
