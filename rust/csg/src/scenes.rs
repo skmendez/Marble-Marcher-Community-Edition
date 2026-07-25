@@ -575,6 +575,299 @@ pub fn cube_sphere_morph(params: &mut Params) -> (Object, CubeSphereMorphHandles
     (object, handles)
 }
 
+/// Parameter handles for [`gears`]: the two tooth-phase params and the
+/// [`Expr`]s that spin them -- register both `(param, anim)` pairs into
+/// the scene's animation table (the [`CubeSphereMorphHandles`] pattern).
+#[derive(Clone, Debug)]
+pub struct GearsHandles {
+    /// Tooth phase of the 6 face-axis gears (radians about each gear's
+    /// own outward axis).
+    pub face_phase: ScalarParam,
+    pub face_anim: Expr,
+    /// Tooth phase of the 12 edge-direction gears. Spins **opposite** to
+    /// `face_phase` -- see [`gears`] for why the sign is load-bearing.
+    pub edge_phase: ScalarParam,
+    pub edge_anim: Expr,
+}
+
+/// [`gears`] geometry constants, straight from the reference shader
+/// (iq's "Gears", Shadertoy 3lBSRK) at full extension `tr = 1`. All the
+/// gears live on this sphere: shell radius 0.5, wall +-0.03.
+const GEARS_SHELL_RADIUS: f32 = 0.5;
+const GEARS_SHELL_THICK: f32 = 0.03;
+/// Ring (the gear's rim): cylinder radius 0.155, wall +-0.018.
+const GEARS_RING_RADIUS: f32 = 0.155;
+const GEARS_RING_THICK: f32 = 0.018;
+/// Teeth: 12 per gear, each a rounded box at radial center 0.17 --
+/// half-extents (tangential, axial, radial) + rounding. The reference
+/// sizes teeth in the plane at shell radius (tangential half-width
+/// `0.041 * r` with `r ~= 0.5`); ours are the equivalent constants.
+pub const GEARS_TOOTH_COUNT: i32 = 12;
+const GEARS_TOOTH_RADIAL_CENTER: f32 = 0.17;
+const GEARS_TOOTH_HALF: Vec3 = Vec3::new(0.0155, 9.0, 0.037);
+const GEARS_TOOTH_ROUND: f32 = 0.005;
+/// Face cross (the 4-spoke cap at the gear's pole, y = 0.485): one
+/// rounded bar, replicated into a plus-sign by a 4-fold polar modulo.
+const GEARS_CROSS_Y: f32 = 0.485;
+const GEARS_CROSS_HALF: Vec3 = Vec3::new(0.039, 0.005, 0.167);
+const GEARS_CROSS_ROUND: f32 = 0.003;
+/// Axle pivot: radius-0.01 cylinder capped by a radius-0.51 sphere, plus
+/// the small knob sphere on the axle at y = 0.12.
+const GEARS_PIVOT_RADIUS: f32 = 0.01;
+const GEARS_PIVOT_CAP: f32 = 0.51;
+const GEARS_KNOB_RADIUS: f32 = 0.025;
+const GEARS_KNOB_Y: f32 = 0.12;
+/// The stationary center sphere the axles radiate from.
+const GEARS_CENTER_RADIUS: f32 = 0.12;
+
+/// Rotation rate: the reference spins gears at 2 rad/s; ticks are 60 Hz.
+const GEARS_RATE_PER_TICK: f32 = 2.0 / 60.0;
+/// Edge gears' tooth offset: half a tooth sector (`TAU/24`), so their
+/// teeth interleave with the face gears' at the contact points.
+const GEARS_EDGE_OFFSET: f32 = std::f32::consts::TAU / 24.0;
+
+/// Albedo constants (pre-pipeline values -- see [`hollow_donut`]'s color
+/// notes): cool steel for the gears, warm orange for the center sphere.
+const GEARS_STEEL: Vec3 = Vec3::new(1.4, 1.4, 1.6);
+const GEARS_CENTER_COLOR: Vec3 = Vec3::new(2.0, 0.35, 0.05);
+
+/// One gear *pair* around the template's +-Y axis: every part is built in
+/// the upper half only and a `Plane{y}` mirror fold supplies the lower
+/// gear. The mirror is not just a dedup -- a mirrored copy of a
+/// `phase`-rotating pattern **counter-rotates**, which is exactly what two
+/// gears sharing an axle through the center sphere must do (the reference
+/// shader gets the same effect from `sign(q.y)` inside its rotation).
+///
+/// Parts (template coordinates, gear axis = +Y):
+///  - ring: radius-0.155 cylinder shell, cut to the 0.5-sphere shell
+///    (the gear is the small circle where cylinder meets sphere, near the
+///    pole at `y ~= 0.475`);
+///  - teeth: one rounded box at radial center 0.17, replicated 12-fold by
+///    [`Fold::PolarModulo`] (whose `phase` is the live rotation), cut to
+///    the same spherical shell;
+///  - cross: one rounded bar at the pole cap, replicated 4-fold by a
+///    second `PolarModulo` sharing the same phase param so the spokes
+///    spin rigidly with the teeth;
+///  - pivot: thin axle cylinder capped by a slightly-larger sphere, plus
+///    the knob sphere partway down the axle. These don't rotate visually,
+///    but they're inside the phase-free part of the tree anyway.
+fn gears_pair(align: Vec<Fold>, phase: ScalarParam) -> Object {
+    let shell = || Object::Onion {
+        base: Box::new(Object::Sphere {
+            radius: ScalarValue::Const(GEARS_SHELL_RADIUS),
+        }),
+        thickness: ScalarValue::Const(GEARS_SHELL_THICK),
+    };
+
+    let ring = Object::Intersect(
+        Box::new(Object::Onion {
+            base: Box::new(Object::Cylinder {
+                radius: ScalarValue::Const(GEARS_RING_RADIUS),
+            }),
+            thickness: ScalarValue::Const(GEARS_RING_THICK),
+        }),
+        Box::new(shell()),
+    );
+
+    let teeth = Object::Intersect(
+        Box::new(Object::Fractal {
+            fold: Fold::Series(vec![
+                Fold::PolarModulo {
+                    axis: Axis::Y,
+                    count: IntValue::Const(GEARS_TOOTH_COUNT),
+                    phase: ScalarValue::Param(phase),
+                },
+                Fold::ScaleTranslate {
+                    scale: ScalarValue::Const(1.0),
+                    shift: Vec3Value::Const(Vec3::new(0.0, 0.0, -GEARS_TOOTH_RADIAL_CENTER)),
+                },
+            ]),
+            base: Box::new(Object::Offset {
+                base: Box::new(Object::Cuboid {
+                    half_extent: Vec3Value::Const(GEARS_TOOTH_HALF),
+                }),
+                offset: ScalarValue::Const(GEARS_TOOTH_ROUND),
+            }),
+        }),
+        Box::new(shell()),
+    );
+
+    let cross = Object::Fractal {
+        fold: Fold::Series(vec![
+            Fold::PolarModulo {
+                axis: Axis::Y,
+                count: IntValue::Const(4),
+                phase: ScalarValue::Param(phase),
+            },
+            Fold::ScaleTranslate {
+                scale: ScalarValue::Const(1.0),
+                shift: Vec3Value::Const(Vec3::new(0.0, -GEARS_CROSS_Y, 0.0)),
+            },
+        ]),
+        base: Box::new(Object::Offset {
+            base: Box::new(Object::Cuboid {
+                half_extent: Vec3Value::Const(GEARS_CROSS_HALF),
+            }),
+            offset: ScalarValue::Const(GEARS_CROSS_ROUND),
+        }),
+    };
+
+    let pivot = Object::Intersect(
+        Box::new(Object::Cylinder {
+            radius: ScalarValue::Const(GEARS_PIVOT_RADIUS),
+        }),
+        Box::new(Object::Sphere {
+            radius: ScalarValue::Const(GEARS_PIVOT_CAP),
+        }),
+    );
+
+    let knob = Object::Fractal {
+        fold: Fold::ScaleTranslate {
+            scale: ScalarValue::Const(1.0),
+            shift: Vec3Value::Const(Vec3::new(0.0, -GEARS_KNOB_Y, 0.0)),
+        },
+        base: Box::new(Object::Sphere {
+            radius: ScalarValue::Const(GEARS_KNOB_RADIUS),
+        }),
+    };
+
+    let union = Object::Union(
+        Box::new(ring),
+        Box::new(Object::Union(
+            Box::new(teeth),
+            Box::new(Object::Union(
+                Box::new(cross),
+                Box::new(Object::Union(Box::new(pivot), Box::new(knob))),
+            )),
+        )),
+    );
+
+    let mut folds = vec![Fold::OrbitInit(Vec3Value::Const(GEARS_STEEL))];
+    folds.extend(align);
+    folds.push(Fold::Plane {
+        normal: Vec3Value::Const(Vec3::Y),
+        offset: ScalarValue::Const(0.0),
+    });
+
+    Object::Fractal {
+        fold: Fold::Series(folds),
+        base: Box::new(union),
+    }
+}
+
+/// The 9 gear-pair alignments: constant `Rotate` folds mapping each
+/// pair's two world axis directions onto the template's +-Y. Verified
+/// numerically by `gears_pair_axes_map_to_template_y` below. Which pole
+/// lands on +Y vs -Y is irrelevant: the pair is mirror-symmetric, and a
+/// rotation about the *outward* axis is itself mirror-invariant, so both
+/// choices render identically.
+fn gears_alignments() -> Vec<(Vec<Fold>, [Vec3; 2])> {
+    use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+    let rot = |axis: Axis, angle: f32| Fold::Rotate {
+        axis,
+        mat: Mat2Value::Const(rotation_mat2(angle)),
+    };
+    let s = std::f32::consts::FRAC_1_SQRT_2;
+    vec![
+        // Face pairs: +-X, +-Y, +-Z.
+        (vec![rot(Axis::Z, -FRAC_PI_2)], [Vec3::X, -Vec3::X]),
+        (vec![], [Vec3::Y, -Vec3::Y]),
+        (vec![rot(Axis::X, FRAC_PI_2)], [Vec3::Z, -Vec3::Z]),
+        // Edge pairs: the 6 antipodal pairs of cube-edge directions.
+        (
+            vec![rot(Axis::Z, -FRAC_PI_4)],
+            [Vec3::new(s, s, 0.0), Vec3::new(-s, -s, 0.0)],
+        ),
+        (
+            vec![rot(Axis::Z, -3.0 * FRAC_PI_4)],
+            [Vec3::new(s, -s, 0.0), Vec3::new(-s, s, 0.0)],
+        ),
+        (
+            vec![rot(Axis::X, FRAC_PI_4)],
+            [Vec3::new(0.0, s, s), Vec3::new(0.0, -s, -s)],
+        ),
+        (
+            vec![rot(Axis::X, -FRAC_PI_4)],
+            [Vec3::new(0.0, s, -s), Vec3::new(0.0, -s, s)],
+        ),
+        (
+            vec![rot(Axis::Y, -FRAC_PI_4), rot(Axis::Z, -FRAC_PI_2)],
+            [Vec3::new(s, 0.0, s), Vec3::new(-s, 0.0, -s)],
+        ),
+        (
+            vec![rot(Axis::Y, FRAC_PI_4), rot(Axis::Z, -FRAC_PI_2)],
+            [Vec3::new(s, 0.0, -s), Vec3::new(-s, 0.0, s)],
+        ),
+    ]
+}
+
+/// iq's "Gears" (Shadertoy 3lBSRK) in its fully-extended, constantly
+/// rotating state: 18 interlocking gears on the surface of a sphere --
+/// one at each face direction and each edge direction of a cube -- their
+/// axles meeting a stationary sphere at the center. The reference's
+/// extend/contract cycle is deliberately not reproduced; this is the
+/// `tr = 1` steady state only.
+///
+/// Structure: 9 [`gears_pair`] subtrees (each covering two antipodal
+/// gears via its internal mirror), explicitly unioned. The reference
+/// evaluates only 4 gear calls using octant folds; those folds are
+/// mirrors, and a mirrored gear *counter-rotates*, which its shader
+/// counteracts with `sign()` tricks inside the rotation -- our fold
+/// algebra has no per-branch sign, so the explicit union (cost comparable
+/// to the classic fractal's 16 folded iterations) buys exact CPU physics
+/// and normals through the standard fold-history machinery instead.
+///
+/// **Meshing** is a real constraint, not set dressing (the tooth circles
+/// of adjacent gears genuinely interpenetrate -- angular radius ~24 deg
+/// each, axes 45 deg apart):
+///  - The contact graph is bipartite: edge gears touch only face gears
+///    (face-face are 90 deg apart, edge-edge 60 deg, both out of reach), so a
+///    consistent two-coloring of spin directions exists.
+///  - Velocity matching at each contact point forces the two classes to
+///    spin at **equal and opposite** rates about their own outward axes;
+///    hence `edge_anim = -face rate` (the reference hides this sign in
+///    the handedness of its swizzled frames).
+///  - Tooth alignment: with these alignment rotations every contact
+///    direction sits at azimuth `0 mod TAU/12` in *both* gears' local
+///    frames, so face gears (phase 0) present a tooth exactly where edge
+///    gears (phase `TAU/24`) present a gap. Matched velocities keep it
+///    that way for all time.
+pub fn gears(params: &mut Params) -> (Object, GearsHandles) {
+    let face_phase = params.alloc_scalar(0.0);
+    let edge_phase = params.alloc_scalar(GEARS_EDGE_OFFSET);
+    let face_anim = Expr::Mul(
+        Box::new(Expr::Tick),
+        Box::new(Expr::Const(GEARS_RATE_PER_TICK)),
+    );
+    let edge_anim = Expr::Add(
+        Box::new(Expr::Mul(
+            Box::new(Expr::Tick),
+            Box::new(Expr::Const(-GEARS_RATE_PER_TICK)),
+        )),
+        Box::new(Expr::Const(GEARS_EDGE_OFFSET)),
+    );
+    let handles = GearsHandles {
+        face_phase,
+        face_anim,
+        edge_phase,
+        edge_anim,
+    };
+
+    let center = Object::Fractal {
+        fold: Fold::OrbitInit(Vec3Value::Const(GEARS_CENTER_COLOR)),
+        base: Box::new(Object::Sphere {
+            radius: ScalarValue::Const(GEARS_CENTER_RADIUS),
+        }),
+    };
+
+    let mut object = center;
+    for (i, (align, _axes)) in gears_alignments().into_iter().enumerate() {
+        let phase = if i < 3 { face_phase } else { edge_phase };
+        object = Object::Union(Box::new(object), Box::new(gears_pair(align, phase)));
+    }
+    (object, handles)
+}
+
 /// Writes a full parameter set for the classic fractal tree built by
 /// [`classic`]/[`demo_scene`]. `ang1`/`ang2` are turned into rotation
 /// matrices via [`rotation_mat2`].
@@ -1020,4 +1313,193 @@ mod tests {
             anim.eval(full_period)
         );
     }
+
+    /// Every alignment in [`gears_alignments`] must send both of its world
+    /// gear directions onto the template's +-Y axis -- the whole meshing
+    /// argument in [`gears`]'s doc is anchored to these being exact.
+    #[test]
+    fn gears_pair_axes_map_to_template_y() {
+        let params = Params::new();
+        for (i, (align, axes)) in gears_alignments().into_iter().enumerate() {
+            let fold = Fold::Series(align);
+            for axis in axes {
+                let mut p = Vec4::new(axis.x, axis.y, axis.z, 1.0);
+                fold.fold(&mut p, &params);
+                assert!(
+                    p.x.abs() < 1e-6 && p.z.abs() < 1e-6 && (p.y.abs() - 1.0).abs() < 1e-6,
+                    "pair {i}: axis {axis:?} folded to {p:?}, expected +-Y"
+                );
+            }
+        }
+    }
+
+    /// The assembled scene has a pivot axle inside the shell along all 18
+    /// gear directions and free space just past the shell -- a coarse
+    /// whole-assembly check that catches any alignment fold pointing a
+    /// pair the wrong way.
+    #[test]
+    fn gears_scene_has_all_18_axles_where_expected() {
+        let mut params = Params::new();
+        let (object, _handles) = gears(&mut params);
+
+        // Stationary center sphere.
+        let d = object.de(Vec4::new(0.0, 0.0, 0.0, 1.0), &params);
+        assert!((d - (-GEARS_CENTER_RADIUS)).abs() < 1e-5, "center de={d}");
+
+        for (_align, axes) in gears_alignments() {
+            for axis in axes {
+                // Just under the pivot cap sphere (0.51): inside the axle.
+                let p = axis * 0.505;
+                let d = object.de(Vec4::new(p.x, p.y, p.z, 1.0), &params);
+                assert!(d < 0.0, "no axle at 0.505 * {axis:?}: de={d}");
+                // Just past everything (shell ends at 0.53, cap at 0.51).
+                let p = axis * 0.56;
+                let d = object.de(Vec4::new(p.x, p.y, p.z, 1.0), &params);
+                assert!(d > 0.0, "solid past the shell at 0.56 * {axis:?}: de={d}");
+            }
+        }
+
+        // Finite bound covering the shell.
+        let (_c, r) = object.bounding_sphere(&params).unwrap();
+        assert!(r.is_finite() && r >= 0.53 && r < 1.5, "bound r={r}");
+    }
+
+    /// Phase animations: equal and opposite rates (the meshing condition),
+    /// and each param's initial value equals its anim at tick 0 so the
+    /// first pre-tick frame isn't briefly wrong.
+    #[test]
+    fn gears_phase_anims_counter_rotate_from_consistent_starts() {
+        let mut params = Params::new();
+        let (_object, handles) = gears(&mut params);
+        assert!((handles.face_anim.eval(0) - params.scalar(handles.face_phase)).abs() < 1e-6);
+        assert!((handles.edge_anim.eval(0) - params.scalar(handles.edge_phase)).abs() < 1e-6);
+        let face_rate = handles.face_anim.eval(60) - handles.face_anim.eval(0);
+        let edge_rate = handles.edge_anim.eval(60) - handles.edge_anim.eval(0);
+        assert!((face_rate - 2.0).abs() < 1e-4, "face rate {face_rate} rad/s != 2");
+        assert!((edge_rate + 2.0).abs() < 1e-4, "edge rate {edge_rate} rad/s != -2");
+    }
+
+    /// The load-bearing meshing test: march the face gear at +Y and the
+    /// edge gear at (0, s, s) through a full tooth period of their
+    /// (counter-rotating) phase schedule, densely sampling the contact
+    /// lens where their tooth circles interpenetrate, and assert the two
+    /// solids never overlap. This catches every failure mode at once: a
+    /// wrong alignment azimuth, a wrong edge offset, or a wrong rotation
+    /// *sign* (same-sign gears grind within half a sector).
+    #[test]
+    fn gears_adjacent_gears_never_interpenetrate_through_a_tooth_period() {
+        use std::f32::consts::TAU;
+        let mut params = Params::new();
+        let face_phase = params.alloc_scalar(0.0);
+        let edge_phase = params.alloc_scalar(GEARS_EDGE_OFFSET);
+        let aligns = gears_alignments();
+        assert_eq!(aligns[1].1[0], Vec3::Y);
+        let edge_axis = aligns[5].1[0];
+        assert!(edge_axis.x.abs() < 1e-6 && edge_axis.y > 0.0 && edge_axis.z > 0.0);
+        let face = gears_pair(aligns[1].0.clone(), face_phase);
+        let edge = gears_pair(aligns[5].0.clone(), edge_phase);
+
+        // Contact lens around the pitch point between the two axes.
+        let m = (Vec3::Y + edge_axis).normalize();
+        let u = m.cross(Vec3::X).normalize();
+        let v = m.cross(u);
+        let center = m * GEARS_SHELL_RADIUS;
+
+        // Tolerance: the *reference geometry itself* lets tooth tips graze
+        // the neighbor's solid rim ring by up to ~0.008 (tip reach 0.212+
+        // from its own axis vs. the rim band starting 45 deg away -- both
+        // DEs capped by the 0.03 shell term), so a shallow overlap is
+        // faithful, not a bug. What the phase schedule must prevent is
+        // tooth-vs-tooth grinding, which shows up ~0.02 deep (tangential
+        // and radial tooth margins both exceed 0.02 at the pitch point);
+        // -0.012 sits between the two regimes.
+        const OVERLAP: f32 = -0.012;
+        let sector = TAU / GEARS_TOOTH_COUNT as f32;
+        for step in 0..12 {
+            let ang = step as f32 * sector / 12.0;
+            params.set_scalar(face_phase, ang);
+            params.set_scalar(edge_phase, -ang + GEARS_EDGE_OFFSET);
+            let mut probed_inside_face = false;
+            let n = 10;
+            for i in -n..=n {
+                for j in -n..=n {
+                    for k in -n..=n {
+                        let p = center
+                            + u * (i as f32 / n as f32 * 0.06)
+                            + v * (j as f32 / n as f32 * 0.06)
+                            + m * (k as f32 / n as f32 * 0.06);
+                        let p4 = Vec4::new(p.x, p.y, p.z, 1.0);
+                        let df = face.de(p4, &params);
+                        let de = edge.de(p4, &params);
+                        probed_inside_face |= df < OVERLAP;
+                        assert!(
+                            !(df < OVERLAP && de < OVERLAP),
+                            "gears interpenetrate at {p:?} (phase {ang}): \
+                             face de={df}, edge de={de}"
+                        );
+                    }
+                }
+            }
+            // Guard the test itself: the lens must actually contain face-gear
+            // material at every phase, or the assert above is vacuous.
+            assert!(probed_inside_face, "contact lens missed the face gear at phase {ang}");
+        }
+    }
+
+    /// At t = 0 the design puts a face-gear *tooth* exactly at the contact
+    /// direction and an edge-gear *gap* there (the azimuth-mod-30-degrees
+    /// argument in [`gears`]'s doc); spot-check both signs at the pitch
+    /// point.
+    #[test]
+    fn gears_tooth_meets_gap_at_time_zero() {
+        let mut params = Params::new();
+        let face_phase = params.alloc_scalar(0.0);
+        let edge_phase = params.alloc_scalar(GEARS_EDGE_OFFSET);
+        let aligns = gears_alignments();
+        let face = gears_pair(aligns[1].0.clone(), face_phase);
+        let edge = gears_pair(aligns[5].0.clone(), edge_phase);
+
+        let m = (Vec3::Y + aligns[5].1[0]).normalize();
+        let p = m * GEARS_SHELL_RADIUS;
+        let p4 = Vec4::new(p.x, p.y, p.z, 1.0);
+        let df = face.de(p4, &params);
+        let de = edge.de(p4, &params);
+        assert!(df < -0.005, "expected a face tooth at the pitch point, de={df}");
+        assert!(de > 0.005, "expected an edge gap at the pitch point, de={de}");
+
+        // And with the edge gear's built-in offset removed, its tooth lands
+        // there instead -- the offset is what interleaves them.
+        params.set_scalar(edge_phase, 0.0);
+        let de = edge.de(p4, &params);
+        assert!(de < -0.005, "offset-less edge gear should present a tooth, de={de}");
+    }
+
+    /// CPU physics path: nearest-point queries on the gears scene must be
+    /// finite and consistent with the DE (the marble collides with the
+    /// spinning teeth through the same fold-history machinery as every
+    /// other scene).
+    #[test]
+    fn gears_nearest_point_is_surface_consistent() {
+        let mut params = Params::new();
+        let (object, _handles) = gears(&mut params);
+        let probes = [
+            Vec3::new(0.0, 0.6, 0.02),
+            Vec3::new(0.19, 0.46, 0.0),
+            Vec3::new(0.3, 0.3, 0.3),
+            Vec3::new(0.0, 0.2, 0.0),
+            Vec3::new(1.0, 0.5, -0.4),
+        ];
+        for probe in probes {
+            let p = Vec4::new(probe.x, probe.y, probe.z, 1.0);
+            let d = object.de(p, &params).abs();
+            let np = object.nearest_point(p, &params);
+            assert!(np.is_finite(), "non-finite nearest_point for probe {probe:?}");
+            let actual = (probe - np).length();
+            assert!(
+                actual <= 2.0 * d.max(1e-4) && d <= 2.0 * actual.max(1e-4),
+                "probe {probe:?}: |p-np|={actual} vs de={d}"
+            );
+        }
+    }
 }
+

@@ -141,6 +141,11 @@ mod tests {
                 color_a: Vec3Value::Const(Vec3::new(1.3, 0.05, 0.06)),
                 color_b: Vec3Value::Const(Vec3::splat(2.5)),
             },
+            Fold::PolarModulo {
+                axis: Axis::Y,
+                count: IntValue::Const(12),
+                phase: ScalarValue::Const(0.3),
+            },
         ];
         for fold in variants {
             let object = Object::Fractal { fold: fold.clone(), base: Box::new(Object::Sphere { radius: ScalarValue::Const(1.0) }) };
@@ -200,6 +205,18 @@ mod tests {
             }),
             t: ScalarValue::Param(t),
         });
+    }
+
+    #[test]
+    fn cylinder_and_gears_round_trip() {
+        assert_object_round_trips(&Object::Cylinder {
+            radius: ScalarValue::Const(0.155),
+        });
+        // The real scene tree: 9 aligned gear pairs full of PolarModulo
+        // folds, Cylinders, and param-driven phases.
+        let mut params = Params::new();
+        let (object, _handles) = scenes::gears(&mut params);
+        assert_object_round_trips(&object);
     }
 
     #[test]

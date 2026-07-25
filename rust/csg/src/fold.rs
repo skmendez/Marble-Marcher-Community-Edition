@@ -73,6 +73,28 @@ pub enum Fold {
         color_a: Vec3Value,
         color_b: Vec3Value,
     },
+    /// N-fold angular repetition around `axis` (hg_sdf's classic
+    /// `pModPolar`; no C++ counterpart in this repo): rotates the query
+    /// point's around-the-axis angle into the canonical sector of width
+    /// `2*PI / count` centered on angle `phase`. A **piecewise pure
+    /// rotation** — every piece is an isometry, so the folded field stays
+    /// exact wherever the base is exact, same soundness class as `Rotate`/
+    /// `Modulo`. One primitive in the sector unfolds to `count` copies
+    /// arranged around the axis: gear teeth, spokes, turbine blades,
+    /// flower petals.
+    ///
+    /// `phase` doubles as a **rotation animation carrier**: the animation
+    /// table drives `ScalarParam`s only (not `Mat2Param`s), so a spinning
+    /// N-fold assembly is expressed by `Expr`-driving `phase` — exactly
+    /// how the gears scene rotates its teeth deterministically across
+    /// rollback. The angular pair convention matches `Rotate`'s cyclic
+    /// components (`rotate_components`): the canonical sector's center
+    /// direction (at `phase = 0`) is the `+c1` axis.
+    PolarModulo {
+        axis: Axis,
+        count: IntValue,
+        phase: ScalarValue,
+    },
 }
 
 /// Component indices `(c1, c2)` rotated by `FoldRotate` for a given axis,
@@ -163,6 +185,18 @@ impl Fold {
                 }
             }
             Fold::OrbitInit(_) | Fold::OrbitMax(_) | Fold::OrbitBarberPole { .. } => {}
+            Fold::PolarModulo { axis, count, phase } => {
+                let n = count.get(params).max(1) as f32;
+                let sector = std::f32::consts::TAU / n;
+                let ph = phase.get(params);
+                let (c1, c2) = rotate_components(*axis);
+                let a = p[c2].atan2(p[c1]) - ph;
+                let k = (a / sector).round();
+                let d = a - k * sector;
+                let rho = (p[c1] * p[c1] + p[c2] * p[c2]).sqrt();
+                p[c1] = rho * d.cos();
+                p[c2] = rho * d.sin();
+            }
         }
     }
 
@@ -173,7 +207,11 @@ impl Fold {
     /// `Repeat` recurse.
     pub fn fold_with_history(&self, p: &mut Vec4, hist: &mut Vec<Vec4>, params: &Params) {
         match self {
-            Fold::Abs | Fold::Menger | Fold::Plane { .. } | Fold::Modulo { .. } => {
+            Fold::Abs
+            | Fold::Menger
+            | Fold::Plane { .. }
+            | Fold::Modulo { .. }
+            | Fold::PolarModulo { .. } => {
                 hist.push(*p);
                 self.fold(p, params);
             }
@@ -256,6 +294,25 @@ impl Fold {
                 }
             }
             Fold::OrbitInit(_) | Fold::OrbitMax(_) | Fold::OrbitBarberPole { .. } => {}
+            // The fold rotated the (c1, c2) pair from angle `theta0` (the
+            // pre-fold angle, recoverable from history) down to the
+            // canonical `d = theta0 - ph - k*sector`; the inverse rotation
+            // (by `ph + k*sector`) maps the normal back out to the copy
+            // the query actually hit.
+            Fold::PolarModulo { axis, count, phase } => {
+                let p = hist.pop().expect("fold history underflow");
+                let n_count = count.get(params).max(1) as f32;
+                let sector = std::f32::consts::TAU / n_count;
+                let ph = phase.get(params);
+                let (c1, c2) = rotate_components(*axis);
+                let theta0 = p[c2].atan2(p[c1]);
+                let k = ((theta0 - ph) / sector).round();
+                let back = ph + k * sector;
+                let (sb, cb) = back.sin_cos();
+                let (a, b) = (n[c1], n[c2]);
+                n[c1] = cb * a - sb * b;
+                n[c2] = sb * a + cb * b;
+            }
         }
     }
 
@@ -340,6 +397,19 @@ impl Fold {
             }
             // Color-pass-only no-ops (same as `fold`/`unfold`).
             Fold::OrbitInit(_) | Fold::OrbitMax(_) | Fold::OrbitBarberPole { .. } => Some((c, r)),
+            // The preimage is `count` copies of the child bound rotated
+            // about the axis: enclose them all with an axis-centered
+            // sphere (keep the child's axial offset, pad the radius by its
+            // perpendicular distance) -- same shape of argument as
+            // `Abs`/`Menger`'s origin-recentering, specialized to one axis.
+            Fold::PolarModulo { axis, .. } => {
+                let i = axis.index();
+                let mut center = Vec3::ZERO;
+                center[i] = c[i];
+                let mut perp = c;
+                perp[i] = 0.0;
+                Some((center, r + perp.length()))
+            }
         }
     }
 
@@ -401,6 +471,12 @@ impl Fold {
                 color_a.encode(out);
                 color_b.encode(out);
             }
+            Fold::PolarModulo { axis, count, phase } => {
+                out.push(11);
+                axis.encode(out);
+                count.encode(out);
+                phase.encode(out);
+            }
         }
     }
 
@@ -430,6 +506,9 @@ impl Fold {
                     && twist_count.handle_valid_for(slot_count)
                     && color_a.handle_valid_for(slot_count)
                     && color_b.handle_valid_for(slot_count)
+            }
+            Fold::PolarModulo { count, phase, .. } => {
+                count.handle_valid_for(slot_count) && phase.handle_valid_for(slot_count)
             }
         }
     }
@@ -504,6 +583,12 @@ impl Fold {
                 let (color_a, pos) = Vec3Value::decode_at(bytes, pos)?;
                 let (color_b, pos) = Vec3Value::decode_at(bytes, pos)?;
                 (Fold::OrbitBarberPole { major, ring_count, twist_count, color_a, color_b }, pos)
+            }
+            11 => {
+                let (axis, pos) = Axis::decode_at(bytes, pos)?;
+                let (count, pos) = IntValue::decode_at(bytes, pos)?;
+                let (phase, pos) = ScalarValue::decode_at(bytes, pos)?;
+                (Fold::PolarModulo { axis, count, phase }, pos)
             }
             _ => return None,
         };
@@ -740,5 +825,108 @@ mod tests {
         let mut overflow_bytes = vec![6u8];
         overflow_bytes.extend_from_slice(&u32::MAX.to_le_bytes());
         assert!(Fold::decode_at(&overflow_bytes, 0).is_none());
+    }
+
+    /// `PolarModulo` is an N-fold rotational symmetrizer: folding a point
+    /// and folding that same point rotated by any whole number of sectors
+    /// about the axis must land on the identical canonical point.
+    #[test]
+    fn polar_modulo_is_sector_periodic() {
+        use std::f32::consts::TAU;
+        let params = Params::new();
+        let count = 12;
+        let fold = Fold::PolarModulo {
+            axis: Axis::Y,
+            count: IntValue::Const(count),
+            phase: ScalarValue::Const(0.4),
+        };
+        let base = Vec4::new(0.13, 0.46, 0.11, 1.0);
+        let mut expect = base;
+        fold.fold(&mut expect, &params);
+        for k in 1..count {
+            let ang = k as f32 * TAU / count as f32;
+            let (s, c) = ang.sin_cos();
+            // Rotate about +Y (the (z, x) angular pair, matching
+            // rotate_components).
+            let rotated = Vec4::new(
+                s * base.z + c * base.x,
+                base.y,
+                c * base.z - s * base.x,
+                base.w,
+            );
+            let mut p = rotated;
+            fold.fold(&mut p, &params);
+            assert!(
+                (p - expect).length() < 1e-5,
+                "sector {k}: folded {p:?} != {expect:?}"
+            );
+        }
+    }
+
+    /// The canonical sector is centered on +c1 (+Z for a Y axis) rotated
+    /// by `phase`, and folded points land within half a sector of it.
+    #[test]
+    fn polar_modulo_canonicalizes_to_the_phase_centered_sector() {
+        use std::f32::consts::TAU;
+        let params = Params::new();
+        let count = 8;
+        let phase = 0.7;
+        let fold = Fold::PolarModulo {
+            axis: Axis::Y,
+            count: IntValue::Const(count),
+            phase: ScalarValue::Const(phase),
+        };
+        let half_sector = TAU / count as f32 / 2.0;
+        for i in 0..40 {
+            let ang = i as f32 * TAU / 40.0;
+            let mut p = Vec4::new(ang.sin() * 2.0, 0.3, ang.cos() * 2.0, 1.0);
+            let rho = 2.0;
+            fold.fold(&mut p, &params);
+            // Radius and y are untouched (it's an isometry per sector)...
+            assert!((p.y - 0.3).abs() < 1e-6);
+            assert!(((p.x * p.x + p.z * p.z).sqrt() - rho).abs() < 1e-5);
+            // ...and the folded azimuth sits within half a sector of 0
+            // (the fold already subtracted `phase`).
+            let az = p.x.atan2(p.z);
+            assert!(
+                az.abs() <= half_sector + 1e-5,
+                "azimuth {az} escaped the canonical sector"
+            );
+        }
+    }
+
+    /// History/unfold roundtrip: unfolding the canonical nearest point
+    /// must produce a world point at the same distance from the query as
+    /// the canonical pair -- the property `Object::nearest_point` relies
+    /// on (folds are per-sector isometries).
+    #[test]
+    fn polar_modulo_unfold_preserves_distances() {
+        let params = Params::new();
+        let fold = Fold::PolarModulo {
+            axis: Axis::X,
+            count: IntValue::Const(5),
+            phase: ScalarValue::Const(-0.9),
+        };
+        for query in [
+            Vec4::new(0.4, -1.2, 0.5, 1.0),
+            Vec4::new(-0.1, 0.3, -2.0, 1.0),
+            Vec4::new(0.0, 1.7, 0.2, 1.0),
+        ] {
+            let mut p = query;
+            let mut hist = Vec::new();
+            fold.fold_with_history(&mut p, &mut hist, &params);
+            assert_eq!(hist.len(), 1);
+            // Pretend the canonical-space nearest point is this offset spot.
+            let np_canonical = p.truncate() + Vec3::new(0.05, -0.1, 0.2);
+            let d_canonical = (p.truncate() - np_canonical).length();
+            let mut np = np_canonical;
+            fold.unfold(&mut hist, &mut np, &params);
+            assert!(hist.is_empty());
+            let d_world = (query.truncate() - np).length();
+            assert!(
+                (d_world - d_canonical).abs() < 1e-5,
+                "distance not preserved: canonical {d_canonical} vs world {d_world}"
+            );
+        }
     }
 }

@@ -74,6 +74,13 @@ pub enum Object {
         major: ScalarValue,
         minor: ScalarValue,
     },
+    /// An infinite solid cylinder along the Y axis (no C++ counterpart):
+    /// `de = length(p.xz) - radius`. Exact, with an exact closed-form
+    /// nearest point (radial projection). Unbounded along its axis --
+    /// `bounding_sphere` returns `None`, the `Modulo` convention; scenes
+    /// clip it with `Intersect` where a finite bound matters (the gears
+    /// scene intersects it with a spherical shell).
+    Cylinder { radius: ScalarValue },
 }
 
 impl Object {
@@ -113,6 +120,7 @@ impl Object {
             Object::Torus { major, minor } => {
                 major.handle_valid_for(slot_count) && minor.handle_valid_for(slot_count)
             }
+            Object::Cylinder { radius } => radius.handle_valid_for(slot_count),
         }
     }
 
@@ -159,6 +167,9 @@ impl Object {
                 );
                 (q.length() - minor.get(params)) / p.w
             }
+            Object::Cylinder { radius } => {
+                (Vec2::new(p.x, p.z).length() - radius.get(params)) / p.w
+            }
         }
     }
 
@@ -190,7 +201,28 @@ impl Object {
             Object::Sphere { radius } => p.truncate().normalize() * radius.get(params),
             Object::Cuboid { half_extent } => {
                 let he = half_extent.get(params);
-                p.truncate().clamp(-he, he)
+                let q = p.truncate();
+                let clamped = q.clamp(-he, he);
+                if clamped != q {
+                    // Outside: componentwise clamp IS the exact projection.
+                    clamped
+                } else {
+                    // Inside: clamp is the identity here, which is useless
+                    // to `Offset`/`Onion` delegation (no push-out
+                    // direction) -- the true nearest surface point is
+                    // straight out through the face with the smallest
+                    // remaining margin.
+                    let margins = he - q.abs();
+                    let mut np = q;
+                    if margins.x <= margins.y && margins.x <= margins.z {
+                        np.x = he.x * q.x.signum();
+                    } else if margins.y <= margins.z {
+                        np.y = he.y * q.y.signum();
+                    } else {
+                        np.z = he.z * q.z.signum();
+                    }
+                    np
+                }
             }
             Object::Fractal { fold, base } => {
                 // The invariant is that this node's own fold pushes and pops
@@ -314,6 +346,14 @@ impl Object {
                     ring_point + d * (min_r / len)
                 }
             }
+            // Radial projection at the query's own height; on the axis
+            // (degenerate direction) pick +X, matching Torus's convention.
+            Object::Cylinder { radius } => {
+                let r = radius.get(params);
+                let xz = Vec2::new(p.x, p.z);
+                let dir = if xz.length() > 1e-9 { xz.normalize() } else { Vec2::X };
+                Vec3::new(dir.x * r, p.y, dir.y * r)
+            }
         }
     }
 
@@ -425,6 +465,9 @@ impl Object {
             Object::Torus { major, minor } => {
                 Some((Vec3::ZERO, major.get(params) + minor.get(params)))
             }
+            // Infinite along Y -- genuinely unbounded, resolved by an
+            // enclosing `Intersect` exactly like `Modulo` tilings.
+            Object::Cylinder { .. } => None,
         }
     }
 
@@ -487,6 +530,10 @@ impl Object {
                 out.push(9);
                 major.encode(out);
                 minor.encode(out);
+            }
+            Object::Cylinder { radius } => {
+                out.push(10);
+                radius.encode(out);
             }
         }
     }
@@ -562,6 +609,10 @@ impl Object {
                 let (major, pos) = ScalarValue::decode_at(bytes, pos)?;
                 let (minor, pos) = ScalarValue::decode_at(bytes, pos)?;
                 (Object::Torus { major, minor }, pos)
+            }
+            10 => {
+                let (radius, pos) = ScalarValue::decode_at(bytes, pos)?;
+                (Object::Cylinder { radius }, pos)
             }
             _ => return None,
         };
@@ -1196,6 +1247,54 @@ mod tests {
         let (c, r) = torus(3.0, 1.0).bounding_sphere(&params).unwrap();
         assert_eq!(c, Vec3::ZERO);
         assert!((r - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cylinder_de_and_nearest_point() {
+        let params = Params::new();
+        let c = Object::Cylinder {
+            radius: ScalarValue::Const(0.5),
+        };
+        // Outside, radially: de is the radial gap regardless of y.
+        assert!((c.de(Vec4::new(2.0, 7.0, 0.0, 1.0), &params) - 1.5).abs() < 1e-6);
+        // Inside: negative by the depth.
+        assert!((c.de(Vec4::new(0.2, -3.0, 0.0, 1.0), &params) - (-0.3)).abs() < 1e-6);
+        // Scaled-w division.
+        assert!((c.de(Vec4::new(2.0, 0.0, 0.0, 2.0), &params) - 0.75).abs() < 1e-6);
+
+        // Nearest point: radial projection, preserving y.
+        let np = c.nearest_point(Vec4::new(2.0, 7.0, 0.0, 1.0), &params);
+        assert!((np - Vec3::new(0.5, 7.0, 0.0)).length() < 1e-5, "{np:?}");
+        let np = c.nearest_point(Vec4::new(0.0, 1.0, -0.1, 1.0), &params);
+        assert!((np - Vec3::new(0.0, 1.0, -0.5)).length() < 1e-5, "{np:?}");
+        // Exactly on the axis (degenerate direction): finite, on-surface.
+        let np = c.nearest_point(Vec4::new(0.0, 2.0, 0.0, 1.0), &params);
+        assert!(np.is_finite());
+        assert!(c.de(np.extend(1.0), &params).abs() < 1e-5, "{np:?}");
+
+        // Unbounded along its axis.
+        assert!(c.bounding_sphere(&params).is_none());
+    }
+
+    #[test]
+    fn cuboid_nearest_point_from_inside_projects_to_the_closest_face() {
+        let params = Params::new();
+        let c = cuboid(Vec3::new(1.0, 2.0, 3.0));
+        // Interior point nearest the +X face.
+        let np = c.nearest_point(Vec4::new(0.7, 0.5, -1.0, 1.0), &params);
+        assert!((np - Vec3::new(1.0, 0.5, -1.0)).length() < 1e-5, "{np:?}");
+        // Interior point nearest the -Y face.
+        let np = c.nearest_point(Vec4::new(0.1, -1.9, 1.0, 1.0), &params);
+        assert!((np - Vec3::new(0.1, -2.0, 1.0)).length() < 1e-5, "{np:?}");
+        // Center: still lands on a face, not the center itself (any face
+        // is acceptable; the invariant is |p - np| == |de|).
+        let p = Vec4::new(0.0, 0.0, 0.0, 1.0);
+        let np = c.nearest_point(p, &params);
+        let d = c.de(p, &params);
+        assert!(((p.truncate() - np).length() - d.abs()).abs() < 1e-5, "{np:?} vs de {d}");
+        // Outside is still the plain clamp projection.
+        let np = c.nearest_point(Vec4::new(5.0, 0.0, 0.0, 1.0), &params);
+        assert!((np - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5, "{np:?}");
     }
 
     #[test]

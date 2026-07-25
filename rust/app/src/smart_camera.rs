@@ -1834,6 +1834,7 @@ mod scene_probe {
             SceneKind::MengerOscillatingSphere,
             SceneKind::HollowDonut,
             SceneKind::CubeSphereMorph,
+            SceneKind::Gears,
         ];
         println!(
             "{:<26} {:>5} {:>7} {:>7} {:>7} {:>9} {:>9} {:>9} {:>6} {:>7} {:>7}",
