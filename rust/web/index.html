@@ -167,6 +167,15 @@
       // still needs these to exist.
       window.mmNet.reportPassTimings = function () {};
       window.mmNet.reportStepData = function () {};
+      // Same safe-no-op-first-real-implementation-later pattern for the
+      // dev-only "copy snapshot" button's data source (`rust/app/src/
+      // snapshot.rs`'s module doc): unlike the two calls above, Rust's own
+      // gate for calling this one already is `?debug=1` (`main.rs`'s
+      // `report_snapshot_state.run_if(...)`), so in practice the real
+      // handler below is always installed before this could ever matter --
+      // kept anyway for the same defense-in-depth reason every other
+      // bridge call in this file gets a default.
+      window.mmNet.reportSnapshot = function () {};
     })();
   </script>
   <!-- Controls panel: a dat.gui instance that ALWAYS exists (every player
@@ -334,6 +343,60 @@
       // player's panel is just the copy-link row above.
       if (!debugEnabled) {
         return;
+      }
+
+      // Copy-snapshot -- a dev tool for reproducing the *exact* current
+      // still frame later (`rust/app/src/snapshot.rs`'s module doc): scene,
+      // camera angle/zoom, marble position(s), and animated-fold phase all
+      // pinned via a `?snapshot=<value>` URL. Same "action button + rename-
+      // for-transient-feedback" shape as "copy invite link" above, but the
+      // payload itself comes from Rust (`window.mmNet.reportSnapshot`,
+      // pushed fresh every frame -- `report_snapshot_state`'s doc) rather
+      // than plain JS state, since only Rust can see `RollbackSim`/
+      // `CameraOrbit`. An empty pushed value means "not available right
+      // now" (`MultiplayerSession::is_solo`'s doc: a connected multiplayer
+      // session can't safely load arbitrary frozen state), not a bug.
+      let latestSnapshot = "";
+      window.mmNet.reportSnapshot = function (encoded) {
+        latestSnapshot = encoded;
+      };
+      const SNAPSHOT_IDLE_LABEL = "copy snapshot";
+      const snapshotState = {
+        copy: function () {
+          if (!latestSnapshot) {
+            showSnapshotFeedback("not available (connected)");
+            return;
+          }
+          // Preserves the page's *own* current query params (so `?scene=`/
+          // `?debug=1` carry over unchanged) rather than building a bare
+          // `?snapshot=`-only URL from scratch -- the snapshot's own scene
+          // geometry is fully self-contained either way
+          // (`SceneSnapshot`'s doc), but keeping `?scene=` in sync is
+          // still what makes the *live params panel*'s labels line up
+          // after loading (`load_snapshot_from_url`'s "known scope
+          // limitation" doc).
+          const next = new URLSearchParams(location.search);
+          next.set("snapshot", latestSnapshot);
+          const link = `${location.origin}${location.pathname}?${next.toString()}`;
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(link).then(
+              () => showSnapshotFeedback("copied!"),
+              () => showSnapshotFeedback("copy failed"),
+            );
+          } else {
+            showSnapshotFeedback("copy failed");
+          }
+        },
+      };
+      const snapshotController = gui.add(snapshotState, "copy").name(SNAPSHOT_IDLE_LABEL);
+      let snapshotFeedbackTimeout = null;
+      function showSnapshotFeedback(message) {
+        snapshotController.name(message);
+        if (snapshotFeedbackTimeout !== null) clearTimeout(snapshotFeedbackTimeout);
+        snapshotFeedbackTimeout = setTimeout(() => {
+          snapshotController.name(SNAPSHOT_IDLE_LABEL);
+          snapshotFeedbackTimeout = null;
+        }, 1500);
       }
 
       // Two folders so reload-triggering and instant/live controls are

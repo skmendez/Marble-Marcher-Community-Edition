@@ -1,8 +1,9 @@
 //! Half-resolution shadow/AO pre-pass (second-round-perf addition, mirrors
 //! `mrrm.rs`'s architecture): a soft-shadow march is far more expensive per
-//! pixel than the primary march it sits next to (`SHADOW_STEPS = 24` fixed
-//! iterations, `marble_csg::codegen`'s `shadow()`, run at *every* full-res
-//! pixel today), so this decouples its resolution from color resolution --
+//! pixel than the primary march it sits next to (`SHADOW_STEPS` fixed
+//! iterations, `marble_csg::codegen`'s `shadow()`, plus `AMBIENT_MARCHES`
+//! for the ambient-occlusion term, which would otherwise run at *every*
+//! full-res pixel), so this decouples its resolution from color resolution --
 //! ported from MMCE's own `Illumination_step` pass
 //! (`game_folder/shaders/shader_documentation.md`: "half res shadows and
 //! AO"), which does the same thing.
@@ -16,10 +17,17 @@
 //! read of the coarse pass's cheapened-fold DE could land this march on the
 //! wrong fold near a Menger-fold crease, producing a materially wrong shadow
 //! value for the whole frame under a tiny camera nudge). The fine pass
-//! resamples *this* pass's cached shadow visibility (`marble_csg::codegen`'s
-//! `sample_shadow`, a depth-aware 4-tap blend -- ported from MMCE's
-//! `bilinear_surface`) instead of marching a fresh shadow ray per full-res
-//! pixel.
+//! resamples *this* pass's cached shadow visibility and ambient occlusion
+//! (`marble_csg::codegen`'s `sample_shadow`, a depth-aware 4-tap blend --
+//! ported from MMCE's `bilinear_surface`) instead of marching a fresh shadow
+//! ray per full-res pixel.
+//!
+//! This pass's own march runs against the **full-fidelity** scene DE, same as
+//! the fine pass. It used to use the coarse pass's reduced-iteration variant,
+//! which meant it occluded against a visibly different (much fatter) shape
+//! than the one on screen -- see `generate_shadow_shader`'s doc for what that
+//! produced, and for why the depth-aware resample silently degenerated along
+//! with it.
 //!
 //! `ShadowCamera`/`ShadowQuad` get their own `RenderLayers` (distinct from
 //! both the fine marcher's implicit layer 0 and MRRM's `COARSE_LAYER`), same
@@ -199,11 +207,22 @@ pub struct ShadowRenderTarget {
 /// reasoning as `mrrm::make_coarse_render_target_image`'s doc (this pass's
 /// output needs an arbitrary, not-clamped-to-[0,1], not-gamma-encoded `A`
 /// channel for the traveled-distance value `sample_shadow` reads back).
+///
+/// Channels are `R` = sun visibility, `G` = ambient occlusion, `B` unused,
+/// `A` = traveled distance (`marble_csg::codegen`'s `SHADOW_MARCHER`). `G`
+/// was spare until AO moved into this pass -- the fine pass used to derive
+/// its own "AO" from the primary march's step count, which is a render-cost
+/// heatmap rather than an occlusion term (see `ambient_occlusion`'s doc in
+/// `SHADING_CORE`); computing it here instead makes it a real
+/// normal-direction march, and it rides the *same* four depth-weighted taps
+/// `sample_shadow` already does for visibility, so the resample is free.
+///
 /// Initial fill is all-zero bytes, decoding to `(0.0, 0.0, 0.0, 0.0)`:
 /// harmless (every `Startup` system finishes before the first frame renders,
 /// and this pass fully redraws its target every frame after that), and even
-/// a stale zero read (`shadow = 0.0`, `td = 0.0`) would just read as
-/// "fully shadowed at the camera" rather than corrupting anything.
+/// a stale zero read (`shadow = 0.0`, `ao = 0.0`, `td = 0.0`) would just
+/// read as "fully shadowed and fully occluded at the camera" rather than
+/// corrupting anything.
 fn make_shadow_render_target_image(size: UVec2) -> Image {
     let mut image = Image::new_fill(
         Extent3d {

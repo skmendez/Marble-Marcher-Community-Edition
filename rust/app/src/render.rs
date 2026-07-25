@@ -1292,6 +1292,22 @@ pub fn setup(
             target: RenderTarget::from(fine_image_handle.clone()),
             ..default()
         },
+        // This pass draws exactly one full-screen quad (`MarcherQuad`) --
+        // nothing for MSAA to antialias, so it's pure overhead. Worse than
+        // idle overhead, in fact: without this, Bevy defaults to
+        // `Msaa::Sample4`, which means a multisampled resolve texture sized
+        // to this camera's *viewport* (not the underlying image), recreated
+        // through `TextureCache` any time that viewport size changes. Fine's
+        // viewport tracks `FineRenderTarget::active_size`
+        // (`sync_fine_render_target_and_present`), which
+        // `oscillate_fine_resolution_tier` (debug flag `?res_oscillate=1`)
+        // changes on *every* frame -- a new resolve texture every frame,
+        // and on WebGPU `wgpu`'s `Drop for WebTexture` is a no-op (browser
+        // GC only), so those textures piled up until the tab crashed.
+        // Matches the existing convention on the coarse (`mrrm.rs`) and
+        // shadow (`shadow_pass.rs`) cameras, both of which already spawn
+        // `Msaa::Off` for the same "single full-screen quad" reason.
+        Msaa::Off,
         MarcherCamera,
         // GPU-timestamp-query profiling (`gpu_profile.rs`).
         crate::gpu_profile::GpuProfiledPass(crate::gpu_profile::FINE_PASS_NAME),
@@ -1330,6 +1346,27 @@ pub fn setup(
             order: 1,
             ..default()
         },
+        // Deliberately *not* `Msaa::Off` here, unlike the fine camera above
+        // (and the coarse/shadow cameras) -- measured live (screenshot
+        // diff, same scene/camera state): adding it introduces a real
+        // rendering regression on this camera specifically (visible holes
+        // in the fractal surface that aren't present with Bevy's default
+        // `Msaa::Sample4`), most likely an interaction with
+        // `IsDefaultUiCamera`/bevy_ui sharing this camera's target rather
+        // than anything about the present quad itself. Leaving it off cost
+        // nothing for the bug this was chasing, either:
+        // `sync_fine_render_target_and_present`'s viewport-mutating query
+        // is `Without<PresentCamera>` -- this camera's `Camera.viewport`
+        // is never written at all (stays `None`, i.e. Bevy tracks the
+        // window's actual size directly), so `oscillate_fine_resolution_
+        // tier`'s every-frame churn (the fine camera's fix above) never
+        // touched this camera in the first place. A real window resize
+        // still changes this camera's effective size (same as the fine
+        // camera's `native_size`), so it isn't entirely free of the
+        // underlying MSAA-resolve-texture-churn risk -- but that's a rare,
+        // user-driven event, not a continuous every-frame one, so it's a
+        // much smaller residual risk than the one this fix targets, and
+        // not worth a confirmed visual regression to close.
         RenderLayers::layer(PRESENT_LAYER),
         PresentCamera,
         IsDefaultUiCamera,
@@ -1363,6 +1400,93 @@ pub fn setup(
         kill_y: spawn.kill_y,
         local_player_index: 0,
     });
+}
+
+/// `Startup` system, chained directly after [`setup`] and before
+/// `mrrm::setup_mrrm_pipeline`/`shadow_pass::setup_shadow_pipeline`
+/// (`main.rs`'s `Startup` chain): if `?snapshot=<encoded>`/`MM_SNAPSHOT` is
+/// present and decodes (`snapshot::SceneSnapshot::from_url_param`), applies
+/// it -- reproducing the exact frozen still frame the "copy snapshot"
+/// dat.gui button (`snapshot::report_snapshot_state`) captured.
+///
+/// Mirrors [`apply_pending_scene_sync`]'s own "adopt a wholesale different
+/// scene, atomically with a tick + marble list" handling (same
+/// `RollbackSim::set_scene` call, same unconditional `frame.params`
+/// reseed, same `bounding_sphere` recompute, same `CameraRig::reset` so the
+/// realized camera snaps to the restored view instead of springing across
+/// the old one first), with two differences that fall directly out of
+/// running at `Startup` instead of `Update`:
+///  - No force-touch of the coarse/shadow materials' bind groups
+///    (`apply_pending_scene_sync`'s doc on why *that* call needs one): this
+///    runs *before* `setup_mrrm_pipeline`/`setup_shadow_pipeline` have ever
+///    built those materials in the first place, so there is no stale bind
+///    group to invalidate -- those two systems build theirs fresh, right
+///    after this one runs, straight from `mp.sim.scene().object` (already
+///    the replaced scene by the time they read it), with no separate
+///    shader-regen call needed here for either of them.
+///  - `CameraOrbit`'s orientation/zoom are also overwritten directly
+///    (`apply_pending_scene_sync` never touches them -- a multiplayer scene
+///    sync never moves the other peer's camera, it only resets the rig's
+///    spring state so *whatever* orbit that peer already has isn't swept
+///    away from).
+///
+/// Solo-only in effect, not by an explicit `MultiplayerSession::is_solo`
+/// check: this only ever runs once, at `Startup`, strictly before any
+/// network connection can exist, so the session is unconditionally solo
+/// at this point regardless of what happens later.
+///
+/// A malformed/truncated/wrong-version `?snapshot=` value is ignored with
+/// a `warn!` (same defensive posture as this function's `Update`-side
+/// counterpart's undecodable scene-sync payload) rather than panicking --
+/// a hand-edited or truncated-in-transit URL shouldn't take the whole page
+/// down.
+///
+/// Known scope limitation: `SceneState::kind`/`handles` are left as
+/// whatever `setup` built from `?scene=`/`Config::scene` -- correct in the
+/// intended usage (the "copy snapshot" button preserves the page's
+/// existing `?scene=` when it builds its URL, so the snapshot's actual
+/// scene always matches), but the live params panel's labeled sliders
+/// would refer to the wrong handles if a `?snapshot=` value is ever
+/// combined with an unrelated `?scene=` by hand.
+pub fn load_snapshot_from_url(
+    mut scene_state: ResMut<SceneState>,
+    mut mp: ResMut<MultiplayerSession>,
+    mut marble_state: ResMut<MarbleState>,
+    mut camera_orbit: ResMut<CameraOrbit>,
+    mut rig: ResMut<CameraRig>,
+    mut shaders: ResMut<Assets<Shader>>,
+    mut frame: ResMut<MarcherFrameData>,
+) {
+    let Some(raw) = crate::config::query_value("snapshot", "MM_SNAPSHOT") else {
+        return;
+    };
+    let Some(snapshot) = crate::snapshot::SceneSnapshot::from_url_param(&raw) else {
+        warn!("snapshot: `?snapshot=` value present but failed to decode -- ignoring it");
+        return;
+    };
+
+    let wgsl = generate_shader(&snapshot.scene.object);
+    shaders.insert(MARCHER_SHADER_HANDLE.id(), Shader::from_wgsl(wgsl, "generated://marcher.wgsl"));
+    scene_state.bounding_sphere = pack_bounding_sphere(&snapshot.scene.object, &snapshot.scene.params);
+    frame.params.clear();
+    frame.params.extend_from_slice(snapshot.scene.params.slots());
+
+    marble_state.start_positions = snapshot.marbles.iter().map(|m| m.pos).collect();
+    marble_state.marbles = snapshot.marbles.clone();
+    mp.sim.set_scene(snapshot.tick, snapshot.scene, snapshot.marbles);
+
+    camera_orbit.orientation = snapshot.camera_orientation;
+    camera_orbit.zoom = snapshot.camera_zoom;
+    // The realized camera (`CameraRig`) only *tracks* `CameraOrbit`,
+    // springing toward it over several frames rather than jumping there
+    // instantly (`smart_camera`'s module doc) -- exactly like a multiplayer
+    // scene sync (`apply_pending_scene_sync`'s identical `rig.reset()`
+    // call), the world/marble/camera are all being replaced wholesale here,
+    // so the next `smart_camera::solve` must snap straight to the restored
+    // orbit instead of visibly sweeping across the old view first.
+    rig.reset();
+
+    info!("snapshot: loaded a `?snapshot=` frame at tick {}", mp.sim.current_tick());
 }
 
 /// `Update` system: applies the host's most recently received scene-sync
@@ -1743,6 +1867,17 @@ fn update_frame_data_impl(
             shadow_render_target.size.y as f32,
             if toggles.mrrm_enabled { 1.0 } else { 0.0 },
         ),
+        // x: the *fine* pass's render-target height. Unlike `misc.z` (this
+        // pass's own height, which drives its own primary march's cone
+        // angle), this is deliberately the other pass's: the shadow march's
+        // occlusion threshold has to be the resolution the result is
+        // eventually *displayed* at, or shadow silhouettes change shape with
+        // the shadow target's resolution. Mirrors MMCE, which computes
+        // `fovray` once from the full resolution and uses that same value
+        // inside `shadow_march` even when called from its half-resolution
+        // `Illumination_step` (`marble_csg::codegen`'s `SHADOW_MARCHER`).
+        // y/z/w unused by this pass.
+        misc2: Vec4::new(resolution_height, 0.0, 0.0, 0.0),
         ..base
     };
 

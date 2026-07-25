@@ -358,6 +358,14 @@ pub(crate) mod js_bridge {
         pub fn live_mrrm_enabled() -> bool;
         #[wasm_bindgen(js_namespace = mmNet, js_name = liveViewMode)]
         pub fn live_view_mode() -> i32;
+        // Dev-only "copy snapshot" button (`snapshot.rs`'s module doc):
+        // pushed fresh every frame (gated on `Config::debug_enabled`, same
+        // convention as `report_pass_timings`/`report_step_data` above,
+        // just gated on a different flag), an empty string meaning "not
+        // available right now" (`MultiplayerSession::is_solo`'s doc) rather
+        // than a real encoded payload.
+        #[wasm_bindgen(js_namespace = mmNet, js_name = reportSnapshot)]
+        pub fn report_snapshot(encoded: &str);
     }
 }
 
@@ -391,6 +399,7 @@ pub(crate) mod js_bridge {
     }
     pub fn report_pass_timings(_supported: bool, _coarse_ms: f64, _shadow_ms: f64, _fine_ms: f64, _present_ms: f64) {}
     pub fn report_step_data(_avg_iters_per_px: f64, _estimated_total_steps: f64) {}
+    pub fn report_snapshot(_encoded: &str) {}
     // Never actually called on native: `live_debug.rs`'s
     // `poll_live_debug_toggles` is a true no-op there, so these exist only
     // to keep this stub module's shape matching the wasm one; values are

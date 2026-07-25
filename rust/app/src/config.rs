@@ -18,7 +18,12 @@ use bevy::prelude::Resource;
 
 use crate::render::SceneKind;
 
-fn query_value(web_key: &str, env_key: &str) -> Option<String> {
+/// `pub(crate)`, not private: `snapshot.rs`'s `?snapshot=`/`MM_SNAPSHOT` read
+/// reuses this exact query-param-then-env-var convention too (not part of
+/// `Config` itself since a snapshot payload is a `String`, not a `Copy`
+/// value like every other field here), rather than duplicating the same
+/// two-line fallback glue a second time.
+pub(crate) fn query_value(web_key: &str, env_key: &str) -> Option<String> {
     crate::web_config::query_param(web_key).or_else(|| std::env::var(env_key).ok())
 }
 

@@ -832,13 +832,27 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
 
     // This pass's *own* resolution's cone angle (`scene.misc.z` is this
     // pass's own render-target height, written by `shadow_pass.rs` -- same
-    // per-pass-own-resolution convention as `COARSE_MARCHER`).
+    // per-pass-own-resolution convention as `COARSE_MARCHER`), used for this
+    // pass's own primary march and for the cone-radius back-off that sizes
+    // its shadow-ray origin bias.
     let half_fov = atan(1.0 / scene.cam_forward.w);
     let pixel_angle = 2.0 * half_fov / max(scene.misc.z, 1.0);
+    // The *fine* pass's cone angle (`scene.misc2.x`, this pass's own render
+    // target height's counterpart, written by `render.rs`'s `frame.shadow`),
+    // used as `shadow()`'s occlusion threshold. MMCE computes `fovray` once
+    // from the full resolution (utility/camera.glsl) and uses that same
+    // value inside `shadow_march` even when called from the half-resolution
+    // `Illumination_step`. Using this pass's own 2x-coarser angle instead --
+    // as this did before -- makes the occlusion test twice as eager to
+    // declare a hit, so shadows both over-occlude and change shape with the
+    // shadow target's resolution, which is not a thing shadows should do.
+    let fine_pixel_angle = 2.0 * half_fov / max(scene.misc2.x, 1.0);
 
+    // G channel is ambient occlusion, A is traveled distance. A ray that
+    // never hits anything is fully lit and fully unoccluded.
     let clip = ray_sphere_clip(ro, rd, scene.bounding.xyz, scene.bounding.w);
     if (clip.x > clip.y) {
-        return vec4<f32>(1.0, 0.0, 0.0, MAX_DIST);
+        return vec4<f32>(1.0, 1.0, 0.0, MAX_DIST);
     }
 
     // Deliberately *not* warm-started from MRRM's coarse buffer -- see this
@@ -850,14 +864,37 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     // same behavior every pass has when `?mrrm=0`.
     let march = march_scene(ro, rd, clip.x, pixel_angle, clip.y, MAX_STEPS);
     if (!march.hit) {
-        return vec4<f32>(1.0, 0.0, 0.0, MAX_DIST);
+        return vec4<f32>(1.0, 1.0, 0.0, MAX_DIST);
     }
 
-    let p = ro + rd * march.t;
-    let eps = 1e-4 * max(march.t, 0.05);
-    let n = calc_normal(p, eps);
-    let sh = shadow(p + n * 2.0 * eps, scene.sun.xyz, pixel_angle);
-    return vec4<f32>(sh, 0.0, 0.0, march.t);
+    // `march.t` (not the backed-off point's own distance) is what goes in the
+    // A channel: `sample_shadow` compares it against the *fine* pass's hit
+    // distance for the same pixel, so it has to stay the raw traveled
+    // distance to the surface. MMCE stores its `td` the same way, before the
+    // equivalent back-off.
+    let cone_rad = max(march.t * pixel_angle, MIN_HIT_DIST);
+    let p = cone_backoff(ro + rd * march.t, rd, cone_rad);
+    // Normal epsilon of half the cone radius, matching MMCE's `shading()`
+    // (`error = 0.5*fov*dir.w; calcNormal(pos.xyz, max(MIN_DIST, error))`)
+    // rather than the previous fixed `1e-4 * t`, which was well below the
+    // march's own convergence tolerance and so sampled the DE's gradient at a
+    // scale finer than the surface it had actually resolved.
+    let n = calc_normal(p, max(0.5 * cone_rad, MIN_HIT_DIST));
+    let ao = ambient_occlusion(p, n, march.t);
+
+    // A surface facing away from the sun is fully self-shadowed by
+    // definition -- no march can change that, so skip it. Typically a little
+    // under half of all hit texels, and it's the cheapest large saving
+    // available here (MMCE can't do this: its `Illumination_step` computes
+    // `direct` before it has a normal to test against).
+    var sh = 0.0;
+    if (dot(n, scene.sun.xyz) > 0.0) {
+        // Escape distance for the shadow ray: where it leaves the scene's
+        // bounding sphere, not a blanket `MAX_DIST` (see `shadow()`'s doc).
+        let sun_clip = ray_sphere_clip(p, scene.sun.xyz, scene.bounding.xyz, scene.bounding.w);
+        sh = shadow(p, scene.sun.xyz, fine_pixel_angle, min(sun_clip.y, MAX_DIST));
+    }
+    return vec4<f32>(sh, ao, 0.0, march.t);
 }
 ";
 
@@ -869,20 +906,34 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
 /// skips all shading -- but harmless dead code there is worse than a third
 /// copy, so this lives in its own block included only where used.
 const SHADING_CORE: &str = "\
-// Reduced from 24 to 16 this session -- the improved-sphere-tracing soft
-// shadow technique below already converges faster per step than a naive
-// `min(d/t)` march would, and this pass only ever feeds a half-resolution,
-// depth-aware-resampled visibility term into the fine pass (`sample_shadow`),
-// not a direct per-fine-pixel shadow ray -- re-verified visually across the
-// Menger scenes' corner/tunnel shadows and the Demo scene at several sun
-// angles with no visible new banding/acne versus 24.
-const SHADOW_STEPS: i32 = 16;
+// Raised from 16 to 64 (MMCE's `shadow_march` uses 128). 16 was far too few
+// given how `shadow()` below reports failure: a ray that exhausts its budget
+// without either hitting an occluder or escaping returns **occluded**, so an
+// under-budgeted march doesn't degrade gracefully, it renders hard black.
+// Reaching the escape condition used to mean travelling the full `MAX_DIST`
+// (30 world units) from the surface, which 16 geometric steps frequently
+// could not do on a scene whose bounding radius is a few units -- so a large
+// fraction of *unoccluded* pixels reported full shadow. Worse, *which* rays
+// made it depended on exactly where the primary march terminated, which
+// scales with the pixel cone angle and therefore with camera distance: the
+// direct mechanism behind \"a static scene's shadows change when I move the
+// camera\". `shadow()` now also takes a `max_t` escape distance from the
+// caller's bounding-sphere clip instead of using `MAX_DIST`, so a ray that
+// leaves the scene's bounds escapes in a handful of steps rather than
+// grinding out to 30 units -- that alone reclaims most of what raising the
+// budget costs, and it makes budget exhaustion a genuinely rare event rather
+// than a routine one.
+const SHADOW_STEPS: i32 = 64;
 // Angular size (tangent of the half-angle) of the sun disc, controlling
-// shadow penumbra softness in the improved soft-shadow technique below --
-// MMCE passes this in as a per-scene `light_angle` parameter we don't have
-// a located concrete value for; 0.06 gives a fairly crisp but not
-// razor-hard directional-sun-like shadow, chosen by visual inspection.
-const LIGHT_ANGLE: f32 = 0.06;
+// shadow penumbra softness in the improved soft-shadow technique below.
+// MMCE passes this in as a per-scene `light_angle` parameter; its shipped
+// default is `#define LIGHT_ANGLE 0.08` (utility/definitions.glsl), which is
+// what this now matches (was 0.06, picked by inspection before that value
+// had been located).
+const LIGHT_ANGLE: f32 = 0.08;
+// Number of normal-direction steps in `ambient_occlusion` below -- MMCE's
+// `#define AMBIENT_MARCHES 4` (utility/definitions.glsl).
+const AMBIENT_MARCHES: i32 = 4;
 
 // Tetrahedral central-difference normal (4 `map()` calls, down from the
 // prior axis-aligned 6-tap version's 6) -- Inigo Quilez's well-established
@@ -902,6 +953,79 @@ fn calc_normal(p: vec3<f32>, eps: f32) -> vec3<f32> {
     return normalize(e1 * map(p + e1) + e2 * map(p + e2) + e3 * map(p + e3) + e4 * map(p + e4));
 }
 
+// Backs a primary-march hit point off the surface until it sits roughly one
+// pixel-cone radius clear of it, by iterating `p += (map(p) - cone_rad) * rd`
+// along the *view* direction -- a direct port of MMCE's `Illumination_step`,
+// which does exactly this (three unrolled steps) before firing its shadow
+// ray. This is the shadow-ray origin bias, and it replaces the previous
+// `p + n * 2.0 * eps` (`eps = 1e-4 * t`) offset, which was wrong in two ways.
+//
+// It was too small: `march_scene` terminates once `h < t * pixel_angle`, so
+// the hit point can sit a full cone radius (~1.7e-3 * t at 720p) above the
+// surface while the bias applied was `2e-4 * t` -- an order of magnitude
+// less than the march's own convergence tolerance, so the bias was noise
+// next to the uncertainty it was supposed to cover.
+//
+// And it could not rescue a point *inside* the surface: `march_scene` also
+// breaks on `h < 0.0` and reports that `t`, so `map(p)` is genuinely
+// negative for those pixels. A normal-direction nudge of `2e-4 * t` doesn't
+// get back out, the shadow march starts inside geometry, immediately trips
+// its own occlusion test and returns hard black. Whether a given pixel
+// overshoots that way depends on the over-relaxed march's step sequence,
+// which depends on the ray origin -- another camera-dependent path to
+// spurious shadow.
+//
+// Iterating on `map(p) - cone_rad` fixes both: from outside it walks back
+// toward the camera until `map(p) == cone_rad`, from inside it walks back out
+// through the surface to the same place. The result is a bias that is a
+// consistent function of the pixel footprint rather than an accident of
+// where the march happened to stop.
+fn cone_backoff(p_in: vec3<f32>, rd: vec3<f32>, cone_rad: f32) -> vec3<f32> {
+    var p = p_in;
+    p += (map(p) - cone_rad) * rd;
+    p += (map(p) - cone_rad) * rd;
+    p += (map(p) - cone_rad) * rd;
+    return p;
+}
+
+// Ambient occlusion by marching along the surface normal, ported from MMCE's
+// `ambient_occlusion` (utility/shading.glsl): step out, take AMBIENT_MARCHES
+// sphere-tracing steps along `n`, and accumulate `clamp(DE / distance, 0, 1)`
+// -- the fraction of the hemisphere still open at each step -- then remap the
+// average through `0.5 - 0.5*cos(pi*occ)` for a smooth falloff.
+//
+// This replaces `1.0 - iters / fine_max_steps`, which was not ambient
+// occlusion at all: it multiplied the final color by the *ray marcher's own
+// step count*, i.e. by a render-cost heatmap. With MRRM enabled `iters`
+// counts steps taken *after* a coarse warm-start, so it inherited the coarse
+// pass's 8x8 texel structure and its instability under small camera
+// movements (this codebase's own measurements had the fine pass's avg
+// steps/px swinging 9.9 -> 11.3 -> 6.2 under sub-0.5-unit camera drift on a
+// static scene). That made a large, soft, blotchy darkening term that moved
+// with the camera and was indistinguishable from a bad shadow -- and because
+// it lived in the fine pass's shading, it was there whether `?shadowlod` was
+// on or off, matching the reported symptom. `iters` is now used only by the
+// `?stepheat=1` debug view, which is what it actually measures.
+//
+// Costs 4 `map()` calls where the step-count version cost none, but it runs
+// in the half-resolution shadow pass and is resampled by `sample_shadow`
+// alongside the visibility term, so it's ~1 extra `map()` per fine pixel.
+fn ambient_occlusion(p: vec3<f32>, n: vec3<f32>, td: f32) -> f32 {
+    // MMCE steps out by 1% of the traveled distance before marching, so the
+    // first sample isn't taken from inside the surface's own hit tolerance.
+    var pos = p + n * max(0.01 * td, MIN_HIT_DIST);
+    var occlusion_angle = 0.0;
+    var h = map(pos);
+    for (var i = 0; i < AMBIENT_MARCHES; i++) {
+        pos += n * max(h, 0.0);
+        h = map(pos);
+        let dist = length(pos - p);
+        occlusion_angle += clamp(h / max(dist, MIN_HIT_DIST), 0.0, 1.0);
+    }
+    occlusion_angle /= f32(AMBIENT_MARCHES);
+    return 0.5 - cos(3.14159265 * occlusion_angle) * 0.5;
+}
+
 // Improved soft shadows via the closest-distance-to-the-cone technique
 // (Inigo Quilez's \"improved sphere tracing soft shadows\"; ported from
 // MMCE's shadow_march, utility/ray_marching.glsl), replacing the earlier
@@ -913,27 +1037,33 @@ fn calc_normal(p: vec3<f32>, eps: f32) -> vec3<f32> {
 // can't change anything visible and is used as the base occlusion test
 // (matching MMCE's `pos.w < max(fovray*dir.w, MIN_DIST)`).
 // A ray that exhausts SHADOW_STEPS without either hitting an occluder or
-// escaping past MAX_DIST reports **occluded** (0.0), not whatever partial
-// visibility it had accumulated so far. Without this, enclosed geometry
-// produces scalloped false-light bands: inside a closed shell (the
-// hollow-donut scene) every step's `h` is bounded by the cavity radius, so
-// 16 steps can never carry the ray to MAX_DIST -- every interior ray
-// exhausts mid-flight, and the sawtooth iso-contours of \"how far did my
-// budget happen to get\" render as jagged shadow lines on smooth walls
-// (root-caused empirically: the artifact survives ?shadowlod=0 and doesn't
-// match the ?stepheat=1 contours, and vanishes at SHADOW_STEPS = 64).
-// Treating exhaustion as occlusion is also simply the honest answer -- the
-// march could not verify that light reaches this point. Open scenes are
-// unaffected in practice (outside geometry `h` grows rapidly, so
-// sun-visible rays escape well within budget -- why 16 steps looked fine
-// on every fractal scene and only the donut's smooth enclosed interior
-// exposed it); deep crevices get slightly darker, which is the more
-// correct direction. Penumbra edges keep their smooth arcsine remap: rays
-// that genuinely escape still return their accumulated soft visibility.
-fn shadow(ro: vec3<f32>, rd: vec3<f32>, pixel_angle: f32) -> f32 {
+// escaping past `max_t` reports **occluded** (0.0), not whatever partial
+// visibility it had accumulated so far -- matching MMCE's `shadow_march`,
+// which does the same (`if(i >= shadow_steps) light_visibility = 0.`). It is
+// the honest answer: the march could not verify that light reaches this
+// point. It is only *safe* as a failure mode when exhaustion is rare, which
+// is what SHADOW_STEPS = 64 and the caller-supplied `max_t` escape distance
+// (both above) are for -- at 16 steps with a hardcoded `MAX_DIST` escape it
+// fired constantly, on open geometry, and rendered as hard black patches.
+//
+// `max_t` is how far the ray has to travel before it counts as having
+// escaped to the light: callers pass their bounding-sphere clip's exit
+// distance (`ray_sphere_clip(...).y`), so a ray that leaves the scene's
+// bounds is done immediately instead of stepping out to `MAX_DIST` through
+// certified-empty space. MMCE's equivalent is `shadow_march`'s
+// `distance2light` parameter. `MAX_DIST` remains a safe fallback for an
+// unbounded scene.
+//
+// `pixel_angle` is the *fine* pass's cone angle, not each pass's own --
+// see `SHADOW_MARCHER`'s `fine_pixel_angle` for why.
+fn shadow(ro: vec3<f32>, rd: vec3<f32>, pixel_angle: f32, max_t: f32) -> f32 {
     var pos = ro;
     var t = 0.0;
-    var h = map(pos);
+    // Clamped non-negative: `cone_backoff` should have put the origin clear
+    // of the surface, but a pathological DE can still report negative here,
+    // and a negative first step would march the ray *backwards* and poison
+    // the `y`/`d` penumbra bookkeeping below with a negative radius.
+    var h = max(map(pos), 0.0);
     var light_visibility = 1.0;
     var ph = 1e5;
     var d_de_dt = 0.0;
@@ -942,16 +1072,17 @@ fn shadow(ro: vec3<f32>, rd: vec3<f32>, pixel_angle: f32) -> f32 {
         t += h;
         pos += rd * h;
         h = map(pos);
+        let hc = max(h, 0.0);
 
-        let y = h * h / (2.0 * ph);
-        let d = (h + ph) * 0.5 * (1.0 - d_de_dt);
+        let y = hc * hc / (2.0 * ph);
+        let d = (hc + ph) * 0.5 * (1.0 - d_de_dt);
         let ang = d / (max(MIN_HIT_DIST, t - y) * LIGHT_ANGLE);
         light_visibility = min(light_visibility, ang);
 
-        d_de_dt = d_de_dt * 0.75 + 0.25 * (h - ph) / ph;
-        ph = h;
+        d_de_dt = d_de_dt * 0.75 + 0.25 * (hc - ph) / ph;
+        ph = max(hc, MIN_HIT_DIST);
 
-        if (t > MAX_DIST) {
+        if (t > max_t) {
             escaped = true;
             break;
         }
@@ -1049,13 +1180,18 @@ fn apply_tint(color: vec3<f32>, index: u32) -> vec3<f32> {
 // `coarse_pixel_angle` back-off) -- MMCE's gamma-correction step in the
 // original is dropped here: that's for resampling a color texture, this is
 // a linear scalar visibility. `uv` is this pixel's screen UV (`mesh.uv`).
-fn sample_shadow(uv: vec2<f32>, td: f32) -> f32 {
+fn sample_shadow(uv: vec2<f32>, td: f32) -> vec2<f32> {
     let dims = vec2<f32>(textureDimensions(shadow_tex));
     let shadow_pixel_angle = 2.0 * atan(1.0 / scene.cam_forward.w) / max(scene.misc2.x, 1.0);
     let sz = max(3.0 * td * shadow_pixel_angle, MIN_HIT_DIST);
     let sz2 = sz * sz;
 
-    let coord = uv * dims;
+    // `- 0.5` puts the 4 taps around the *center* of this pixel's footprint
+    // in shadow-texel space. Without it (as before) `floor(uv * dims)` picks
+    // the texel the pixel center falls in and then blends toward +x/+y only,
+    // which shifts the entire resampled shadow layer half a shadow texel (a
+    // full fine pixel) down-right and biases every weight asymmetrically.
+    let coord = uv * dims - 0.5;
     let ci = vec2<i32>(floor(coord));
     let d = coord - floor(coord);
     let dims_i = vec2<i32>(dims) - vec2<i32>(1);
@@ -1072,7 +1208,14 @@ fn sample_shadow(uv: vec2<f32>, td: f32) -> f32 {
     let w2 = d.x * (1.0 - d.y) / (sz2 + (td - a2.w) * (td - a2.w));
     let w3 = (1.0 - d.x) * d.y / (sz2 + (td - a3.w) * (td - a3.w));
     let w4 = d.x * d.y / (sz2 + (td - a4.w) * (td - a4.w));
-    return (a1.r * w1 + a2.r * w2 + a3.r * w3 + a4.r * w4) / (w1 + w2 + w3 + w4);
+    let wsum = w1 + w2 + w3 + w4;
+    // `x` = sun visibility (R), `y` = ambient occlusion (G) -- both are
+    // linear scalars sharing the same surface and the same depth weights, so
+    // they resample together for the price of one set of taps.
+    return vec2<f32>(
+        (a1.r * w1 + a2.r * w2 + a3.r * w3 + a4.r * w4) / wsum,
+        (a1.g * w1 + a2.g * w2 + a3.g * w3 + a4.g * w4) / wsum,
+    );
 }
 
 // Vertical gradient of bg_col plus a sun disc/glow.
@@ -1354,32 +1497,31 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
                 && cn_sw <= COARSE_MISS_SENTINEL_THRESHOLD && cn_s <= COARSE_MISS_SENTINEL_THRESHOLD && cn_se <= COARSE_MISS_SENTINEL_THRESHOLD;
 
             let coarse_pixel_angle = 2.0 * half_fov / max(f32(coarse_dims.y), 1.0);
-            // Shadow-tier warm-start: the half-resolution shadow/AO pass
-            // (`shadow_pass.rs`/`SHADOW_MARCHER`) already ran its own march
-            // at 4x pixel density vs. the coarse pass's 64x -- a strictly
-            // tighter, more spatially-accurate starting-distance guess than
-            // the coarse pass's, whenever it actually hit something. Its `A`
-            // channel is `MAX_DIST` on a miss (`SHADOW_MARCHER`'s doc -- not
-            // a negative sentinel, since `sample_shadow`'s far-away
-            // down-weighting wants a large, not negative, value there), so
-            // \"did it hit\" is a plain `< MAX_DIST` check; preferred outright
-            // over the coarser guess (not blended) when true, same
-            // single-warm-start-winner simplicity as MRRM's own
-            // coarse-vs-camera choice. Falls back to the coarse guess above
-            // when the shadow pass's own march missed too. Same back-off-by-
-            // one-texel's-angular-footprint reasoning as the coarse guess,
-            // just at this pass's own (denser) resolution.
-            let shadow_dims = vec2<i32>(textureDimensions(shadow_tex));
-            let shadow_texel = clamp(
-                vec2<i32>(mesh.uv * vec2<f32>(shadow_dims)),
-                vec2<i32>(0),
-                shadow_dims - vec2<i32>(1),
-            );
-            let shadow_td = textureLoad(shadow_tex, shadow_texel, 0).a;
-            if (shadow_td < MAX_DIST) {
-                let shadow_pixel_angle = 2.0 * half_fov / max(f32(shadow_dims.y), 1.0);
-                t0 = max(t0, shadow_td - shadow_td * shadow_pixel_angle);
-            } else if (coarse_t > 0.0) {
+            // The shadow pass's own hit distance used to be preferred here
+            // as a tighter warm-start than the coarse pass's. Removed along
+            // with the shadow pass's cheapened DE (`generate_shadow_shader`'s
+            // doc), because that cheapening was the entire safety argument:
+            // a reduced-iteration Menger sponge is a strict *superset* of the
+            // real one, so its reported hit distance was guaranteed to be at
+            // or nearer than the true surface, i.e. conservative as a
+            // starting `t`. At full fidelity that guarantee is gone -- the
+            // shadow pass samples one ray per 2x2 fine pixels, so its ray can
+            // pass through a gap the fine ray's own direction does not, come
+            // back with a *farther* distance, and warm-start the fine march
+            // past real geometry. The failure mode is a hole in the terrain,
+            // not a slow pixel, and unlike the coarse tier there is no
+            // cheapened-DE margin left to absorb it.
+            //
+            // The coarse warm-start below keeps its own conservatism (its DE
+            // is still reduced-iteration) and is untouched. Restoring a
+            // shadow-tier warm-start is a reasonable follow-up *if* the
+            // coarse pass also goes full-fidelity, since the two changes
+            // share a root cause -- but it is a perf optimization on a code
+            // path this change cannot exercise headlessly (llvmpipe segfaults
+            // on the coarse-texture-fed march loop, so `MM_MRRM=0` is forced
+            // in `scripts/headless_screenshot.sh`), so it is deliberately not
+            // bundled in here.
+            if (coarse_t > 0.0) {
                 // Back off by roughly one coarse-pixel's angular footprint at
                 // that depth, computed from the coarse pass's *own* resolution
                 // (`coarse_dims`, not this pass's `pixel_angle`) -- a real
@@ -1596,20 +1738,37 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         // shadow/AO pass's cached visibility instead of marching a fresh
         // shadow ray for every full-res pixel.
         var sh = 0.0;
+        var ao = 1.0;
         if (scene.misc2.y > 0.5) {
-            sh = sample_shadow(mesh.uv, t);
+            let lighting = sample_shadow(mesh.uv, t);
+            sh = lighting.x;
+            ao = lighting.y;
         } else {
-            sh = shadow(p + n * 2.0 * eps, scene.sun.xyz, pixel_angle);
+            // `?shadowlod=0`: march a fresh shadow ray (and compute AO)
+            // per full-res pixel instead of resampling the half-res pass.
+            // Uses the exact same cone-radius back-off, N.L early-out and
+            // bounding-sphere escape distance as `SHADOW_MARCHER` does, so
+            // this stays a true A/B of *where* the value is computed rather
+            // than also changing *how*.
+            let cone_rad = max(t * pixel_angle, MIN_HIT_DIST);
+            let sp = cone_backoff(p, rd, cone_rad);
+            if (dot(n, scene.sun.xyz) > 0.0) {
+                let sun_clip = ray_sphere_clip(sp, scene.sun.xyz, scene.bounding.xyz, scene.bounding.w);
+                sh = shadow(sp, scene.sun.xyz, pixel_angle, min(sun_clip.y, MAX_DIST));
+            }
+            ao = ambient_occlusion(sp, n, t);
         }
         let ambient = 0.3 + 0.4 * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0);
-        // Divides by `fine_max_steps` (the budget this specific march
-        // actually ran under), not the shared `MAX_STEPS` constant -- with
-        // `FINE_MAX_STEPS` now smaller than `MAX_STEPS`, and `?perfprobe=`'s
-        // override shrinking it further still, dividing by the wrong
-        // (larger) constant would cap this term well short of fully dark
-        // in deep recursive crevices, silently flattening AO contrast.
-        let ao = 1.0 - f32(iters) / f32(fine_max_steps);
-        var color = base * (ambient + diffuse * sh) * ao;
+        // AO attenuates the *ambient* term only; the sun's direct
+        // contribution is gated by `sh` (the shadow march) instead. That
+        // split is what MMCE's `lighting()` does -- its `ambient_color.w`
+        // occlusion factor multiplies the ambient/GI radiance while the
+        // light's own radiance comes from `direct` (the shadow march's
+        // output). The previous `* ao` on the whole sum applied a
+        // step-count-derived term to direct sunlight too, which is both
+        // physically backwards and how a render-cost artifact ended up
+        // visible in fully-lit areas.
+        var color = base * (ambient * ao + diffuse * sh);
         // Fades toward sky(rd) starting only past MAX_DIST * 0.5 (was
         // smoothstep(0.0, MAX_DIST, t), i.e. any hit at all started
         // fading): the old onset-at-zero curve already blended ~22% of the
@@ -1711,17 +1870,13 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
                 && cn_sw <= COARSE_MISS_SENTINEL_THRESHOLD && cn_s <= COARSE_MISS_SENTINEL_THRESHOLD && cn_se <= COARSE_MISS_SENTINEL_THRESHOLD;
 
             let coarse_pixel_angle = 2.0 * half_fov / max(f32(coarse_dims.y), 1.0);
-            let shadow_dims = vec2<i32>(textureDimensions(shadow_tex));
-            let shadow_texel = clamp(
-                vec2<i32>(mesh.uv * vec2<f32>(shadow_dims)),
-                vec2<i32>(0),
-                shadow_dims - vec2<i32>(1),
-            );
-            let shadow_td = textureLoad(shadow_tex, shadow_texel, 0).a;
-            if (shadow_td < MAX_DIST) {
-                let shadow_pixel_angle = 2.0 * half_fov / max(f32(shadow_dims.y), 1.0);
-                t0 = max(t0, shadow_td - shadow_td * shadow_pixel_angle);
-            } else if (coarse_t > 0.0) {
+            // Shadow-tier warm-start removed here too, mirroring `MARCHER`'s
+            // own removal exactly (see its doc) -- this pass only stays a
+            // faithful step-count proxy for the fine pass if it warm-starts
+            // identically. `shadow_tex` is consequently unread now, but stays
+            // declared for bind-group-layout parity with `StepDataMaterial`,
+            // same as `coarse_tex` in `SHADOW_MARCHER`.
+            if (coarse_t > 0.0) {
                 t0 = max(t0, coarse_t - coarse_t * coarse_pixel_angle);
             }
         }
@@ -1899,14 +2054,38 @@ pub fn generate_coarse_shader(obj: &Object) -> String {
 /// (`shadow_pass.rs`): import line + bindings + the MRRM coarse-texture
 /// binding (kept for bind-group-layout parity with `ShadowMarcherMaterial`
 /// only -- no longer read by the fragment body, see `SHADOW_MARCHER`'s doc
-/// for why its warm-start was removed) + library + a reduced-iteration copy
-/// of the scene functions (same `COARSE_ITERATION_DIVISOR` as the coarse
-/// pass -- this pass only needs an approximate occlusion test, not full
-/// fractal fidelity either) + shared march core + shared shading core + the
+/// for why its warm-start was removed) + library + the **full-fidelity**
+/// scene functions + shared march core + shared shading core + the
 /// `fragment` entry (see `SHADOW_MARCHER`'s doc). Wholly separate module
 /// from both `generate_shader` and `generate_coarse_shader`, same "fixed
 /// `\"fragment\"` entry-point name per `Material2d`" reasoning as
 /// `COARSE_MARCHER`'s doc.
+///
+/// Deliberately `generate_scene_functions` (divisor 1), *not*
+/// `COARSE_ITERATION_DIVISOR` as it was before: this pass used to occlude
+/// against a visibly different, much fatter shape than the one on screen.
+/// `MIN_REPEAT_ITERATIONS` floors the reduction at 2, so on the default
+/// `menger_oscillating_sphere` scene (`render.rs`'s `MENGER_DEPTH = 5`) the
+/// shadow pass was tracing a **2-iteration** Menger sponge against a
+/// 5-iteration one on screen (the `demo` scene: 2 vs 16). A low-iteration
+/// sponge is a strict *superset* of the real one -- the holes haven't been
+/// carved yet -- so every shadow was cast by geometry that isn't there,
+/// which is what produced the large chunky dark regions with hard
+/// fractal-shaped edges this change was opened to fix.
+///
+/// It also silently broke the fine pass's resample: `sample_shadow` weights
+/// its taps by `1/(sz^2 + (td - td_i)^2)`, comparing the *fine* pass's hit
+/// distance against the *shadow* pass's stored one. Computed against two
+/// different surfaces those disagree by far more than `sz`, so all four
+/// weights collapsed toward the `sz^2` floor and the depth-aware blend
+/// degenerated into arbitrary noise -- differently at every camera distance,
+/// which is the mechanism behind "the shadows change when I move the camera
+/// on a static scene".
+///
+/// MMCE has no equivalent cheapening anywhere in this path: its
+/// `Illumination_step` reads the surface position straight out of the
+/// primary march's own output buffer and calls `shadow_march` against the
+/// one and only `de_scene`.
 pub fn generate_shadow_shader(obj: &Object) -> String {
     let mut s = String::new();
     s.push_str("#import bevy_sprite::mesh2d_vertex_output::VertexOutput\n\n");
@@ -1914,10 +2093,7 @@ pub fn generate_shadow_shader(obj: &Object) -> String {
     s.push('\n');
     s.push_str(COARSE_TEXTURE_BINDING);
     s.push('\n');
-    s.push_str(&generate_scene_functions_with_divisor(
-        obj,
-        COARSE_ITERATION_DIVISOR,
-    ));
+    s.push_str(&generate_scene_functions(obj));
     s.push_str("\n\n");
     s.push_str(MARCH_CORE);
     s.push('\n');
