@@ -725,6 +725,24 @@ while the intent quaternion sits where the player last left it, so the
 deviation grows for reasons unrelated to the camera misbehaving — and at the
 cap, the camera is then forbidden from going anywhere it can see from.
 
+**Follow smoothing applies across the frame only, never along the view
+axis.** A spring following a moving target trails it by roughly
+`speed * tau`. Across the frame that is harmless and rather nice — the
+marble leads slightly in the direction it is going. Along the view axis it
+is neither: it quietly adds the trailing distance to the camera's distance
+(a marble flying away at 3 units/s sat ~20% further back than the framing
+rule asked for), and the instant the marble stops — which for a marble means
+*hitting something* — all of it unwinds at the spring's rate. Reported from
+play as the camera whipping in toward the marble on every collision, and
+reproduced in empty space, which is what established it was never a
+deocclusion problem. Zeroing the depth component of the focus error leaves
+the eye exactly `distance` from the marble at all times, so how far away the
+camera sits is purely the distance solver's business — damped, asymmetric,
+geometry-aware — instead of something the follow spring gets an unowned say
+in. It also measurably improved the tube: HollowDonut's mean visibility went
+from 0.86 to 1.00 and its blocked frames from 66 to 0, because the sweep now
+starts from where the camera is really looking.
+
 **The search's first candidate is the local clearance gradient** at the
 marble (`Sdf::outward`), not just the ring of rotations. In a tunnel that
 points straight into the open middle, where hill-climbing 40° at a time
@@ -746,24 +764,25 @@ reports what the camera did. `cargo test -p marble-marcher-bevy scene_probe
 | scene | smart | mean vis | frames blocked | min eye clearance | screen size | `de` steps/frame |
 |---|---|---|---|---|---|---|
 | demo | off | 1.00 | 0/480 | +0.015 | 0.167–0.194 | 4.1 |
-| demo | **on** | 1.00 | 0/480 | +0.013 | 0.162–0.187 | 4.2 |
+| demo | **on** | 1.00 | 0/480 | +0.010 | 0.148–0.222 | 4.7 |
 | classic_only | off | 1.00 | 0/480 | +0.020 | 0.167 | 2.9 |
-| classic_only | **on** | 1.00 | 0/480 | +0.020 | 0.167 | 3.0 |
+| classic_only | **on** | 1.00 | 0/480 | +0.010 | 0.167–0.216 | 3.2 |
 | menger_sponge | off | 1.00 | 0/480 | +0.155 | 0.167 | 4.0 |
-| menger_sponge | **on** | 1.00 | 0/480 | +0.106 | 0.165–0.174 | 4.5 |
+| menger_sponge | **on** | 1.00 | 0/480 | +0.171 | 0.167 | 4.8 |
 | menger_sphere | off | 1.00 | 0/480 | +0.155 | 0.167 | 4.0 |
-| menger_sphere | **on** | 1.00 | 0/480 | +0.106 | 0.165–0.174 | 4.5 |
+| menger_sphere | **on** | 1.00 | 0/480 | +0.171 | 0.167 | 4.8 |
 | menger_oscillating_sphere | off | 1.00 | 0/480 | +0.109 | 0.167–0.224 | 4.0 |
-| menger_oscillating_sphere | **on** | 1.00 | 0/480 | +0.081 | 0.147–0.227 | 4.0 |
+| menger_oscillating_sphere | **on** | 1.00 | 0/480 | +0.098 | 0.158–0.190 | 3.9 |
 | hollow_donut | off | **0.59** | **192/480** | **−0.061** | up to **1.34** | 7.0 |
-| hollow_donut | **on** | 0.86 | 66/480 | +0.026 | up to 0.90 | 13.6 |
+| hollow_donut | **on** | **1.00** | **0/480** | +0.097 | up to 0.90 | 17.9 |
 
 The rows that matter are the ones where geometry actually crowds the camera.
 `hollow_donut` is the case: with the solver off, the marble is behind
 geometry for 40% of the run, the eye dips inside the shell, and the camera
 gets pinned close enough that the marble fills the frame outright. With it
-on, the eye stays outside the geometry, the blocked frames drop by two
-thirds, and the worst-case framing improves by a third. Where nothing is in
+on, the marble is fully visible on every frame of the run, the eye stays
+outside the geometry throughout, and the worst-case framing improves by a
+third. Where nothing is in
 the way — the four open scenes — the two agree to within a few percent and
 the solver costs a fraction of a `de` evaluation per frame.
 
@@ -788,13 +807,12 @@ actually runs. The `?debug=1` overlay reports the camera phase at 0.01 ms.
 
 ### Known limits
 
-**HollowDonut is the hard case and is not fully solved.** Inside a closed
-tube whose interior free radius is `0.85`, with a `0.15` marble that spends
-the probe run pressed against the wall, the framing rule's `1.36` barely
-fits across the tube at all. The camera keeps the marble visible (86% mean
-visibility, no frames where it is lost for long) and never enters geometry,
-but spends much of the run closer than the framing rule wants — up to 0.9 of
-the frame at worst. FOV widening recovers part of it. Two things make it
+**HollowDonut still frames tight.** Inside a closed tube whose interior free
+radius is `0.85`, with a `0.15` marble that spends the probe run pressed
+against the wall, the framing rule's `1.36` barely fits across the tube at
+all. The camera now keeps the marble fully visible for the whole run and
+never enters geometry, but spends much of it closer than the framing rule
+wants — up to 0.9 of the frame at worst. FOV widening recovers part of it. Two things make it
 genuinely hard rather than merely untuned: the usable directions sweep
 around the tube as the marble circles it, so the reposition is a chase
 against a moving target; and the marble's thrust is camera-relative, so the
