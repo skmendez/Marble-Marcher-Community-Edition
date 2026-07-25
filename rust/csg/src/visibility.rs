@@ -105,6 +105,21 @@ pub struct SweepConfig {
     /// scale [`Sweep::visibility`] is measured against: an obstruction
     /// matters in proportion to how much of *this* it covers.
     pub target_radius: f32,
+    /// Where the camera's own world begins: the march ignores everything
+    /// nearer to the target than this, for both questions it answers.
+    ///
+    /// This is Cinemachine's "Minimum Distance From Target", and it is not
+    /// an optimisation -- it is the difference between a camera that works
+    /// and one that collapses the moment the target touches anything. The
+    /// camera can never sit closer than this, so geometry inside that radius
+    /// is not in its way; it is the surface the target is resting against.
+    /// Without it, a marble rolling onto a floor puts a wall inside the
+    /// probe's own first sample, the swept test reports "blocked, free
+    /// distance zero", and the camera slams to its minimum distance with the
+    /// marble filling the screen -- observed in play, reproduced in
+    /// `smart_camera`'s `a_marble_resting_on_a_surface_does_not_collapse_
+    /// the_shot`.
+    pub min_camera_distance: f32,
     /// Hard cap on `de` evaluations. Reaching it returns whatever was found
     /// so far with `exhausted = true` rather than reporting a clear view --
     /// a march that runs out of budget is grazing something, so treating it
@@ -171,7 +186,9 @@ pub struct Sweep {
 /// (`t → max_dist`): a gap a hand's width from your face doesn't block your
 /// view, the same gap across the room does.
 pub fn sweep(sdf: &impl Sdf, origin: Vec3, dir: Vec3, max_dist: f32, cfg: SweepConfig) -> Sweep {
-    let start = cfg.target_radius.min(max_dist);
+    // Everything nearer than this belongs to the target, not to the camera
+    // (`SweepConfig::min_camera_distance`).
+    let start = cfg.min_camera_distance.max(cfg.target_radius).min(max_dist);
     // Every division below is guarded by this: `max_dist` can legitimately
     // be tiny (a marble wedged in a crevice), and the visibility ratio's
     // denominator vanishes at the eye by construction.
@@ -320,7 +337,10 @@ mod tests {
     }
 
     fn cfg(camera_radius: f32, target_radius: f32) -> SweepConfig {
-        SweepConfig { camera_radius, target_radius, max_steps: 64 }
+        // Tests that predate `min_camera_distance` keep the old behavior by
+        // setting it to the target's own radius (i.e. "the camera's world
+        // starts at the target's surface").
+        SweepConfig { camera_radius, target_radius, min_camera_distance: target_radius, max_steps: 64 }
     }
 
     #[test]
@@ -455,6 +475,42 @@ mod tests {
     }
 
     #[test]
+    fn geometry_nearer_than_the_camera_can_get_is_not_an_obstruction() {
+        // A target resting on a floor, viewed from 45 degrees above: the
+        // floor is within a target-radius of the sightline's start, so a
+        // march beginning at the target's own surface reads it as blocking
+        // everything. Starting where the camera's world actually begins is
+        // what makes this the non-event it should be.
+        struct Floor;
+        impl Sdf for Floor {
+            fn de(&self, p: Vec3) -> f32 {
+                p.y
+            }
+        }
+        let r = 0.15;
+        let origin = Vec3::new(0.0, r, 0.0); // resting on the floor
+        let dir = Vec3::new(0.0, 1.0, 1.0).normalize();
+        let blind = SweepConfig {
+            camera_radius: 0.3,
+            target_radius: r,
+            min_camera_distance: r,
+            max_steps: 32,
+        };
+        let collapsed = sweep(&Floor, origin, dir, 8.0, blind);
+        assert!(
+            collapsed.free_distance < 0.2,
+            "test setup: an over-fat probe starting at the surface should collapse to near nothing \
+             (against the 8.0 that is actually available), got {}",
+            collapsed.free_distance
+        );
+
+        let sane = SweepConfig { camera_radius: 0.35 * r, min_camera_distance: 1.5 * r, ..blind };
+        let s = sweep(&Floor, origin, dir, 8.0, sane);
+        assert_eq!(s.free_distance, 8.0, "nothing is actually in the way of this shot");
+        assert_eq!(s.visibility, 1.0);
+    }
+
+    #[test]
     fn outward_gradient_points_away_from_the_surface() {
         let wall = Wall { plane_x: 5.0 };
         let n = wall.outward(Vec3::new(4.0, 0.0, 0.0), 0.01);
@@ -475,6 +531,7 @@ mod tests {
         let s = sweep(&Grazing, Vec3::ZERO, Vec3::X, 1000.0, SweepConfig {
             camera_radius: 0.01,
             target_radius: 0.1,
+            min_camera_distance: 0.1,
             max_steps: 24,
         });
         assert!(s.exhausted);

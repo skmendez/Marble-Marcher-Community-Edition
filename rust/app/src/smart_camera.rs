@@ -182,14 +182,22 @@ const MAX_CORRECTION: f32 = 1.9;
 /// FOV-widening smoothing time (§4.8's rate limit).
 const FOCAL_TAU: f32 = 0.5;
 
-/// The camera's own collision radius, as a fraction of the framing distance
-/// — Cinemachine's "camera radius", and also what keeps the eye out of the
-/// near-surface band where this renderer's normal estimation degenerates
-/// into speckle (see the per-scene camera-distance comments this replaced in
-/// `render::setup`). Clamped to a sane multiple of the marble's radius so
-/// it stays meaningful for both a `rad = 0.02` demo marble and a `rad = 0.15`
-/// Menger one.
-const CAMERA_RADIUS_FRACTION: f32 = 0.08;
+/// The camera's own collision radius, in marble radii — Cinemachine's
+/// "camera radius", and also what keeps the eye out of the near-surface band
+/// where this renderer's normal estimation degenerates into speckle (see the
+/// per-scene camera-distance comments this replaced in `render::setup`).
+///
+/// Scaled to the *marble*, which is the game's unit of length, and
+/// emphatically not to the framing distance, which is what it used to be
+/// (`0.08 * desired`). That coupling is wrong in principle -- the camera's
+/// physical size has nothing to do with how far back it happens to want to
+/// sit -- and catastrophic in practice: at `cube_sphere_morph`'s `zoom =
+/// 3.3` it made the probe ball `0.645`, over four marble radii, so the very
+/// first sample of every march (taken on the marble's own surface) reported
+/// blocked whenever the marble was near anything at all. Reported from play
+/// as the camera diving at the marble on approach to any surface; captured
+/// on device as `vis 0.00 d 0.225/4.816 (free 0.000) ... steps 1`.
+const CAMERA_RADIUS_MARBLE_RADII: f32 = 0.35;
 
 /// A view is "cramped" when geometry allows less than this fraction of the
 /// distance framing wants. Being cramped is not an emergency -- the marble
@@ -630,13 +638,18 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
         rig.focus_vel = Vec3::ZERO;
         rig.distance_vel = 0.0;
         rig.focal_length = FOCAL_LENGTH;
-        let camera_radius = (CAMERA_RADIUS_FRACTION * desired).clamp(0.5 * radius, 3.0 * radius);
+        let camera_radius = CAMERA_RADIUS_MARBLE_RADII * radius;
         let sw = sweep(
             sdf,
             rig.focus,
             -(rig.orientation * Vec3::NEG_Z),
             desired,
-            SweepConfig { camera_radius, target_radius: radius, max_steps: SWEEP_MAX_STEPS },
+            SweepConfig {
+                camera_radius,
+                target_radius: radius,
+                min_camera_distance: min_distance,
+                max_steps: SWEEP_MAX_STEPS,
+            },
         );
         // The one geometry-aware thing that stays on with the flag off:
         // don't put the eye inside a wall. Not a feel change -- the camera
@@ -692,14 +705,20 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
     rig.focus_vel -= forward * rig.focus_vel.dot(forward);
 
     // --- 2. one march along the current sightline ---
-    let camera_radius = (CAMERA_RADIUS_FRACTION * desired).clamp(0.5 * radius, 3.0 * radius);
+    let camera_radius = CAMERA_RADIUS_MARBLE_RADII * radius;
     let u = -(rig.orientation * Vec3::NEG_Z); // focus -> eye
     // Probe at least as far as the camera currently is: shrinking the probe
     // to `desired` alone would report "clear" for a camera that is already
     // further out than that and about to be pulled in.
     let probe_dist = desired.max(rig.distance).max(min_distance);
-    let sweep_cfg =
-        SweepConfig { camera_radius, target_radius: radius, max_steps: SWEEP_MAX_STEPS };
+    let sweep_cfg = SweepConfig {
+        camera_radius,
+        target_radius: radius,
+        // Nothing inside the closest the camera may ever sit counts as an
+        // obstruction -- see `SweepConfig::min_camera_distance`.
+        min_camera_distance: min_distance,
+        max_steps: SWEEP_MAX_STEPS,
+    };
     let sw = sweep(sdf, rig.focus, u, probe_dist, sweep_cfg);
 
     // --- 3. direction: slide away from the obstruction, decay to intent ---
@@ -1463,6 +1482,57 @@ mod tests {
                 "deviation varied with frame rate: {results:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_marble_resting_on_a_surface_does_not_collapse_the_shot() {
+        // Second half of the reported "camera dives at the marble" bug, and
+        // the more serious half: it fired on *approaching* a surface, not
+        // just on stopping. Captured on device as
+        // `vis 0.00 d 0.225/4.816 (free 0.000) size 2.424 ... steps 1` --
+        // a march that gave up on its first sample.
+        //
+        // Two causes, both fixed: the probe ball was scaled to the framing
+        // distance (`0.08 * desired`), which at this scene's `zoom = 3.3`
+        // made it four marble radii wide; and the march began at the
+        // marble's own surface, so the floor it was resting on sat inside
+        // the very first sample. Nothing about a marble touching the ground
+        // should move the camera at all -- the camera is up and behind, with
+        // an unobstructed view.
+        struct Floor;
+        impl Sdf for Floor {
+            fn de(&self, p: Vec3) -> f32 {
+                p.y
+            }
+        }
+        let radius = 0.15;
+        let mut rig = CameraRig::default();
+        let mut inp = SolveInput {
+            marble_pos: Vec3::new(0.0, radius, 0.0), // exactly touching
+            marble_radius: radius,
+            intent: Quat::from_rotation_x(-0.785), // 45 degrees up and back
+            zoom: 3.3,
+            aspect: 384.0 / 694.0, // the reporter's phone, in portrait
+            target_fraction: POINTER_TARGET_FRACTION,
+            dt: 1.0 / 60.0,
+            smart: true,
+        };
+        for _ in 0..120 {
+            solve(&mut rig, &mut inp, &Floor);
+        }
+        let want = rig.debug.desired_distance;
+        assert!(
+            (rig.distance - want).abs() < 0.01 * want,
+            "resting on a floor pulled the camera from {want} to {}",
+            rig.distance
+        );
+        assert_eq!(rig.debug.visibility, 1.0, "nothing is between the camera and the marble");
+        assert!(
+            rig.debug.screen_fraction < 0.2,
+            "marble ballooned to {} of frame",
+            rig.debug.screen_fraction
+        );
+        assert_eq!(rig.focal_length, FOCAL_LENGTH, "no reason to widen the FOV here");
     }
 
     #[test]

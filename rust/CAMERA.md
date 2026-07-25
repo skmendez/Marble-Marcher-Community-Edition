@@ -763,26 +763,30 @@ reports what the camera did. `cargo test -p marble-marcher-bevy scene_probe
 
 | scene | smart | mean vis | frames blocked | min eye clearance | screen size | `de` steps/frame |
 |---|---|---|---|---|---|---|
-| demo | off | 1.00 | 0/480 | +0.015 | 0.167–0.194 | 4.1 |
-| demo | **on** | 1.00 | 0/480 | +0.010 | 0.148–0.222 | 4.7 |
-| classic_only | off | 1.00 | 0/480 | +0.020 | 0.167 | 2.9 |
-| classic_only | **on** | 1.00 | 0/480 | +0.010 | 0.167–0.216 | 3.2 |
-| menger_sponge | off | 1.00 | 0/480 | +0.155 | 0.167 | 4.0 |
-| menger_sponge | **on** | 1.00 | 0/480 | +0.171 | 0.167 | 4.8 |
-| menger_sphere | off | 1.00 | 0/480 | +0.155 | 0.167 | 4.0 |
-| menger_sphere | **on** | 1.00 | 0/480 | +0.171 | 0.167 | 4.8 |
-| menger_oscillating_sphere | off | 1.00 | 0/480 | +0.109 | 0.167–0.224 | 4.0 |
-| menger_oscillating_sphere | **on** | 1.00 | 0/480 | +0.098 | 0.158–0.190 | 3.9 |
-| hollow_donut | off | **0.59** | **192/480** | **−0.061** | up to **1.34** | 7.0 |
-| hollow_donut | **on** | **1.00** | **0/480** | +0.097 | up to 0.90 | 17.9 |
+| demo | off | 1.00 | 0/480 | +0.010 | 0.167 | 3.4 |
+| demo | **on** | 1.00 | 0/480 | +0.004 | 0.164–0.175 | 4.2 |
+| classic_only | off | 1.00 | 0/480 | +0.020 | 0.167 | 2.7 |
+| classic_only | **on** | 1.00 | 0/480 | +0.004 | 0.167–0.175 | 3.0 |
+| menger_sponge | off | 1.00 | 0/480 | +0.155 | 0.167 | 3.5 |
+| menger_sponge | **on** | 1.00 | 0/480 | +0.142 | 0.167 | 3.9 |
+| menger_sphere | off | 1.00 | 0/480 | +0.155 | 0.167 | 3.5 |
+| menger_sphere | **on** | 1.00 | 0/480 | +0.142 | 0.167 | 3.9 |
+| menger_oscillating_sphere | off | 1.00 | 0/480 | +0.053 | 0.167–0.193 | 3.8 |
+| menger_oscillating_sphere | **on** | 1.00 | 0/480 | +0.045 | 0.165–0.172 | 3.5 |
+| hollow_donut | off | **0.69** | **147/480** | **−0.061** | up to **1.34** | 8.0 |
+| hollow_donut | **on** | 0.99 | 3/480 | +0.041 | up to 0.92 | 16.0 |
+| cube_sphere_morph | off | 1.00 | 0/480 | +0.739 | 0.167 | 2.0 |
+| cube_sphere_morph | **on** | 1.00 | 0/480 | +0.740 | 0.167 | 2.0 |
 
 The rows that matter are the ones where geometry actually crowds the camera.
 `hollow_donut` is the case: with the solver off, the marble is behind
 geometry for 40% of the run, the eye dips inside the shell, and the camera
 gets pinned close enough that the marble fills the frame outright. With it
-on, the marble is fully visible on every frame of the run, the eye stays
+on, the marble is visible on all but three frames of the run, the eye stays
 outside the geometry throughout, and the worst-case framing improves by a
-third. Where nothing is in
+third. The four open scenes show *zero* distance travel over an
+eight-second run: with nothing in the way, the camera simply holds its
+frame. Where nothing is in
 the way — the four open scenes — the two agree to within a few percent and
 the solver costs a fraction of a `de` evaluation per frame.
 
@@ -810,8 +814,8 @@ actually runs. The `?debug=1` overlay reports the camera phase at 0.01 ms.
 **HollowDonut still frames tight.** Inside a closed tube whose interior free
 radius is `0.85`, with a `0.15` marble that spends the probe run pressed
 against the wall, the framing rule's `1.36` barely fits across the tube at
-all. The camera now keeps the marble fully visible for the whole run and
-never enters geometry, but spends much of it closer than the framing rule
+all. The camera now keeps the marble visible for all but three frames of the run
+and never enters geometry, but spends much of it closer than the framing rule
 wants — up to 0.9 of the frame at worst. FOV widening recovers part of it. Two things make it
 genuinely hard rather than merely untuned: the usable directions sweep
 around the tube as the marble circles it, so the reposition is a chase
