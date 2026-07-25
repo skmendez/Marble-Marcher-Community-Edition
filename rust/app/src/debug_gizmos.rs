@@ -95,6 +95,7 @@ use bevy::color::palettes::basic::{AQUA, LIME, RED};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
+#[cfg(test)]
 use crate::camera::{CameraOrbit, FOCAL_LENGTH};
 use crate::config::Config;
 use crate::physics_sys::MarbleState;
@@ -170,8 +171,13 @@ pub fn setup_thrust_debug_arrows(
 /// camera convention — matches how `fps_overlay.rs`'s UI nodes and the
 /// marcher quad's own `Transform` are already positioned relative to the
 /// window). `eye`/`right`/`up`/`forward` are the virtual ray-marcher
-/// camera's basis (`CameraOrbit::eye_and_basis`); `aspect` and
-/// `window_size` match what `update_material` feeds the shader.
+/// camera's basis (`smart_camera::CameraRig::eye_and_basis`); `focal`,
+/// `aspect` and `window_size` match what `update_frame_data` feeds the
+/// shader. `focal` is a parameter rather than the `FOCAL_LENGTH` constant
+/// because the smart camera widens the FOV in tight spaces
+/// (`CameraRig::focal_length`) -- projecting with the constant would put
+/// the gizmos in the wrong place exactly when the camera is doing something
+/// interesting.
 ///
 /// Inverts `codegen.rs`'s ray-setup formula: a ray through NDC `(nx, ny)` is
 /// `rd ∝ right*nx*aspect + up*ny + forward*f`. Given a world point at
@@ -185,12 +191,14 @@ pub fn setup_thrust_debug_arrows(
 ///
 /// Returns `None` if `point` is behind the camera (`z_cam <= 0`), where a
 /// perspective projection has no on-screen answer.
+#[allow(clippy::too_many_arguments)] // a projection needs its whole camera
 fn project_to_screen(
     point: Vec3,
     eye: Vec3,
     right: Vec3,
     up: Vec3,
     forward: Vec3,
+    focal: f32,
     aspect: f32,
     window_size: Vec2,
 ) -> Option<Vec2> {
@@ -201,8 +209,8 @@ fn project_to_screen(
     }
     let x_cam = rel.dot(right);
     let y_cam = rel.dot(up);
-    let ndc_x = x_cam * FOCAL_LENGTH / (z_cam * aspect);
-    let ndc_y = y_cam * FOCAL_LENGTH / z_cam;
+    let ndc_x = x_cam * focal / (z_cam * aspect);
+    let ndc_y = y_cam * focal / z_cam;
     Some(Vec2::new(
         ndc_x * window_size.x * 0.5,
         ndc_y * window_size.y * 0.5,
@@ -226,6 +234,7 @@ fn update_arrow(
     right: Vec3,
     up: Vec3,
     forward: Vec3,
+    focal: f32,
     aspect: f32,
     window_size: Vec2,
 ) {
@@ -234,7 +243,7 @@ fn update_arrow(
         return;
     }
     let Some(tip) =
-        project_to_screen(probe_from + dir.normalize() * PROBE_OFFSET, eye, right, up, forward, aspect, window_size)
+        project_to_screen(probe_from + dir.normalize() * PROBE_OFFSET, eye, right, up, forward, focal, aspect, window_size)
     else {
         *visibility = Visibility::Hidden;
         return;
@@ -263,7 +272,7 @@ fn update_arrow(
 /// marble is always exactly there, and why "forward" isn't drawn as a
 /// reference.
 pub fn draw_thrust_debug(
-    orbit: Res<CameraOrbit>,
+    rig: Res<crate::smart_camera::CameraRig>,
     marble_state: Res<MarbleState>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut arrows: Query<(&ThrustDebugArrow, &mut Transform, &mut Visibility)>,
@@ -275,11 +284,17 @@ pub fn draw_thrust_debug(
     let aspect = window_size.x / window_size.y.max(1.0);
 
     let marble = marble_state.local_marble();
-    let (eye, right, up, forward) = orbit.eye_and_basis(marble.pos);
+    let (eye, right, up, forward) = rig.eye_and_basis();
 
-    // The marble is always exactly at screen center by construction (module
-    // doc) -- use that directly rather than reprojecting it every frame.
-    let origin = Vec2::ZERO;
+    // The marble is *near* screen centre rather than exactly on it now: the
+    // camera aims at `CameraRig::focus`, a smoothed version of the marble's
+    // position, so during fast motion the marble sits slightly off-centre
+    // (bounded by `smart_camera::MAX_FOCUS_LAG_FRACTION`). Project it for
+    // real rather than assuming the old exact-centre invariant, which no
+    // longer holds -- these arrows are supposed to emanate from the marble.
+    let origin =
+        project_to_screen(marble.pos, eye, right, up, forward, rig.focal_length, aspect, window_size)
+            .unwrap_or(Vec2::ZERO);
 
     for (kind, mut transform, mut visibility) in &mut arrows {
         let dir = match kind {
@@ -297,6 +312,7 @@ pub fn draw_thrust_debug(
             right,
             up,
             forward,
+            rig.focal_length,
             aspect,
             window_size,
         );
@@ -310,35 +326,34 @@ mod tests {
     #[test]
     fn point_along_forward_projects_to_center() {
         let (eye, right, up, forward) = (Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::Z);
-        let got = project_to_screen(forward * 10.0, eye, right, up, forward, 1.0, Vec2::new(200.0, 100.0))
-            .unwrap();
+        let got =
+            project_to_screen(forward * 10.0, eye, right, up, forward, FOCAL_LENGTH, 1.0, Vec2::new(200.0, 100.0))
+                .unwrap();
         assert!(got.distance(Vec2::ZERO) < 1e-3, "expected center, got {got:?}");
     }
 
     #[test]
     fn point_offset_along_right_projects_with_known_offset() {
-        // eye=0, basis = standard axes, f = 2.0 (not FOCAL_LENGTH -- this
-        // test constructs its own basis/point to check the formula directly,
-        // independent of whatever FOCAL_LENGTH currently is).
+        // eye=0, basis = standard axes, f = 2.0 -- now that `focal` is a
+        // real parameter (the smart camera varies it), this test can state
+        // the arithmetic directly instead of working around a constant.
         // point = forward*10 + right*5 => z_cam=10, x_cam=5.
         // ndc_x = x_cam*f/(z_cam*aspect) = 5*2/(10*1) = 1.0
         // sx = ndc_x * window_x/2 = 1.0 * 100 = 100
         let (eye, right, up, forward) = (Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::Z);
         let point = forward * 10.0 + right * 5.0;
-        // Can't override FOCAL_LENGTH per-call, so pick window/aspect that
-        // make the expected answer easy to state given the real constant:
-        // sx = 5 * FOCAL_LENGTH / 10 / aspect * window_x/2, with aspect=1,
-        // window_x=2 => sx = FOCAL_LENGTH/2.
-        let got = project_to_screen(point, eye, right, up, forward, 1.0, Vec2::new(2.0, 2.0)).unwrap();
-        assert!((got.x - FOCAL_LENGTH / 2.0).abs() < 1e-4, "got {got:?}");
-        assert!(got.y.abs() < 1e-4, "got {got:?}");
+        let got =
+            project_to_screen(point, eye, right, up, forward, 2.0, 1.0, Vec2::new(200.0, 100.0)).unwrap();
+        assert!((got.x - 100.0).abs() < 1e-3, "got {got:?}");
+        assert!(got.y.abs() < 1e-3, "got {got:?}");
     }
 
     #[test]
     fn point_behind_camera_has_no_projection() {
         let (eye, right, up, forward) = (Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::Z);
         let behind = -forward * 5.0;
-        assert!(project_to_screen(behind, eye, right, up, forward, 1.0, Vec2::new(2.0, 2.0)).is_none());
+        assert!(project_to_screen(behind, eye, right, up, forward, FOCAL_LENGTH, 1.0, Vec2::new(2.0, 2.0))
+            .is_none());
     }
 
     #[test]
@@ -349,14 +364,13 @@ mod tests {
         // `orientation` via `Quat::from_rotation_z`, matching what
         // `CameraOrbit::roll` itself does) /distance.
         for roll in [0.0_f32, 0.7, 2.9, -1.4] {
-            let orbit = CameraOrbit {
-                orientation: CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35) * Quat::from_rotation_z(roll),
-                distance: 0.6,
-            };
+            let orientation =
+                CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35) * Quat::from_rotation_z(roll);
             let target = Vec3::new(1.0, 2.0, 3.0);
-            let (eye, right, up, forward) = orbit.eye_and_basis(target);
-            let got = project_to_screen(target, eye, right, up, forward, 1.3, Vec2::new(1280.0, 720.0))
-                .unwrap();
+            let (eye, right, up, forward) = CameraOrbit::basis_from(orientation, target, 0.6);
+            let got =
+                project_to_screen(target, eye, right, up, forward, FOCAL_LENGTH, 1.3, Vec2::new(1280.0, 720.0))
+                    .unwrap();
             assert!(got.distance(Vec2::ZERO) < 1e-2, "roll={roll}: expected center, got {got:?}");
         }
     }
@@ -375,6 +389,7 @@ mod tests {
             Vec3::X,
             Vec3::Y,
             Vec3::Z,
+            FOCAL_LENGTH,
             1.0,
             Vec2::new(200.0, 100.0),
         );
@@ -406,6 +421,7 @@ mod tests {
             Vec3::X,
             Vec3::Y,
             Vec3::Z,
+            FOCAL_LENGTH,
             1.0,
             Vec2::new(200.0, 100.0),
         );

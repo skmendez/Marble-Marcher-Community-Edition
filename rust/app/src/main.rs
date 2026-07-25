@@ -21,6 +21,7 @@ mod perfprobe;
 mod physics_sys;
 mod render;
 mod shadow_pass;
+mod smart_camera;
 mod step_data;
 mod touch;
 mod web_config;
@@ -49,6 +50,7 @@ use render::{
 };
 use shadow_pass::{resize_shadow_render_target, setup_shadow_pipeline, sync_shadow_quad_scale, ShadowMarcherMaterial};
 use step_data::{setup_step_data_pipeline, StepDataMaterial, StepDataPlugin};
+use smart_camera::{smart_camera_solve, CameraRig, InputProfile};
 use touch::{touch_camera_input, TouchDebugInfo};
 
 /// `MM_WINDOW_SIZE=WxH` overrides the window's starting resolution — mainly
@@ -223,6 +225,11 @@ fn main() {
         .add_plugins(DebugScreenshotPlugin)
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<CameraOrbit>()
+        // The realized camera (smart_camera.rs) -- `CameraOrbit` is now the
+        // player's *intent*; this is what renders. Both are written by
+        // every input path (`camera::apply_drag`/`apply_roll`).
+        .init_resource::<CameraRig>()
+        .init_resource::<InputProfile>()
         .init_resource::<TouchDebugInfo>()
         .init_resource::<PendingSceneSync>()
         .init_resource::<PerfProbeState>()
@@ -317,6 +324,13 @@ fn main() {
                     // params/bounding-sphere writes should reach this
                     // frame's uniforms, not land one frame late.
                     param_ui_input,
+                    // Must run after every camera-input system (so this
+                    // frame's drag is already in `CameraOrbit`/`CameraRig`),
+                    // after `param_ui_input` (a live param edit changes the
+                    // very geometry this solves against), and before
+                    // `update_frame_data` (so the solved pose reaches this
+                    // frame's uniforms rather than landing one frame late).
+                    smart_camera_solve,
                     // Must run before `update_frame_data`: a same-frame
                     // `mrrm`/view-mode toggle (`live_debug.rs`) needs to
                     // reach this frame's uniforms, not land one frame late.

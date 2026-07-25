@@ -73,6 +73,35 @@ pub struct Config {
     /// on top (`Settings.h`'s `exposure`/`auto_exposure_*`); this is the
     /// fixed-value starting point.
     pub exposure: f32,
+    /// `?smartcam=1`/`MM_SMARTCAM=1` enables the geometry-aware half of the
+    /// camera (`smart_camera.rs`): deocclusion, clearance pull-in, damping,
+    /// FOV compensation.
+    ///
+    /// **Default off**, pending a play-test -- it changes how the camera
+    /// *moves*, which is the kind of change that has to be felt rather than
+    /// measured, and the measurements it does have
+    /// (`smart_camera::scene_probe`) only establish that it keeps the marble
+    /// visible and the eye out of the geometry, not that it feels good. Off,
+    /// the camera tracks the player's intent exactly and instantly, as it
+    /// always did.
+    ///
+    /// One thing changes either way: distance comes from the framing rule
+    /// (marble sized to the screen, `smart_camera::framing_distance`) rather
+    /// than from a hand-tuned per-scene constant. That part has no failure
+    /// mode worth an escape hatch -- it reproduces the three deleted
+    /// per-scene distances to within ~12% at 16:9, and unlike them it is
+    /// also right on a phone and right for a marble of any radius.
+    pub smart_camera: bool,
+    /// `?autopilot=1`/`MM_AUTOPILOT=1` drives the marble and the camera from
+    /// a fixed script instead of from real input -- a wandering
+    /// camera-relative thrust, plus a slow camera drag for the first few
+    /// seconds. Purely a verification aid: a headless run
+    /// (`scripts/headless_screenshot.sh`) otherwise renders a marble sitting
+    /// perfectly still in `GravityMode::Flying`, which says nothing about
+    /// how the camera *follows*. Deterministic (driven by the physics tick,
+    /// not the wall clock) so two runs at different frame rates capture the
+    /// same moment. Default off.
+    pub autopilot: bool,
     /// `?material_gamma=<f>`/`MM_MATERIAL_GAMMA=<f>` -- the terrain-albedo
     /// gamma boost (`albedo = pow(albedo, 1/this)`, rides in
     /// `SceneUniforms::misc3.z`). Default 0.5 (albedo squared), matching
@@ -103,6 +132,11 @@ impl Config {
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| *v > 0.0)
                 .unwrap_or(1.0),
+            smart_camera: matches!(
+                query_value("smartcam", "MM_SMARTCAM").as_deref(),
+                Some("1") | Some("true")
+            ),
+            autopilot: query_value("autopilot", "MM_AUTOPILOT").as_deref() == Some("1"),
             material_gamma: query_value("material_gamma", "MM_MATERIAL_GAMMA")
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| *v > 0.0)
@@ -131,6 +165,8 @@ mod tests {
         assert!(value != Some("1")); // res_oscillate
         assert!(value != Some("1")); // gpuprofile
         assert!(value != Some("1")); // stepheat
+        assert!(!matches!(value, Some("1") | Some("true"))); // smartcam
+        assert!(value != Some("1")); // autopilot
     }
 
     #[test]

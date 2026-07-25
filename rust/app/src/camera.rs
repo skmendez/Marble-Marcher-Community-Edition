@@ -24,7 +24,7 @@
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 
-use crate::physics_sys::MarbleState;
+use crate::smart_camera::CameraRig;
 
 /// Radians of rotation per pixel of swipe magnitude (`drag`) — same
 /// numeric value the old yaw/pitch decomposition used for both axes, kept
@@ -38,9 +38,19 @@ pub(crate) const DRAG_SENSITIVITY: f32 = 0.006;
 /// screen-space projection uses the exact same value rather than a fifth,
 /// independently-chosen copy.
 pub(crate) const FOCAL_LENGTH: f32 = 1.5;
-const MIN_DISTANCE: f32 = 0.12;
-const MAX_DISTANCE: f32 = 20.0;
+/// Absolute floor/ceiling on the *solved* distance, after framing and zoom
+/// (`smart_camera::solve`) -- a backstop against a degenerate marble radius
+/// or aspect ratio, not the everyday range control the zoom multiplier is.
+pub(crate) const MAX_DISTANCE: f32 = 20.0;
+/// Wheel-notch gain, now in log space: one line multiplies the zoom by
+/// `exp(0.5) ~= 1.65`.
 const ZOOM_SENSITIVITY: f32 = 0.5;
+/// Zoom multiplier limits (`CameraOrbit::zoom`). The lower bound is what
+/// stops a player from zooming so far in that the framing rule asks for a
+/// distance inside the marble itself; `MIN_DISTANCE_MARBLE_RADII` below is
+/// the hard geometric floor underneath it.
+pub(crate) const MIN_ZOOM: f32 = 0.35;
+pub(crate) const MAX_ZOOM: f32 = 6.0;
 /// `MouseWheel::unit == Pixel` (trackpads, and some mice) reports raw pixel
 /// deltas rather than wheel "notches" -- a single physical gesture's
 /// magnitude can be 10-100x a `Line` event's. Dividing by this before
@@ -49,25 +59,35 @@ const ZOOM_SENSITIVITY: f32 = 0.5;
 /// line is the standard DOM wheel-event convention (matches Chrome's
 /// default `deltaMode`-conversion factor). Without this, a single trackpad
 /// swipe on macOS got read as an enormous number of "lines" and jumped the
-/// camera straight to `MIN_DISTANCE`/`MAX_DISTANCE` instead of smoothly
-/// zooming -- reported live as "scrolling jumps between fog and 100% zoom".
+/// camera straight to the zoom limits instead of smoothly zooming --
+/// reported live as "scrolling jumps between fog and 100% zoom". (The
+/// multiplicative zoom this now feeds makes an unscaled pixel delta even
+/// worse than it was under the old additive one: `exp(-lines * 0.5)`
+/// saturates within a couple of hundred raw pixels.)
 const PIXELS_PER_LINE: f32 = 100.0;
 /// The camera is never allowed closer than this multiple of the marble's
-/// own radius, on top of the flat `MIN_DISTANCE` floor -- `MIN_DISTANCE`
-/// alone isn't enough for every scene: the Menger scenes' marble
-/// (`render.rs::spawn_params`, `rad = 0.15`) is *larger* than
-/// `MIN_DISTANCE = 0.12`, so a full zoom-in there put the eye literally
-/// inside the marble's own geometry ("100% zoom... puts you inside the
-/// marble"). `1.5x` clears the surface with a comfortable margin while
-/// staying well under every scene's own tuned default distance
-/// (`render.rs::setup`'s per-scene `camera_orbit.distance` overrides), so
-/// zoom-in headroom is preserved everywhere.
-const MIN_DISTANCE_MARBLE_RADII: f32 = 1.5;
+/// own radius -- the hard geometric floor that no zoom, and no amount of
+/// geometry crowding the camera (`smart_camera::solve`'s pull-in), may go
+/// under. Originally added because a full zoom-in at the Menger scenes'
+/// marble radius (`render.rs::spawn_params`, `rad = 0.15`) put the eye
+/// literally inside the marble's own geometry ("100% zoom... puts you
+/// inside the marble"); it matters more now, since deocclusion can drive
+/// the distance down on its own without the player asking. `1.5x` clears
+/// the marble's surface with a comfortable margin.
+pub(crate) const MIN_DISTANCE_MARBLE_RADII: f32 = 1.5;
 
-/// Full 3D orbit orientation + distance around an externally supplied
-/// target (see [`CameraOrbit::eye_and_basis`]) — the target itself (the
-/// marble's position) lives in `MarbleState`, not here, so this resource
-/// stays pure input state.
+/// Full 3D orbit orientation + zoom preference around an externally
+/// supplied target (see [`CameraOrbit::eye_and_basis`]) — the target itself
+/// (the marble's position) lives in `MarbleState`, not here, so this
+/// resource stays pure input state.
+///
+/// **This is the player's *intent*, not what renders.** The camera that
+/// actually renders is [`CameraRig`], which tracks this exactly except when
+/// geometry would come between the eye and the marble
+/// ([`crate::smart_camera`]). Every input path writes this resource *and*
+/// the rig in the same breath (`apply_drag`/`apply_roll`), so input remains
+/// immediate and 1:1; the rig's freedom to deviate is spent only on
+/// keeping the marble visible, and it springs back here as soon as it can.
 ///
 /// A single quaternion, with no separate `roll`/yaw/pitch fields: `drag`
 /// and `roll` below only ever compose an *incremental* rotation onto
@@ -81,7 +101,21 @@ const MIN_DISTANCE_MARBLE_RADII: f32 = 1.5;
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct CameraOrbit {
     pub orientation: Quat,
-    pub distance: f32,
+    /// The player's zoom preference as a **multiplier** on the
+    /// automatically framed distance (`smart_camera::framing_distance`),
+    /// not an absolute world distance -- `1.0` means "frame the marble at
+    /// the target on-screen size", `2.0` means "twice as far back as that".
+    ///
+    /// Absolute distances were what this field used to hold, and they had to
+    /// be hand-tuned per scene (`render::setup`'s deleted `camera_orbit.
+    /// distance` overrides) because the right number depends on the marble's
+    /// radius, the window's aspect, and the input modality -- a value tuned
+    /// by screenshot for one scene was simply wrong for the next one, and
+    /// wrong again on a phone. As a multiplier the same value means the same
+    /// *thing* everywhere, so a scene needs no camera tuning at all and the
+    /// player's zoom preference survives a scene switch, a device rotation,
+    /// and a window resize.
+    pub zoom: f32,
 }
 
 impl CameraOrbit {
@@ -113,26 +147,19 @@ impl Default for CameraOrbit {
             // straight into solid geometry or get blocked by the nearby
             // decorative "creme spheres" clutter, and this is the direction
             // that was actually verified (via a close-up screenshot) to see
-            // it. Not a general solution — a real fix would auto-orient the
-            // camera to the marble's contact normal at spawn/settle time,
-            // which isn't implemented yet.
+            // it. The smart camera's deocclusion (`smart_camera::solve`)
+            // now recovers from a bad starting direction on its own, so
+            // this is a preference rather than the load-bearing choice it
+            // used to be.
             orientation: Self::orientation_from_yaw_pitch(-1.448, 0.899),
-            // Much closer than DESIGN.md §7's original
-            // `orbit_dist * marble_rad / 0.035` MMCE-scaling formula
-            // (~1.77): that reads as "the marble is a barely-visible speck"
-            // at normal viewing distances (verified this session — even
-            // with a saturated marker color, it was only a handful of
-            // pixels across, ~960x540 screenshot). Picked by comparing
-            // rendered screenshots at several candidate distances: 0.45
-            // made the marble clearly visible but still smallish (~35px
-            // diameter in a 540px-tall frame); 0.2 reads much better — the
-            // marble is unmistakably the visual focus (~60px diameter,
-            // ~11% of frame height) while the surrounding fractal surface
-            // detail and creme-sphere background are still clearly
-            // visible, with no clipping/occlusion artifacts at this
-            // yaw/pitch. `MIN_DISTANCE` below is set just under this so
-            // scroll-zoom still has a little headroom to go closer.
-            distance: 0.2,
+            // Neutral zoom: whatever `smart_camera::framing_distance` says
+            // frames the marble at the target on-screen size for this
+            // scene's marble radius, this window's aspect, and this input
+            // modality. The old hand-tuned `0.2` for the demo scene works
+            // out to `10 * marble_rad`, which is what the framing rule
+            // itself produces at `zoom = 1` within ~10% -- see
+            // `rust/CAMERA.md` §4.2 for that comparison across all scenes.
+            zoom: 1.0,
         }
     }
 }
@@ -143,25 +170,19 @@ impl CameraOrbit {
     /// §8). `right`/`up` already include whatever twist has accumulated —
     /// `orientation` *is* the rendered frame now, there's no separate
     /// unrolled frame to reconcile it with.
-    pub fn eye_and_basis(&self, target: Vec3) -> (Vec3, Vec3, Vec3, Vec3) {
-        let forward = self.forward();
-        let right = self.orientation * Vec3::X;
-        let up = self.orientation * Vec3::Y;
-        let eye = target - forward * self.distance;
+    pub fn basis_from(orientation: Quat, target: Vec3, distance: f32) -> (Vec3, Vec3, Vec3, Vec3) {
+        let forward = orientation * Vec3::NEG_Z;
+        let right = orientation * Vec3::X;
+        let up = orientation * Vec3::Y;
+        let eye = target - forward * distance;
         (eye, right, up, forward)
     }
 
-    /// The direction the camera is currently looking, independent of any
-    /// target (`physics_sys.rs` passes this, alongside `eye_and_basis`'s
-    /// `right`, into `marble_csg::step_marble`'s camera-relative thrust).
-    pub fn forward(&self) -> Vec3 {
-        self.orientation * Vec3::NEG_Z
-    }
-
-    /// Applies a swipe (mouse drag or single-finger touch) as a single
-    /// rotation that slides the camera across its sphere in the swiped
-    /// direction, by an angle proportional to the swipe's magnitude —
-    /// the arcball/trackball construction (module doc).
+    /// The single rotation a swipe (mouse drag or single-finger touch)
+    /// produces: it slides the camera across its sphere in the swiped
+    /// direction, by an angle proportional to the swipe's magnitude — the
+    /// arcball/trackball construction (module doc). `basis` is the
+    /// orientation whose screen axes the swipe is read against.
     ///
     /// `screen_dir` is the swipe's direction expressed in world space,
     /// built from the camera's *current* `right`/`up` (twist included —
@@ -186,30 +207,44 @@ impl CameraOrbit {
     /// roll=0 behavior exactly (checked independently against the old
     /// formula for pure horizontal and pure vertical swipes) — this isn't
     /// a fourth flipped direction.
-    pub(crate) fn drag(&mut self, delta: Vec2) {
-        let Some((screen_dir, angle)) = self.drag_intermediates(delta) else {
-            return;
-        };
-        let axis = self.forward().cross(screen_dir).normalize();
-        // Renormalize every step: repeated quaternion multiplication can
-        // accumulate tiny floating-point drift away from unit length over
-        // a long play session, which would otherwise slowly skew
-        // `eye_and_basis`'s basis vectors away from orthonormal.
-        self.orientation = (Quat::from_axis_angle(axis, angle) * self.orientation).normalize();
-    }
-
-    /// `drag`'s `screen_dir`/`angle` (world-space swipe direction, rotation
-    /// magnitude in radians), or `None` for a zero-length `delta` -- pulled
-    /// out on its own so `touch.rs`'s live debug readout can display the
-    /// exact intermediates `drag` actually computes, without a second,
-    /// independently-written copy of the formula that could drift out of
-    /// sync with the real one.
-    pub(crate) fn drag_intermediates(&self, delta: Vec2) -> Option<(Vec3, f32)> {
+    ///
+    /// **Why the basis is a parameter** rather than always the intent's own
+    /// orientation, which is what this used to be: the rotation is applied
+    /// to *both* the intent and the realized camera
+    /// ([`crate::smart_camera`]), and once the realized
+    /// camera is allowed to deviate from intent to keep the marble in view,
+    /// the screen axes the player is actually swiping across are the
+    /// *realized* ones. Reading the swipe against the intent's basis instead
+    /// would make swipes come out crooked by exactly the deviation angle --
+    /// "I dragged right and it went up and right" -- which is the same class
+    /// of bug (a rotation applied in the wrong frame) this module's history
+    /// already has three rounds of. Applying one world-frame rotation to both
+    /// keeps their relative deviation exactly intact, so a swipe never
+    /// silently erases or amplifies a correction the solver made.
+    pub(crate) fn drag_rotation(basis: Quat, delta: Vec2) -> Option<Quat> {
         if delta.length_squared() < 1e-12 {
             return None;
         }
-        let right = self.orientation * Vec3::X;
-        let up = self.orientation * Vec3::Y;
+        let forward = basis * Vec3::NEG_Z;
+        let right = basis * Vec3::X;
+        let up = basis * Vec3::Y;
+        let screen_dir = (right * delta.x + up * delta.y).normalize();
+        let angle = delta.length() * DRAG_SENSITIVITY;
+        Some(Quat::from_axis_angle(forward.cross(screen_dir).normalize(), angle))
+    }
+
+    /// [`Self::drag_rotation`]'s `screen_dir`/`angle` (world-space swipe
+    /// direction, rotation magnitude in radians), or `None` for a
+    /// zero-length `delta` -- pulled out on its own so `touch.rs`'s live
+    /// debug readout can display the exact intermediates the real rotation
+    /// is built from, without a second, independently-written copy of the
+    /// formula that could drift out of sync with it.
+    pub(crate) fn drag_intermediates_from(basis: Quat, delta: Vec2) -> Option<(Vec3, f32)> {
+        if delta.length_squared() < 1e-12 {
+            return None;
+        }
+        let right = basis * Vec3::X;
+        let up = basis * Vec3::Y;
         let screen_dir = (right * delta.x + up * delta.y).normalize();
         let angle = delta.length() * DRAG_SENSITIVITY;
         Some((screen_dir, angle))
@@ -241,7 +276,15 @@ impl CameraOrbit {
 const KEYBOARD_ROLL_RATE: f32 = 1.5;
 
 /// Left-drag to orbit, scroll wheel to zoom, `Q`/`E` to roll.
-#[allow(clippy::too_many_arguments)] // SystemParam count, one more for the marble-radius zoom clamp
+#[allow(clippy::too_many_arguments)] // SystemParam count
+///
+/// Every rotation here is applied to *both* the intent ([`CameraOrbit`]) and
+/// the realized camera ([`CameraRig`]) -- see [`CameraOrbit::drag_rotation`]'s
+/// doc for why a swipe must be read against the realized basis, and
+/// [`crate::smart_camera`]'s for why the two are separate states at all. The
+/// net effect for the player is that input stays exactly as immediate and
+/// exactly as 1:1 as it was before the smart camera existed: only the
+/// solver's own corrections are ever damped.
 pub fn orbit_camera_input(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -249,12 +292,20 @@ pub fn orbit_camera_input(
     mut motion: EventReader<MouseMotion>,
     mut wheel: EventReader<MouseWheel>,
     mut orbit: ResMut<CameraOrbit>,
+    mut rig: ResMut<CameraRig>,
     mut twist_debug: ResMut<crate::fps_overlay::DebugTwistAccum>,
-    marble_state: Res<MarbleState>,
+    config: Res<crate::config::Config>,
 ) {
+    // Scripted camera input for headless verification
+    // (`config::Config::autopilot`): a steady drag for the first few
+    // seconds, then hands off -- so a capture covers both "the player is
+    // steering" and "the player has let go and the solver is on its own".
+    if config.autopilot && time.elapsed_secs() < 4.0 {
+        apply_drag(&mut orbit, &mut rig, Vec2::new(1.2, 0.3));
+    }
     if mouse_buttons.pressed(MouseButton::Left) {
         for ev in motion.read() {
-            orbit.drag(ev.delta);
+            apply_drag(&mut orbit, &mut rig, ev.delta);
         }
     } else {
         motion.clear();
@@ -269,23 +320,70 @@ pub fn orbit_camera_input(
     }
     if roll_dir != 0.0 {
         let delta = roll_dir * KEYBOARD_ROLL_RATE * time.delta_secs();
-        orbit.roll(delta);
+        apply_roll(&mut orbit, &mut rig, delta);
         twist_debug.0 += delta;
     }
 
-    let min_distance = MIN_DISTANCE.max(marble_state.local_marble().rad * MIN_DISTANCE_MARBLE_RADII);
     for ev in wheel.read() {
         let lines = match ev.unit {
             MouseScrollUnit::Line => ev.y,
             MouseScrollUnit::Pixel => ev.y / PIXELS_PER_LINE,
         };
-        orbit.distance = (orbit.distance - lines * ZOOM_SENSITIVITY).clamp(min_distance, MAX_DISTANCE);
+        orbit.zoom = zoom_by_lines(orbit.zoom, lines);
     }
+}
+
+/// Applies one swipe to the intent and the realized camera together
+/// ([`orbit_camera_input`]'s doc). Shared with `touch.rs` so a finger swipe
+/// and a mouse drag go through exactly one implementation.
+pub(crate) fn apply_drag(orbit: &mut CameraOrbit, rig: &mut CameraRig, delta: Vec2) {
+    let Some(rotation) = CameraOrbit::drag_rotation(rig.orientation, delta) else {
+        return;
+    };
+    orbit.orientation = (rotation * orbit.orientation).normalize();
+    rig.orientation = (rotation * rig.orientation).normalize();
+}
+
+/// Applies one twist increment to the intent and the realized camera
+/// together. Roll is a *local*-frame post-multiply for each
+/// ([`CameraOrbit::roll`]), which leaves both cameras' `forward` untouched
+/// and therefore leaves their deviation (which is purely a `forward`
+/// difference -- the solver only ever rotates about axes perpendicular to
+/// `forward`) exactly as it was.
+pub(crate) fn apply_roll(orbit: &mut CameraOrbit, rig: &mut CameraRig, delta_radians: f32) {
+    orbit.roll(delta_radians);
+    let twist = Quat::from_rotation_z(delta_radians);
+    rig.orientation = (rig.orientation * twist).normalize();
+}
+
+/// One wheel event's effect on the zoom multiplier: *multiplicative*, so a
+/// notch changes the view by the same proportion whether the camera is close
+/// or far (an additive step, which is what the old absolute-distance zoom
+/// used, is imperceptible when far out and a jump to the clamp when close
+/// in). Clamped to [`MIN_ZOOM`]/[`MAX_ZOOM`].
+pub(crate) fn zoom_by_lines(zoom: f32, lines: f32) -> f32 {
+    (zoom * (-lines * ZOOM_SENSITIVITY).exp()).clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Applies a swipe to an orientation against *its own* basis -- what
+    /// the shipped `apply_drag` does when the realized camera hasn't
+    /// deviated from intent, which is the situation every arcball test
+    /// below is about. Goes through the real `drag_rotation`, so these stay
+    /// regression tests of production code rather than of a test-only
+    /// reimplementation.
+    fn drag(orbit: &mut CameraOrbit, delta: Vec2) {
+        if let Some(rotation) = CameraOrbit::drag_rotation(orbit.orientation, delta) {
+            orbit.orientation = (rotation * orbit.orientation).normalize();
+        }
+    }
+
+    fn forward_of(orbit: &CameraOrbit) -> Vec3 {
+        orbit.orientation * Vec3::NEG_Z
+    }
 
     /// The old (pre-quaternion) offset-direction formula, reimplemented
     /// standalone here purely as an independent oracle for
@@ -317,9 +415,9 @@ mod tests {
         for (yaw, pitch) in [(0.0, 0.0), (0.8, 0.35), (-1.448, 0.899)] {
             let orbit = CameraOrbit {
                 orientation: CameraOrbit::orientation_from_yaw_pitch(yaw, pitch),
-                distance: 1.0,
+                zoom: 1.0,
             };
-            let (_, right, up, forward) = orbit.eye_and_basis(Vec3::ZERO);
+            let (_, right, up, forward) = CameraOrbit::basis_from(orbit.orientation, Vec3::ZERO, 1.0);
             let want_right = forward.cross(Vec3::Y).normalize();
             let want_up = want_right.cross(forward);
             assert!(right.distance(want_right) < 1e-4, "yaw={yaw} pitch={pitch}: right mismatch");
@@ -331,10 +429,10 @@ mod tests {
     fn eye_is_distance_back_along_forward_from_target() {
         let orbit = CameraOrbit {
             orientation: CameraOrbit::orientation_from_yaw_pitch(0.4, 0.2),
-            distance: 3.0,
+            zoom: 1.0,
         };
         let target = Vec3::new(1.0, 2.0, 3.0);
-        let (eye, _, _, forward) = orbit.eye_and_basis(target);
+        let (eye, _, _, forward) = CameraOrbit::basis_from(orbit.orientation, target, 3.0);
         assert!((eye - target).length() - 3.0 < 1e-4);
         assert!((target - eye).normalize().distance(forward) < 1e-4);
     }
@@ -351,14 +449,14 @@ mod tests {
         // system was physically incapable of ever reaching this state at
         // all; this one lands exactly where continuous rotation predicts,
         // with a still-orthonormal, non-degenerate basis.
-        let mut orbit = CameraOrbit { orientation: Quat::IDENTITY, distance: 1.0 };
+        let mut orbit = CameraOrbit { orientation: Quat::IDENTITY, zoom: 1.0 };
         let steps = 100;
         let total_pitch = std::f32::consts::PI;
         let per_step_delta_y = -(total_pitch / DRAG_SENSITIVITY) / steps as f32;
         for _ in 0..steps {
-            orbit.drag(Vec2::new(0.0, per_step_delta_y));
+            drag(&mut orbit, Vec2::new(0.0, per_step_delta_y));
         }
-        let forward = orbit.forward();
+        let forward = forward_of(&orbit);
         assert!(forward.is_finite(), "basis degenerated: {forward:?}");
         // Starting forward was (0, 0, -1); after a PI (half-turn) pitch
         // rotation over the top, it must land close to (0, 0, 1) --
@@ -371,7 +469,7 @@ mod tests {
         );
         // Basis must still be orthonormal after many compositions (checks
         // the per-step renormalization is actually keeping drift in check).
-        let (_, right, up, _) = orbit.eye_and_basis(Vec3::ZERO);
+        let (_, right, up, _) = CameraOrbit::basis_from(orbit.orientation, Vec3::ZERO, 1.0);
         assert!((right.length() - 1.0).abs() < 1e-3);
         assert!((up.length() - 1.0).abs() < 1e-3);
         assert!(right.dot(up).abs() < 1e-3);
@@ -381,11 +479,11 @@ mod tests {
     fn roll_does_not_change_forward() {
         let mut orbit = CameraOrbit {
             orientation: CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35),
-            distance: 1.0,
+            zoom: 1.0,
         };
-        let forward_before = orbit.forward();
+        let forward_before = forward_of(&orbit);
         orbit.roll(1.2);
-        let forward_after = orbit.forward();
+        let forward_after = forward_of(&orbit);
         assert!(
             forward_before.distance(forward_after) < 1e-4,
             "roll must not change the view direction: {forward_before:?} -> {forward_after:?}"
@@ -396,11 +494,11 @@ mod tests {
     fn roll_does_change_right_and_up() {
         let mut orbit = CameraOrbit {
             orientation: CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35),
-            distance: 1.0,
+            zoom: 1.0,
         };
-        let (_, right_before, up_before, _) = orbit.eye_and_basis(Vec3::ZERO);
+        let (_, right_before, up_before, _) = CameraOrbit::basis_from(orbit.orientation, Vec3::ZERO, 1.0);
         orbit.roll(1.2);
-        let (_, right_after, up_after, _) = orbit.eye_and_basis(Vec3::ZERO);
+        let (_, right_after, up_after, _) = CameraOrbit::basis_from(orbit.orientation, Vec3::ZERO, 1.0);
         assert!(right_before.distance(right_after) > 0.1, "roll should visibly change `right`");
         assert!(up_before.distance(up_after) > 0.1, "roll should visibly change `up`");
     }
@@ -413,12 +511,12 @@ mod tests {
         // local-Z-post-multiply `roll` reproduces the same sign, not just
         // "changes right/up somehow" (the test above).
         let base = CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35);
-        let mut orbit = CameraOrbit { orientation: base, distance: 1.0 };
+        let mut orbit = CameraOrbit { orientation: base, zoom: 1.0 };
         let right0 = base * Vec3::X;
         let up0 = base * Vec3::Y;
         let small_roll = 0.01;
         orbit.roll(small_roll);
-        let (_, right, _, _) = orbit.eye_and_basis(Vec3::ZERO);
+        let (_, right, _, _) = CameraOrbit::basis_from(orbit.orientation, Vec3::ZERO, 1.0);
         let predicted = (right0 + up0 * small_roll).normalize();
         assert!(
             right.distance(predicted) < 1e-3,
@@ -443,11 +541,11 @@ mod tests {
         }
         let base = CameraOrbit::orientation_from_yaw_pitch(0.0, 0.0);
         for delta in [Vec2::new(10.0, 0.0), Vec2::new(-10.0, 0.0), Vec2::new(0.0, 10.0), Vec2::new(0.0, -10.0)] {
-            let mut new_orbit = CameraOrbit { orientation: base, distance: 1.0 };
-            new_orbit.drag(delta);
+            let mut new_orbit = CameraOrbit { orientation: base, zoom: 1.0 };
+            drag(&mut new_orbit, delta);
             let old_orientation = old_drag(base, delta);
 
-            let new_delta = (new_orbit.forward() - (base * Vec3::NEG_Z)).normalize();
+            let new_delta = (forward_of(&new_orbit) - (base * Vec3::NEG_Z)).normalize();
             let old_delta = (old_orientation * Vec3::NEG_Z - (base * Vec3::NEG_Z)).normalize();
             assert!(
                 new_delta.distance(old_delta) < 1e-2,
@@ -471,10 +569,10 @@ mod tests {
         for pitch_deg in [0.0, 30.0, 60.0, 80.0, -45.0] {
             let pitch = pitch_deg_to_rad(pitch_deg);
             let base = CameraOrbit::orientation_from_yaw_pitch(0.8, pitch) * Quat::from_rotation_z(0.6458); // ~37deg roll thrown in
-            let mut orbit = CameraOrbit { orientation: base, distance: 1.0 };
-            let f0 = orbit.forward();
-            orbit.drag(delta);
-            let f1 = orbit.forward();
+            let mut orbit = CameraOrbit { orientation: base, zoom: 1.0 };
+            let f0 = forward_of(&orbit);
+            drag(&mut orbit, delta);
+            let f1 = forward_of(&orbit);
             angles.push(f0.angle_between(f1));
         }
         let first = angles[0];
@@ -507,9 +605,9 @@ mod tests {
         ] {
             let pitch = pitch_deg_to_rad(pitch_deg);
             let base = CameraOrbit::orientation_from_yaw_pitch(0.3, pitch) * Quat::from_rotation_z(roll);
-            let mut orbit = CameraOrbit { orientation: base, distance: 1.0 };
-            orbit.drag(delta);
-            orbit.drag(-delta);
+            let mut orbit = CameraOrbit { orientation: base, zoom: 1.0 };
+            drag(&mut orbit, delta);
+            drag(&mut orbit, -delta);
             let ang = base.angle_between(orbit.orientation);
             // Exact in infinite precision (verified algebraically: the
             // second drag's rotation is provably the exact inverse of the
@@ -541,18 +639,18 @@ mod tests {
         let yaw = (0.290_f32 / pitch.cos()).asin(); // cos(pitch)*sin(yaw) = -forward.x = 0.290
         let mut orbit = CameraOrbit {
             orientation: CameraOrbit::orientation_from_yaw_pitch(yaw, pitch),
-            distance: 1.0,
+            zoom: 1.0,
         };
         orbit.roll(46.2_f32.to_radians());
-        let forward_before = orbit.forward();
+        let forward_before = forward_of(&orbit);
         assert!(
             forward_before.distance(Vec3::new(-0.290, -0.800, -0.526)) < 0.02,
             "reconstructed state should reproduce the screenshot's forward, got {forward_before:?}"
         );
 
-        let (_, right, up, _) = orbit.eye_and_basis(Vec3::ZERO);
-        orbit.drag(Vec2::new(-0.1, -1.6));
-        let moved = (orbit.forward() - forward_before).normalize();
+        let (_, right, up, _) = CameraOrbit::basis_from(orbit.orientation, Vec3::ZERO, 1.0);
+        drag(&mut orbit, Vec2::new(-0.1, -1.6));
+        let moved = (forward_of(&orbit) - forward_before).normalize();
 
         let cross_axis_leak = moved.dot(right.normalize()).abs();
         assert!(

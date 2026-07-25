@@ -50,7 +50,7 @@ use crate::fps_overlay::PhaseTimings;
 use marble_csg::physics::{GravityMode, Marble, PhysicsConfig, PlayerInput};
 use marble_rollback::{InputTransport, PlayerIndex, RollbackSim, Tick};
 
-use crate::camera::CameraOrbit;
+use crate::smart_camera::CameraRig;
 use crate::net::{NetSession, NetStatus, Role, WebRtcTransport, HOST_INDEX};
 use crate::render::SceneState;
 use crate::touch::read_two_finger_gesture;
@@ -782,16 +782,17 @@ const ROLLBACK_WINDOW_TICKS: u64 = 16;
 pub fn marble_physics_tick(
     keys: Res<ButtonInput<KeyCode>>,
     touches: Res<Touches>,
-    orbit: Res<CameraOrbit>,
+    rig: Res<CameraRig>,
     scene: Res<SceneState>,
     net: Res<NetSession>,
+    config: Res<crate::config::Config>,
     mp: ResMut<MultiplayerSession>,
     marble_state: ResMut<MarbleState>,
     pending_scene: ResMut<PendingSceneSync>,
     mut timings: ResMut<PhaseTimings>,
 ) {
     let start = Instant::now();
-    marble_physics_tick_impl(keys, touches, orbit, scene, net, mp, marble_state, pending_scene);
+    marble_physics_tick_impl(keys, touches, rig, scene, net, config, mp, marble_state, pending_scene);
     timings.record("physics", start.elapsed());
 }
 
@@ -799,9 +800,10 @@ pub fn marble_physics_tick(
 fn marble_physics_tick_impl(
     keys: Res<ButtonInput<KeyCode>>,
     touches: Res<Touches>,
-    orbit: Res<CameraOrbit>,
+    rig: Res<CameraRig>,
     scene: Res<SceneState>,
     net: Res<NetSession>,
+    config: Res<crate::config::Config>,
     mut mp: ResMut<MultiplayerSession>,
     mut marble_state: ResMut<MarbleState>,
     mut pending_scene: ResMut<PendingSceneSync>,
@@ -818,6 +820,23 @@ fn marble_physics_tick_impl(
     // `Deref`/`DerefMut` (going through method calls the borrow checker
     // can't see through) wouldn't allow in one call.
     let mp = &mut *mp;
+
+    // Autopilot (headless verification, `config::Config::autopilot`) plays
+    // in `Rolling` mode and keeps the marble near its spawn. Both matter for
+    // what the capture is *for*: in `Flying` mode a constant scripted thrust
+    // just accelerates the marble out into empty space, and a camera framing
+    // a marble against an empty sky says nothing about how it handles
+    // geometry -- which is the entire question. Rolling keeps it on the
+    // fractal's surface, where the occlusion is.
+    if config.autopilot {
+        marble_state.cfg.mode = GravityMode::Rolling;
+        let idx = marble_state.local_player_index;
+        let start = marble_state.start_positions[idx];
+        let strayed = mp.sim.marbles()[idx].pos.distance(start) > 40.0 * mp.sim.marbles()[idx].rad;
+        if strayed && mp.transport.is_none() {
+            mp.sim.respawn(idx, start);
+        }
+    }
 
     if keys.just_pressed(KeyCode::KeyG) {
         marble_state.cfg.mode = match marble_state.cfg.mode {
@@ -856,6 +875,15 @@ fn marble_physics_tick_impl(
     if let Some(gesture) = read_two_finger_gesture(&touches) {
         dy += gesture.pinch_dy;
     }
+    // Scripted movement for headless verification (`config::Config::
+    // autopilot`) -- a wandering thrust so a screenshot run actually
+    // exercises the camera's following behavior. Driven by the sim's own
+    // tick, so it is deterministic and identical across runs.
+    if config.autopilot {
+        let t = mp.sim.current_tick() as f32 / 60.0;
+        dx += (t * 0.8).sin();
+        dy += (t * 0.53).cos();
+    }
 
     // `PlayerInput.orientation` carries the camera's actual current
     // orientation, not `dx`/`dy` re-derived from it via a second,
@@ -866,7 +894,15 @@ fn marble_physics_tick_impl(
     // doc). `step_marbles` derives `cam_forward`/`cam_right` from it
     // directly (`PlayerInput::cam_basis`), the same math `CameraOrbit`
     // itself uses (`orientation * Vec3::NEG_Z` / `orientation * Vec3::X`).
-    let local_input = PlayerInput { dx, dy, orientation: orbit.orientation };
+    // The *realized* camera's orientation (`smart_camera::CameraRig`), not
+    // the player's raw intent (`CameraOrbit`): the player steers by what is
+    // on screen, so the control frame has to be the frame that is actually
+    // being rendered. Where the two disagree (the solver has slid the view
+    // around an obstruction), following intent here would mean pushing "up
+    // the screen" sends the marble somewhere else. The solver's own rate
+    // limits are what keep this from swinging the control frame around
+    // faster than a player can track (`smart_camera::SLIDE_RATE`).
+    let local_input = PlayerInput { dx, dy, orientation: rig.orientation };
 
     // Edge-triggered on the *transition into* `Connected` -- a freshly
     // opened data channel, first-ever or a same-tab reconnect alike (see
