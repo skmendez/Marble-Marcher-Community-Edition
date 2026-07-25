@@ -1743,6 +1743,17 @@ fn update_frame_data_impl(
             shadow_render_target.size.y as f32,
             if toggles.mrrm_enabled { 1.0 } else { 0.0 },
         ),
+        // x: the *fine* pass's render-target height. Unlike `misc.z` (this
+        // pass's own height, which drives its own primary march's cone
+        // angle), this is deliberately the other pass's: the shadow march's
+        // occlusion threshold has to be the resolution the result is
+        // eventually *displayed* at, or shadow silhouettes change shape with
+        // the shadow target's resolution. Mirrors MMCE, which computes
+        // `fovray` once from the full resolution and uses that same value
+        // inside `shadow_march` even when called from its half-resolution
+        // `Illumination_step` (`marble_csg::codegen`'s `SHADOW_MARCHER`).
+        // y/z/w unused by this pass.
+        misc2: Vec4::new(resolution_height, 0.0, 0.0, 0.0),
         ..base
     };
 
