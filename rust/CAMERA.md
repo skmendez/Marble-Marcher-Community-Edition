@@ -6,7 +6,10 @@ view of the marble, frames it at a sensible size, moves like a drone operator
 rather than a rigidly-attached boom, and still does exactly what the player
 asks it to.
 
-**Status: implemented** (`app/src/smart_camera.rs`, `csg/src/visibility.rs`).
+**Status: implemented, shipped behind `?smartcam=1`/`MM_SMARTCAM=1`**
+(`app/src/smart_camera.rs`, `csg/src/visibility.rs`). Off by default pending
+a play-test: the framing rule (§4.2) is on either way, the geometry-aware
+behaviors need the flag.
 Sections 1-5 below are the design as written *before* implementation, kept as
 the record of the reasoning; §11 at the end lists what implementation
 changed, what it measured, and what is still missing. Where the two
@@ -742,27 +745,37 @@ reports what the camera did. `cargo test -p marble-marcher-bevy scene_probe
 
 | scene | smart | mean vis | frames blocked | min eye clearance | screen size | `de` steps/frame |
 |---|---|---|---|---|---|---|
-| demo | off | 1.00 | 0/480 | +0.010 | 0.167 | 4.1 |
-| demo | **on** | 1.00 | 0/480 | +0.013 | 0.16–0.19 | 4.2 |
+| demo | off | 1.00 | 0/480 | +0.015 | 0.167–0.194 | 4.1 |
+| demo | **on** | 1.00 | 0/480 | +0.013 | 0.162–0.187 | 4.2 |
 | classic_only | off | 1.00 | 0/480 | +0.020 | 0.167 | 2.9 |
 | classic_only | **on** | 1.00 | 0/480 | +0.020 | 0.167 | 3.0 |
 | menger_sponge | off | 1.00 | 0/480 | +0.155 | 0.167 | 4.0 |
-| menger_sponge | **on** | 1.00 | 0/480 | +0.106 | 0.16–0.17 | 4.5 |
+| menger_sponge | **on** | 1.00 | 0/480 | +0.106 | 0.165–0.174 | 4.5 |
 | menger_sphere | off | 1.00 | 0/480 | +0.155 | 0.167 | 4.0 |
-| menger_sphere | **on** | 1.00 | 0/480 | +0.106 | 0.16–0.17 | 4.5 |
-| menger_oscillating_sphere | off | 1.00 | 0/480 | **−0.008** | 0.167 | 4.0 |
-| menger_oscillating_sphere | **on** | 1.00 | 0/480 | +0.081 | 0.15–0.23 | 4.0 |
-| hollow_donut | off | **0.59** | **192/480** | **−0.149** | 0.167 | 7.0 |
-| hollow_donut | **on** | 0.86 | 66/480 | +0.026 | 0.16–0.90 | 13.6 |
+| menger_sphere | **on** | 1.00 | 0/480 | +0.106 | 0.165–0.174 | 4.5 |
+| menger_oscillating_sphere | off | 1.00 | 0/480 | +0.109 | 0.167–0.224 | 4.0 |
+| menger_oscillating_sphere | **on** | 1.00 | 0/480 | +0.081 | 0.147–0.227 | 4.0 |
+| hollow_donut | off | **0.59** | **192/480** | **−0.061** | up to **1.34** | 7.0 |
+| hollow_donut | **on** | 0.86 | 66/480 | +0.026 | up to 0.90 | 13.6 |
 
-The two rows that matter are the ones where geometry actually crowds the
-camera. Without the solver, the eye ends up *inside* the fractal in
-`menger_oscillating_sphere` and 0.15 deep inside the shell in
-`hollow_donut`, where the marble is also lost behind geometry for 40% of the
-run. With it, the eye is outside the geometry in every scene on every frame,
-and the donut's blocked frames drop by two thirds. Where nothing is in the
-way — the four open scenes — the two cameras agree to within a few percent
-and the solver costs a fraction of a `de` evaluation per frame.
+The rows that matter are the ones where geometry actually crowds the camera.
+`hollow_donut` is the case: with the solver off, the marble is behind
+geometry for 40% of the run, the eye dips inside the shell, and the camera
+gets pinned close enough that the marble fills the frame outright. With it
+on, the eye stays outside the geometry, the blocked frames drop by two
+thirds, and the worst-case framing improves by a third. Where nothing is in
+the way — the four open scenes — the two agree to within a few percent and
+the solver costs a fraction of a `de` evaluation per frame.
+
+Note the "off" column is *not* the pre-feature camera: the framing rule
+applies either way, and one geometry-aware behavior stays on with the flag
+off — the distance is still capped at the swept free distance, so the eye
+does not end up inside a wall. That cap is what the deleted per-scene
+distance constants were for (`HollowDonut`'s `0.6` was chosen because the
+tube's interior free radius is `0.85`), so dropping them without it would
+have left the default strictly worse than before this work. It costs
+nothing in feel: the camera still points exactly where the player says,
+instantly, with no damping and no automatic rotation.
 
 Screen size is the fraction of the shorter screen dimension, against a
 target of 0.167. Eye clearance is the distance field at the eye — invariant

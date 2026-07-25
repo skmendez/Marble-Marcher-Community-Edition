@@ -29,7 +29,19 @@ exactly what each one is a faithful port of):
   camera-relative thrust (WASD flies wherever the camera is actually
   pointed, including up/down).
 
-Left-drag orbits the camera, scroll wheel zooms.
+Left-drag orbits the camera, scroll wheel zooms. Zoom is a *multiplier* on
+an automatically framed distance: the camera sizes the marble to a fixed
+fraction of the screen's shorter dimension (about 1/6 for mouse input, more
+for touch), so it frames correctly for any marble radius, window aspect or
+device without per-scene tuning.
+
+`?smartcam=1`/`MM_SMARTCAM=1` additionally enables the geometry-aware
+camera (`app/src/smart_camera.rs`, designed in `CAMERA.md`): it keeps a
+clear line of sight to the marble, refuses to put the eye inside the
+fractal, damps its own corrections while leaving your input untouched, and
+widens the field of view when geometry forces it closer than it wanted.
+Default off pending a play-test — see `CAMERA.md` §11 for what it has been
+measured to do and where it still falls short.
 
 `MM_WINDOW_SIZE=WxH` overrides the starting window resolution — useful on a
 software (CPU) Vulkan/GL fallback (e.g. llvmpipe, when no hardware GPU ICD

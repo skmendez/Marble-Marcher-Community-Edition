@@ -381,7 +381,8 @@ pub struct SolveInput {
     /// [`POINTER_TARGET_FRACTION`] or [`TOUCH_TARGET_FRACTION`].
     pub target_fraction: f32,
     pub dt: f32,
-    /// `false` (`?smartcam=0`) keeps the framing rule but disables every
+    /// `false` (the default until this has been play-tested; `?smartcam=1`
+    /// turns it on) keeps the framing rule but disables every
     /// geometry-aware and time-based behavior: the rig then tracks intent
     /// exactly, which is the pre-smart-camera behavior and the A/B baseline.
     pub smart: bool,
@@ -614,21 +615,19 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
     }
 
     if !input.smart {
-        // Framing rule only (`?smartcam=0`): track intent exactly, no
-        // smoothing, no geometry awareness. This is the A/B baseline, and
-        // deliberately not "disable the whole module" -- the framing rule
-        // has no failure mode that needs an escape hatch, whereas the
-        // geometry-aware behaviors are the ones worth being able to switch
-        // off when diagnosing a feel complaint.
+        // Framing rule only (the default; `?smartcam=1` opts in to the
+        // rest): track intent exactly, no smoothing, no geometry awareness.
+        // This is both the shipped default until the solver has been
+        // play-tested and the A/B baseline the probe harness measures
+        // against. Deliberately not "disable the whole module" -- the
+        // framing rule has no failure mode that needs an escape hatch,
+        // whereas the geometry-aware behaviors are the ones worth being able
+        // to switch off when diagnosing a feel complaint.
         rig.orientation = input.intent;
         rig.focus = input.marble_pos;
         rig.focus_vel = Vec3::ZERO;
-        rig.distance = desired;
         rig.distance_vel = 0.0;
         rig.focal_length = FOCAL_LENGTH;
-        // Still *measured*, just not acted on: the baseline's overlay should
-        // report what the camera can actually see, which is the whole point
-        // of having a baseline to compare against.
         let camera_radius = (CAMERA_RADIUS_FRACTION * desired).clamp(0.5 * radius, 3.0 * radius);
         let sw = sweep(
             sdf,
@@ -637,6 +636,16 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
             desired,
             SweepConfig { camera_radius, target_radius: radius, max_steps: SWEEP_MAX_STEPS },
         );
+        // The one geometry-aware thing that stays on with the flag off:
+        // don't put the eye inside a wall. Not a feel change -- the camera
+        // still points exactly where the player says, instantly, with no
+        // damping and no auto-rotation -- but it is what the deleted
+        // per-scene distance constants were *for* (HollowDonut's `0.6` was
+        // chosen because the tube's interior free radius is `0.85`), so
+        // dropping them without this would leave the flag-off default
+        // strictly worse than before this feature existed. The sweep it
+        // needs is already being run for the debug overlay.
+        rig.distance = desired.min(sw.free_distance).max(min_distance);
         rig.debug = RigDebug {
             visibility: sw.visibility,
             free_distance: sw.free_distance,
@@ -1439,18 +1448,30 @@ mod tests {
     }
 
     #[test]
-    fn smartcam_off_tracks_intent_exactly() {
+    fn smartcam_off_tracks_intent_exactly_but_still_keeps_the_eye_out_of_walls() {
         let intent = CameraOrbit::orientation_from_yaw_pitch(0.4, -0.2);
         let inp = SolveInput { smart: false, ..input(intent, 1.0 / 60.0) };
-        let pillar = Pillar { cx: 0.0, cz: 0.7, r: 0.35 };
-        let rig = settled(&pillar, &inp, 60);
+        let want = framing_distance(0.15, FOCAL_LENGTH, POINTER_TARGET_FRACTION, 16.0 / 9.0);
+
+        // Open space: exactly the framing distance, exactly the player's
+        // orientation, no FOV games, no damping.
+        let mut rig = CameraRig::default();
+        let mut open = inp;
+        solve(&mut rig, &mut open, &Empty);
         assert_eq!(rig.orientation, intent);
         assert_eq!(rig.focal_length, FOCAL_LENGTH);
-        assert!(
-            (rig.distance - framing_distance(0.15, FOCAL_LENGTH, POINTER_TARGET_FRACTION, 16.0 / 9.0))
-                .abs()
-                < 1e-4
-        );
+        assert!((rig.distance - want).abs() < 1e-4);
+
+        // With a pillar on the view ray the direction is still untouched --
+        // no sliding, no deviation -- but the distance is capped so the eye
+        // does not end up inside it. See the `!input.smart` branch in
+        // `solve` for why this one behavior survives the flag being off.
+        let pillar = Pillar { cx: 0.0, cz: 0.7, r: 0.35 };
+        let rig = settled(&pillar, &inp, 60);
+        assert_eq!(rig.orientation, intent, "flag-off must never rotate the camera");
+        assert_eq!(rig.focal_length, FOCAL_LENGTH, "flag-off must never touch the FOV");
+        assert!(rig.distance < want, "expected the distance to be capped by the pillar");
+        assert!(rig.debug.eye_clearance > 0.0, "eye ended up inside the pillar");
     }
 
     #[test]
