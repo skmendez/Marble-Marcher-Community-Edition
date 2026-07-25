@@ -815,3 +815,9 @@ asserted its fold-history stack was *empty* on return from a `Fractal` node,
 which is only true for a top-level one. `scenes::hollow_donut` nests a
 `Fractal` (the skylight) inside another, so any physics contact there
 panicked in debug builds. Now asserts the stack returned to its entry depth.
+
+(A second one — the hard-coded `CompositeAlphaMode::PreMultiplied` panicking
+at surface configuration on lavapipe, which broke
+`scripts/headless_screenshot.sh` — was hit here too, but master fixed it
+independently while this branch was in flight, so the merge kept master's
+`cfg(target_arch)`-based version rather than this branch's env-var hatch.)
