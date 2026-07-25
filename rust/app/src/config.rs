@@ -56,6 +56,23 @@ pub struct Config {
     /// the adaptive-resolution plumbing (`render::oscillate_fine_resolution_tier`'s
     /// doc), independent of and not gated on `debug_enabled`. Default off.
     pub res_oscillate_enabled: bool,
+    /// `?adaptive_res=1`/`MM_ADAPTIVE_RES=1` enables the load-driven
+    /// resolution controller (`adaptive_res::adjust_resolution_scale`):
+    /// steps the fine pass's `render::FineRenderTarget::active_size` down
+    /// under sustained slow frames and back up once frame time recovers,
+    /// via hysteresis logic ported from a first (fully reverted) attempt at
+    /// this whose *decision* logic was always sound -- only its consumer
+    /// (a since-eliminated GPU render-target rebuild per scale change) was
+    /// the actual cause of that attempt's visible jitter.
+    ///
+    /// **Default off**, pending a play-test -- same cautious-rollout
+    /// pattern as `smart_camera`/`autopilot`: this is a previously-untested
+    /// mechanic (the decision logic is unit-tested, but "does it feel
+    /// smooth to a live player" isn't something a unit test can establish).
+    /// Mutually exclusive with `res_oscillate_enabled` -- see
+    /// `adaptive_res::adjust_resolution_scale`'s doc for which one wins if
+    /// both are somehow requested at once.
+    pub adaptive_res_enabled: bool,
     /// `?gpuprofile=1`/`MM_GPUPROFILE=1` enables GPU timestamp-query
     /// profiling of each render pass, surfaced via the HTML/JS overlay in
     /// `web/index.html` -- default off (a diagnostic tool; also a true
@@ -130,6 +147,8 @@ impl Config {
             vsync_off: query_value("vsync", "MM_VSYNC").as_deref() == Some("off"),
             res_oscillate_enabled: query_value("res_oscillate", "MM_RES_OSCILLATE").as_deref()
                 == Some("1"),
+            adaptive_res_enabled: query_value("adaptive_res", "MM_ADAPTIVE_RES").as_deref()
+                == Some("1"),
             gpu_profile_enabled: query_value("gpuprofile", "MM_GPUPROFILE").as_deref()
                 == Some("1"),
             step_heat_enabled: query_value("stepheat", "MM_STEPHEAT").as_deref() == Some("1"),
@@ -168,6 +187,7 @@ mod tests {
         assert!(value != Some("1")); // debug
         assert!(value != Some("off")); // vsync
         assert!(value != Some("1")); // res_oscillate
+        assert!(value != Some("1")); // adaptive_res
         assert!(value != Some("1")); // gpuprofile
         assert!(value != Some("1")); // stepheat
         assert!(!matches!(value, Some("1") | Some("true"))); // smartcam

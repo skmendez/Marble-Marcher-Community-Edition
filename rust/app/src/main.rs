@@ -6,6 +6,7 @@
 //! same `Object`/`Params` the shader renders, driven by WASD (camera-yaw
 //! relative) with `R` to force a respawn; the orbit camera follows it.
 
+mod adaptive_res;
 mod camera;
 mod config;
 mod debug_gizmos;
@@ -31,6 +32,7 @@ use bevy::prelude::*;
 use bevy::sprite::Material2dPlugin;
 use bevy::window::WindowResolution;
 
+use adaptive_res::{adjust_resolution_scale, AdaptiveResolution};
 use camera::{orbit_camera_input, CameraOrbit};
 use config::Config;
 use debug_gizmos::{draw_thrust_debug, setup_thrust_debug_arrows};
@@ -236,6 +238,7 @@ fn main() {
         .init_resource::<TouchDebugInfo>()
         .init_resource::<PendingSceneSync>()
         .init_resource::<PerfProbeState>()
+        .init_resource::<AdaptiveResolution>()
         // `setup` (below) inserts `SceneState`/`MarbleState`/
         // `MultiplayerSession` directly rather than `init_resource`-ing any
         // of them here -- none has a scene-independent `Default` to speak
@@ -314,6 +317,14 @@ fn main() {
                     // `active_size` write applies on the same frame, not one
                     // frame late).
                     oscillate_fine_resolution_tier,
+                    // Load-driven resolution controller (`?adaptive_res=1`)
+                    // -- occupies the exact same chain slot as (and is
+                    // mutually exclusive with, see its own doc)
+                    // `oscillate_fine_resolution_tier` immediately above:
+                    // same "after resize, before sync" ordering requirement,
+                    // since it writes the same `FineRenderTarget::active_size`
+                    // field.
+                    adjust_resolution_scale,
                     sync_fine_render_target_and_present,
                     sync_quad_scale,
                     sync_coarse_quad_scale,
