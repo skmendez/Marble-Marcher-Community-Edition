@@ -43,20 +43,32 @@
 //!
 //! # What runs each frame
 //!
-//! One sphere trace from the marble outward along the current view ray
-//! ([`marble_csg::visibility::sweep`]) answers all three questions the
-//! solver has — how far back can the eye sit, how much of the marble is
-//! visible, and what is in the way — after which:
+//! A sphere trace from the marble outward along the view ray
+//! ([`marble_csg::visibility::sweep`]) answers the solver's three questions
+//! at once — how far back the eye can sit, how much of the marble is
+//! visible from there, and what is in the way. Around that:
 //!
 //! 1. the focus point springs toward the marble (with a hard lag clamp, so
 //!    smoothing can never cost more than a fixed fraction of the frame),
 //! 2. the view direction slides tangentially away from whatever is blocking
 //!    it, at a rate proportional to how blocked it is, and decays back
-//!    toward intent when clear,
-//! 3. the distance is pulled in fast / pushed back out slowly,
-//! 4. the field of view widens (only) when geometry has forced the camera
-//!    closer than the framing rule wanted, which keeps the marble's
-//!    on-screen size roughly on target even in a tunnel.
+//!    toward the player's intent when clear,
+//! 3. the ray is re-swept wherever that left it, because the step that
+//!    follows is the one that actually places the eye and must not run on a
+//!    frame-old idea of where the walls are,
+//! 4. if that direction has nowhere for the camera to be at all — or has
+//!    been hopeless for long enough, or is merely far tighter than the
+//!    framing rule wants — a small ring of alternatives is searched and the
+//!    best is committed to,
+//! 5. the distance is pulled in fast and pushed back out slowly,
+//! 6. and the field of view widens (only) when geometry has forced the
+//!    camera closer than framing wanted, which keeps the marble's on-screen
+//!    size near target even in a tunnel.
+//!
+//! Steps 2, 4 and 5 each have a hold or commitment attached, and every one
+//! of them is there because its absence produced a specific measured
+//! failure (thrash between candidates, a reposition immediately undone, a
+//! camera pumping in and out on a flickering strut) — see the constants.
 
 use bevy::prelude::*;
 
@@ -614,14 +626,25 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
         rig.distance = desired;
         rig.distance_vel = 0.0;
         rig.focal_length = FOCAL_LENGTH;
+        // Still *measured*, just not acted on: the baseline's overlay should
+        // report what the camera can actually see, which is the whole point
+        // of having a baseline to compare against.
+        let camera_radius = (CAMERA_RADIUS_FRACTION * desired).clamp(0.5 * radius, 3.0 * radius);
+        let sw = sweep(
+            sdf,
+            rig.focus,
+            -(rig.orientation * Vec3::NEG_Z),
+            desired,
+            SweepConfig { camera_radius, target_radius: radius, max_steps: SWEEP_MAX_STEPS },
+        );
         rig.debug = RigDebug {
-            visibility: 1.0,
-            free_distance: desired,
+            visibility: sw.visibility,
+            free_distance: sw.free_distance,
             desired_distance: desired,
             screen_fraction: screen_fraction(radius, FOCAL_LENGTH, rig.distance, input.aspect),
             deviation: 0.0,
             eye_clearance: sdf.de(rig.eye()),
-            steps: 0,
+            steps: sw.steps,
         };
         return;
     }
@@ -1491,7 +1514,7 @@ mod scene_probe {
     /// under camera-relative control (`GravityMode::Flying`, the app's
     /// default) while the player drags the camera for the first two seconds
     /// and then lets go. Deterministic -- no RNG, no wall clock.
-    fn probe(kind: SceneKind) -> Report {
+    fn probe(kind: SceneKind, smart: bool) -> Report {
         let mut params = Params::new();
         let (object, _handles, _anim) = build_scene(kind, &mut params);
         let spawn = kind.spawn_params();
@@ -1554,7 +1577,7 @@ mod scene_probe {
                 aspect: 16.0 / 9.0,
                 target_fraction: POINTER_TARGET_FRACTION,
                 dt,
-                smart: true,
+                smart,
             };
             solve(&mut rig, &mut inp, &sdf);
             orbit.orientation = inp.intent;
@@ -1613,15 +1636,38 @@ mod scene_probe {
             SceneKind::HollowDonut,
         ];
         println!(
-            "{:<26} {:>7} {:>7} {:>7} {:>9} {:>9} {:>9} {:>6} {:>7} {:>7}",
-            "scene", "minVis", "meanVis", "blocked", "minClear", "minSize", "maxSize", "close", "maxDev", "travel"
+            "{:<26} {:>5} {:>7} {:>7} {:>7} {:>9} {:>9} {:>9} {:>6} {:>7} {:>7}",
+            "scene", "mode", "minVis", "meanVis", "blocked", "minClear", "minSize", "maxSize", "close", "maxDev", "travel"
         );
         let mut failures = Vec::new();
         for kind in scenes {
-            let r = probe(kind);
+            // The `smart: false` row is the A/B baseline (`?smartcam=0`):
+            // the same framing rule, with every geometry-aware behavior
+            // switched off. It is printed, never asserted on -- it is
+            // *expected* to bury the eye in geometry and lose sight of the
+            // marble, and that difference is the measurement.
+            let base = probe(kind, false);
             println!(
-                "{:<26} {:>7.3} {:>7.3} {:>6}/{} {:>9.4} {:>9.3} {:>9.3} {:>6} {:>6.0}d {:>7.2}  steps={:.1}",
+                "{:<26} {:>5} {:>7.3} {:>7.3} {:>6}/{} {:>9.4} {:>9.3} {:>9.3} {:>6} {:>6.0}d {:>7.2}  steps={:.1}",
+                base.scene,
+                "off",
+                base.min_visibility,
+                base.mean_visibility,
+                base.frames_blocked,
+                base.frames,
+                base.min_clearance,
+                base.min_screen_fraction,
+                base.max_screen_fraction,
+                base.frames_too_close,
+                base.max_deviation_deg,
+                base.distance_travel,
+                base.mean_steps,
+            );
+            let r = probe(kind, true);
+            println!(
+                "{:<26} {:>5} {:>7.3} {:>7.3} {:>6}/{} {:>9.4} {:>9.3} {:>9.3} {:>6} {:>6.0}d {:>7.2}  steps={:.1}",
                 r.scene,
+                "on",
                 r.min_visibility,
                 r.mean_visibility,
                 r.frames_blocked,

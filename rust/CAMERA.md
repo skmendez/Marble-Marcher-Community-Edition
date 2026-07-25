@@ -735,22 +735,39 @@ associated `basis_from`, so the realized camera can share it.
 ### What it measures
 
 `smart_camera::scene_probe` drives every scene through the real physics with
-a scripted movement + camera-drag script and reports what the camera did.
-`cargo test -p marble-marcher-bevy scene_probe -- --nocapture`:
+a scripted movement + camera-drag script, once with the solver on and once
+with it off (`?smartcam=0`: same framing rule, no geometry awareness), and
+reports what the camera did. `cargo test -p marble-marcher-bevy scene_probe
+-- --nocapture`:
 
-| scene | min vis | mean vis | frames blocked | min eye clearance | screen size | `de` steps/frame |
+| scene | smart | mean vis | frames blocked | min eye clearance | screen size | `de` steps/frame |
 |---|---|---|---|---|---|---|
-| demo | 1.00 | 1.00 | 0/480 | 0.013 | 0.16–0.19 | 4.2 |
-| classic_only | 1.00 | 1.00 | 0/480 | 0.020 | 0.167 | 3.0 |
-| menger_sponge | 1.00 | 1.00 | 0/480 | 0.106 | 0.16–0.17 | 4.5 |
-| menger_sphere | 1.00 | 1.00 | 0/480 | 0.106 | 0.16–0.17 | 4.5 |
-| menger_oscillating_sphere | 1.00 | 1.00 | 0/480 | 0.081 | 0.15–0.23 | 4.0 |
-| hollow_donut | 0.00 | 0.86 | 66/480 | 0.026 | 0.16–0.90 | 13.6 |
+| demo | off | 1.00 | 0/480 | +0.010 | 0.167 | 4.1 |
+| demo | **on** | 1.00 | 0/480 | +0.013 | 0.16–0.19 | 4.2 |
+| classic_only | off | 1.00 | 0/480 | +0.020 | 0.167 | 2.9 |
+| classic_only | **on** | 1.00 | 0/480 | +0.020 | 0.167 | 3.0 |
+| menger_sponge | off | 1.00 | 0/480 | +0.155 | 0.167 | 4.0 |
+| menger_sponge | **on** | 1.00 | 0/480 | +0.106 | 0.16–0.17 | 4.5 |
+| menger_sphere | off | 1.00 | 0/480 | +0.155 | 0.167 | 4.0 |
+| menger_sphere | **on** | 1.00 | 0/480 | +0.106 | 0.16–0.17 | 4.5 |
+| menger_oscillating_sphere | off | 1.00 | 0/480 | **−0.008** | 0.167 | 4.0 |
+| menger_oscillating_sphere | **on** | 1.00 | 0/480 | +0.081 | 0.15–0.23 | 4.0 |
+| hollow_donut | off | **0.59** | **192/480** | **−0.149** | 0.167 | 7.0 |
+| hollow_donut | **on** | 0.86 | 66/480 | +0.026 | 0.16–0.90 | 13.6 |
+
+The two rows that matter are the ones where geometry actually crowds the
+camera. Without the solver, the eye ends up *inside* the fractal in
+`menger_oscillating_sphere` and 0.15 deep inside the shell in
+`hollow_donut`, where the marble is also lost behind geometry for 40% of the
+run. With it, the eye is outside the geometry in every scene on every frame,
+and the donut's blocked frames drop by two thirds. Where nothing is in the
+way — the four open scenes — the two cameras agree to within a few percent
+and the solver costs a fraction of a `de` evaluation per frame.
 
 Screen size is the fraction of the shorter screen dimension, against a
-target of 0.167. Eye clearance is the distance field at the eye: positive
-everywhere, in every scene, for every frame — invariant I2 holds in
-practice, not just in the analytic-world tests.
+target of 0.167. Eye clearance is the distance field at the eye — invariant
+I2, holding in practice on real fractal geometry and not just in the
+analytic-world unit tests.
 
 Cost is well under the §6 budget: 3–5 `de` evaluations per frame in the open
 scenes (the budget assumed up to 24), ~14 in the tube where the search
