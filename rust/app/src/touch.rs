@@ -16,7 +16,8 @@
 use bevy::input::touch::Touches;
 use bevy::prelude::*;
 
-use crate::camera::CameraOrbit;
+use crate::camera::{apply_drag, apply_roll, CameraOrbit};
+use crate::smart_camera::CameraRig;
 
 /// A minimal, owned snapshot of one touch's current and previous-frame
 /// position — decoupled from `bevy::input::touch::Touch` (a borrowed,
@@ -201,6 +202,7 @@ pub struct TouchDebugInfo {
 pub fn touch_camera_input(
     touches: Res<Touches>,
     mut orbit: ResMut<CameraOrbit>,
+    mut rig: ResMut<CameraRig>,
     mut debug: ResMut<TouchDebugInfo>,
     mut twist_debug: ResMut<crate::fps_overlay::DebugTwistAccum>,
 ) {
@@ -213,15 +215,20 @@ pub fn touch_camera_input(
         if let Some(touch) = touches.iter().next() {
             let delta = touch.delta();
             debug.swipe_delta = Some(delta);
-            if let Some((screen_dir, angle)) = orbit.drag_intermediates(delta) {
+            // Read against the *realized* basis -- what the finger is
+            // actually swiping across on screen (`CameraOrbit::drag_rotation`'s
+            // doc) -- and applied to intent and realized alike.
+            if let Some((screen_dir, angle)) =
+                CameraOrbit::drag_intermediates_from(rig.orientation, delta)
+            {
                 debug.screen_dir = Some(screen_dir);
                 debug.angle_deg = Some(angle.to_degrees());
             }
-            orbit.drag(delta);
+            apply_drag(&mut orbit, &mut rig, delta);
         }
     } else if active_count >= 2 {
         if let Some(gesture) = read_two_finger_gesture(&touches) {
-            orbit.roll(gesture.rotate_delta);
+            apply_roll(&mut orbit, &mut rig, gesture.rotate_delta);
             twist_debug.0 += gesture.rotate_delta;
         }
     }

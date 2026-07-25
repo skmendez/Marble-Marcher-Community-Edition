@@ -347,6 +347,8 @@ fn update_phase_timings_text(
 
 fn update_orbit_debug_text(
     orbit: Res<crate::camera::CameraOrbit>,
+    rig: Res<crate::smart_camera::CameraRig>,
+    config: Res<crate::config::Config>,
     twist_debug: Res<DebugTwistAccum>,
     touch_debug: Res<crate::touch::TouchDebugInfo>,
     mut text: Query<&mut Text, With<OrbitDebugText>>,
@@ -354,7 +356,7 @@ fn update_orbit_debug_text(
     let Ok(mut text) = text.single_mut() else {
         return;
     };
-    let f = orbit.forward();
+    let f = rig.orientation * Vec3::NEG_Z;
     // `touches` line always shows the live count (0/1/2+), and the raw
     // swipe delta + the arcball formula's real intermediates (`screen_dir`,
     // `angle`) whenever a single-finger swipe actually happened this frame
@@ -368,8 +370,30 @@ fn update_orbit_debug_text(
         ),
         _ => format!("touches: {}", touch_debug.active_count),
     };
+    // Smart-camera readout (`smart_camera::RigDebug`): everything needed to
+    // answer "why is the camera where it is?" from a screenshot -- how much
+    // of the marble is visible, how far back geometry allows vs how far back
+    // framing wants, the marble's actual on-screen size against the target,
+    // how far the realized camera has had to deviate from the player's
+    // intent, and how much clearance the eye itself has (negative would mean
+    // the camera is inside geometry, i.e. a broken invariant).
+    let d = rig.debug;
+    let camera_line = format!(
+        "{}: vis {:.2} d {:.3}/{:.3} (free {:.3}) size {:.3} dev {:.0}deg clr {:.3} f {:.2} zoom {:.2} steps {}",
+        config.scene.name(),
+        d.visibility,
+        rig.distance,
+        d.desired_distance,
+        d.free_distance,
+        d.screen_fraction,
+        d.deviation.to_degrees(),
+        d.eye_clearance,
+        rig.focal_length,
+        orbit.zoom,
+        d.steps,
+    );
     let new_text = format!(
-        "twist: {:.1}deg forward: ({:.3}, {:.3}, {:.3})\n{touch_line}",
+        "twist: {:.1}deg forward: ({:.3}, {:.3}, {:.3})\n{camera_line}\n{touch_line}",
         twist_debug.0.to_degrees(),
         f.x,
         f.y,

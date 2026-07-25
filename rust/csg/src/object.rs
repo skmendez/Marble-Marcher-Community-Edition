@@ -179,8 +179,8 @@ impl Object {
     /// buffer across calls instead of paying a fresh heap allocation each
     /// time. Requires `hist` to already be empty on entry (the caller's
     /// responsibility -- a fresh `Vec::new()`, or a buffer proven empty by a
-    /// prior call's own `debug_assert!` below) and guarantees it's empty
-    /// again on return. **Deliberately does not clear `hist` itself**: a
+    /// prior call's own `debug_assert!` below) and guarantees it's back at
+    /// whatever depth it was on entry when it returns. **Deliberately does not clear `hist` itself**: a
     /// `Fractal` node's `base` can itself be a nested `Fractal`, which must
     /// share (not reset) this same buffer as a proper push/pop stack across
     /// the whole recursion -- clearing on entry would wipe an outer, still
@@ -193,11 +193,26 @@ impl Object {
                 p.truncate().clamp(-he, he)
             }
             Object::Fractal { fold, base } => {
+                // The invariant is that this node's own fold pushes and pops
+                // in balance -- i.e. the stack comes back to the depth it was
+                // at on entry, NOT that it is empty. Those are the same thing
+                // only for a top-level `Fractal`; for a nested one (this
+                // crate has a shipped example: `scenes::hollow_donut` is a
+                // `Fractal` whose base contains the skylight `Fractal`), the
+                // outer fold's own history is legitimately still on the stack
+                // while the inner one runs, and asserting emptiness there
+                // panics on entirely correct behavior. Found by the smart
+                // camera's per-scene probe harness
+                // (`app/src/smart_camera.rs`'s `scene_probe`), which drives
+                // the marble into contact with the skylight -- the one place
+                // `Difference` picks the inner fractal as the winning side.
+                // Debug-only either way, so no shipped build ever hit it.
+                let depth_on_entry = hist.len();
                 let mut pp = p;
                 fold.fold_with_history(&mut pp, hist, params);
                 let mut n = base.nearest_point_scratch(pp, params, hist);
                 fold.unfold(hist, &mut n, params);
-                debug_assert!(hist.is_empty(), "fold history not fully consumed");
+                debug_assert_eq!(hist.len(), depth_on_entry, "fold history not fully consumed");
                 n
             }
             Object::Union(left, right) => {

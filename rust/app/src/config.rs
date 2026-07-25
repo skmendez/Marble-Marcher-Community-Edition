@@ -73,6 +73,28 @@ pub struct Config {
     /// on top (`Settings.h`'s `exposure`/`auto_exposure_*`); this is the
     /// fixed-value starting point.
     pub exposure: f32,
+    /// `?smartcam=0`/`MM_SMARTCAM=0` disables the geometry-aware half of
+    /// the camera (`smart_camera.rs`): deocclusion, clearance pull-in,
+    /// damping, FOV compensation. The framing rule (marble sized to the
+    /// screen rather than to a hand-tuned per-scene distance) stays on
+    /// either way -- it has no failure mode worth an escape hatch, whereas
+    /// the geometry-aware behaviors are the ones worth being able to A/B
+    /// against when diagnosing a feel complaint. Default on.
+    pub smart_camera: bool,
+    /// `MM_ALPHA_MODE=auto` selects `CompositeAlphaMode::Auto` instead of
+    /// the default `PreMultiplied` -- see `main.rs`'s `composite_alpha_mode`
+    /// for why the headless render path needs it. Default off.
+    pub alpha_mode_auto: bool,
+    /// `?autopilot=1`/`MM_AUTOPILOT=1` drives the marble and the camera from
+    /// a fixed script instead of from real input -- a wandering
+    /// camera-relative thrust, plus a slow camera drag for the first few
+    /// seconds. Purely a verification aid: a headless run
+    /// (`scripts/headless_screenshot.sh`) otherwise renders a marble sitting
+    /// perfectly still in `GravityMode::Flying`, which says nothing about
+    /// how the camera *follows*. Deterministic (driven by the physics tick,
+    /// not the wall clock) so two runs at different frame rates capture the
+    /// same moment. Default off.
+    pub autopilot: bool,
     /// `?material_gamma=<f>`/`MM_MATERIAL_GAMMA=<f>` -- the terrain-albedo
     /// gamma boost (`albedo = pow(albedo, 1/this)`, rides in
     /// `SceneUniforms::misc3.z`). Default 0.5 (albedo squared), matching
@@ -103,6 +125,9 @@ impl Config {
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| *v > 0.0)
                 .unwrap_or(1.0),
+            smart_camera: query_value("smartcam", "MM_SMARTCAM").as_deref() != Some("0"),
+            autopilot: query_value("autopilot", "MM_AUTOPILOT").as_deref() == Some("1"),
+            alpha_mode_auto: query_value("alpha_mode", "MM_ALPHA_MODE").as_deref() == Some("auto"),
             material_gamma: query_value("material_gamma", "MM_MATERIAL_GAMMA")
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| *v > 0.0)
@@ -131,6 +156,8 @@ mod tests {
         assert!(value != Some("1")); // res_oscillate
         assert!(value != Some("1")); // gpuprofile
         assert!(value != Some("1")); // stepheat
+        assert!(value != Some("0")); // smartcam's "default on" test
+        assert!(value != Some("1")); // autopilot
     }
 
     #[test]

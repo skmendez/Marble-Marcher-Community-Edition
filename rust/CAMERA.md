@@ -6,10 +6,12 @@ view of the marble, frames it at a sensible size, moves like a drone operator
 rather than a rigidly-attached boom, and still does exactly what the player
 asks it to.
 
-This is a design document, not an implementation record: nothing in
-`app/src/camera.rs` has changed yet. Everything below is written against the
-code as it exists today, with file/line references so each integration point
-is checkable.
+**Status: implemented** (`app/src/smart_camera.rs`, `csg/src/visibility.rs`).
+Sections 1-5 below are the design as written *before* implementation, kept as
+the record of the reasoning; §11 at the end lists what implementation
+changed, what it measured, and what is still missing. Where the two
+disagree, §11 is what the code does. File/line references in §1-5 are to the
+pre-implementation code and are left as they were.
 
 ---
 
@@ -664,3 +666,122 @@ Math:
 * [Iñigo Quilez, "Soft shadows in raymarched SDFs"](https://iquilezles.org/articles/rmshadows/) — `res = min(res, k·h/t)` and the closest-approach-corrected variant, adapted in §4.3(b).
 * [Ryan Juckett, "Damped springs"](https://www.ryanjuckett.com/damped-springs/) — the exact critically damped solution used in §4.4.
 * [Improved Lerp Smoothing — Game Developer](https://www.gamedeveloper.com/programming/improved-lerp-smoothing-) — frame-rate-independent exponential smoothing.
+
+---
+
+## 11. What implementation changed
+
+Built in this order: `csg/src/visibility.rs` (the sphere-trace queries),
+`app/src/smart_camera.rs` (the solver + its Bevy system), then the wiring
+(`render.rs` reads the rig, `physics_sys.rs` takes its control frame from
+it, `camera.rs` keeps the intent and drives both). 210 tests pass
+(`cargo test -p marble-csg -p marble-marcher-bevy`); all six scenes were
+rendered headlessly and checked.
+
+### Corrections to the design
+
+**Visibility is measured only as far as the camera can actually go** (§4.3
+assumed one march to the *intended* distance). Marching past
+`free_distance` counts geometry the camera will never be in front of: a
+camera with its back to a wall reads as permanently blocked, and the solver
+slides around for no reason. `sweep` is now two passes — pass 1 finds the
+reachable distance stepping by `h - camera_radius` (which is also what makes
+the swept-ball test sound *between* samples, not just at them; a plain
+`t += h` step let the eye clip walls the sweep called clear), pass 2
+measures visibility over `[r, free_distance]` with the eye at
+`free_distance`, so the perspective term uses the real eye position rather
+than the hoped-for one. The distinction matters: "something is in the way"
+and "there is a wall behind me" call for opposite responses.
+
+**The push-out hold keys off the goal tightening**, not off the view being
+clear (§4.4 said "clear for `PUSH_OUT_HOLD`"). Any measure of *current*
+clearness deadlocks in a busy space: one 0.95-visible frame every so often
+resets the timer forever and the camera, having pulled in once, never backs
+out again. Keying it off "did the constraint just move in?" gives the
+intended anti-pumping behavior without the deadlock.
+
+**A third search trigger: `cramped`.** §4.5 fires the whisker search only on
+sustained occlusion. But the common tight-space failure is a view that is
+perfectly *clear* and much too close — an unobstructed close-up looks
+entirely fine to occlusion logic, so nothing pushed the camera back out.
+`cramped` (free distance under half of what framing wants, for 0.4 s) is
+Cinemachine's shot-quality idea reduced to the part that matters here.
+
+**Searches commit, and repositions are held.** Re-running the search every
+frame and easing toward whatever won *that* frame thrashes between
+near-equal candidates; and once a reposition lands, the decay back toward
+intent immediately undoes it, since intent is what got the camera stuck in
+the first place. Fixed with a 0.4 s commitment plus a 2.5 s post-reposition
+lockout on the decay. Neither ever blocks the player: input writes the
+realized camera directly.
+
+**The deviation cap drags the intent along** rather than hauling the camera
+back (§4.5 floated this as a "soft-clamp"; it turned out to be required). A
+marble travelling down a curved tunnel rotates which directions are usable
+while the intent quaternion sits where the player last left it, so the
+deviation grows for reasons unrelated to the camera misbehaving — and at the
+cap, the camera is then forbidden from going anywhere it can see from.
+
+**The search's first candidate is the local clearance gradient** at the
+marble (`Sdf::outward`), not just the ring of rotations. In a tunnel that
+points straight into the open middle, where hill-climbing 40° at a time
+takes about a second and a half to arrive.
+
+**`CameraOrbit` keeps its name** (the design proposed renaming it to
+`CameraIntent`) — its doc now says what it is. Its `distance` field became
+`zoom`, a multiplier on the framed distance, and `eye_and_basis` became the
+associated `basis_from`, so the realized camera can share it.
+
+### What it measures
+
+`smart_camera::scene_probe` drives every scene through the real physics with
+a scripted movement + camera-drag script and reports what the camera did.
+`cargo test -p marble-marcher-bevy scene_probe -- --nocapture`:
+
+| scene | min vis | mean vis | frames blocked | min eye clearance | screen size | `de` steps/frame |
+|---|---|---|---|---|---|---|
+| demo | 1.00 | 1.00 | 0/480 | 0.013 | 0.16–0.19 | 4.2 |
+| classic_only | 1.00 | 1.00 | 0/480 | 0.020 | 0.167 | 3.0 |
+| menger_sponge | 1.00 | 1.00 | 0/480 | 0.106 | 0.16–0.17 | 4.5 |
+| menger_sphere | 1.00 | 1.00 | 0/480 | 0.106 | 0.16–0.17 | 4.5 |
+| menger_oscillating_sphere | 1.00 | 1.00 | 0/480 | 0.081 | 0.15–0.23 | 4.0 |
+| hollow_donut | 0.00 | 0.86 | 66/480 | 0.026 | 0.16–0.90 | 13.6 |
+
+Screen size is the fraction of the shorter screen dimension, against a
+target of 0.167. Eye clearance is the distance field at the eye: positive
+everywhere, in every scene, for every frame — invariant I2 holds in
+practice, not just in the analytic-world tests.
+
+Cost is well under the §6 budget: 3–5 `de` evaluations per frame in the open
+scenes (the budget assumed up to 24), ~14 in the tube where the search
+actually runs. The `?debug=1` overlay reports the camera phase at 0.01 ms.
+
+### Known limits
+
+**HollowDonut is the hard case and is not fully solved.** Inside a closed
+tube whose interior free radius is `0.85`, with a `0.15` marble that spends
+the probe run pressed against the wall, the framing rule's `1.36` barely
+fits across the tube at all. The camera keeps the marble visible (86% mean
+visibility, no frames where it is lost for long) and never enters geometry,
+but spends much of the run closer than the framing rule wants — up to 0.9 of
+the frame at worst. FOV widening recovers part of it. Two things make it
+genuinely hard rather than merely untuned: the usable directions sweep
+around the tube as the marble circles it, so the reposition is a chase
+against a moving target; and the marble's thrust is camera-relative, so the
+camera's own motion feeds back into where the marble goes. Ideas not yet
+tried: preferring directions whose usefulness is *stable* under marble
+motion (the tube's axial direction, rather than its radial one), and the
+x-ray fallback below.
+
+**Not implemented from the design:** the x-ray/silhouette marble fallback
+(§4.8's second lever — the shader work is small and the hooks are all
+there), the screen-space dead zone and velocity lead (§4.6 — the focus
+spring plus a hard lag clamp covers the jitter case), and idle auto-follow
+(§4.7 — deliberately: there is no world "up" or "behind" in `Flying` mode
+for it to mean anything).
+
+**A pre-existing bug this work surfaced:** `Object::nearest_point_scratch`
+asserted its fold-history stack was *empty* on return from a `Fractal` node,
+which is only true for a top-level one. `scenes::hollow_donut` nests a
+`Fractal` (the skylight) inside another, so any physics contact there
+panicked in debug builds. Now asserts the stack returned to its entry depth.

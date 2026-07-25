@@ -18,6 +18,8 @@
 //!  - `scenes`   (M2): prebuilt scenes (classic Marble Marcher fractal, etc.)
 //!  - `codegen`  (M3): WGSL generation from an `Object` tree
 //!  - `physics`  (M5): marble/collider simulation against an `Object`
+//!  - `visibility` (smart camera): line-of-sight / clearance sphere traces
+//!    against an `Object` — see `rust/CAMERA.md`
 //!  - `expr`     (animated fractals): a small deterministic, serializable
 //!    expression tree for driving a `Param` from the shared `Tick` clock —
 //!    see its module doc for why this has to share the rollback crate's
@@ -36,6 +38,7 @@ pub mod physics;
 pub mod scene;
 pub mod scene_sync;
 pub mod scenes;
+pub mod visibility;
 
 pub use fold::Fold;
 pub use object::Object;

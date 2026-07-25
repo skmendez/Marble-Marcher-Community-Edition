@@ -28,6 +28,10 @@
 #    Bevy fall back to resolving `assets/` next to the *executable*
 #    (target/debug/assets, which doesn't exist), silently breaking every
 #    asset load -- including the marble cubemap. Point it at the app crate.
+#  - MM_ALPHA_MODE=auto: lavapipe's X11 surface advertises only
+#    [Opaque, Inherit] alpha modes, and wgpu treats an unsupported one as a
+#    fatal validation error, so the app's default (PreMultiplied, a macOS
+#    compositor-freeze mitigation) has to be overridden here.
 #  - MM_WINDOW_SIZE: small window -- this per-pixel ray marcher is far
 #    slower on a CPU rasterizer than on GPU hardware (480x360 still reached
 #    ~28 FPS on llvmpipe in an 8-core container, so this is comfortable).
@@ -63,6 +67,7 @@ MM_SCREENSHOT="$OUT" \
 MM_SCREENSHOT_DELAY_SECS="$DELAY" \
 MM_WINDOW_SIZE="$SIZE" \
 MM_MRRM=0 \
+MM_ALPHA_MODE=auto \
 WGPU_BACKEND=vulkan \
 xvfb-run -a target/debug/marble-marcher-bevy
 

@@ -64,6 +64,7 @@ use crate::camera::CameraOrbit;
 use crate::gpu::{MarcherFrameData, MarcherGpuBuffers};
 use crate::mrrm::{CoarseMarcherMaterial, CoarseQuad};
 use crate::physics_sys::{MarbleState, MultiplayerSession, PendingSceneSync};
+use crate::smart_camera::CameraRig;
 use crate::shadow_pass::{ShadowMarcherMaterial, ShadowQuad};
 
 /// Which scene to build, selected via
@@ -143,6 +144,20 @@ impl SceneKind {
     /// scene is ever added later.
     pub fn has_marble(self) -> bool {
         true
+    }
+
+    /// Short human-readable name -- for the `?debug=1` overlay's scene line
+    /// and the camera probe harness's per-scene report
+    /// (`smart_camera::scene_probe`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Demo => "demo",
+            Self::ClassicOnly => "classic_only",
+            Self::MengerSponge => "menger_sponge",
+            Self::MengerSphere => "menger_sphere",
+            Self::MengerOscillatingSphere => "menger_oscillating_sphere",
+            Self::HollowDonut => "hollow_donut",
+        }
     }
 
     /// Where/how big the marble starts, and where the (`Rolling`-mode-only)
@@ -1007,6 +1022,83 @@ fn pack_marbles(marbles: &[Marble]) -> Vec<Vec4> {
     marbles.iter().map(|m| m.pos.extend(m.rad)).collect()
 }
 
+/// Builds a scene's CSG tree, its parameter table's initial values, and any
+/// tick-driven animations — everything about a scene that is pure data, with
+/// no rendering resources involved.
+///
+/// Split out of [`setup`] (which is a Bevy system, and therefore needs a
+/// live `App` to call) so the same scenes can be constructed by tests and
+/// offline harnesses: `smart_camera`'s per-scene camera probe walks a
+/// scripted marble path through every one of these and checks what the
+/// camera does, which is not something that can be asserted from inside a
+/// headless render.
+pub fn build_scene(kind: SceneKind, params: &mut Params) -> (Object, SceneHandles, Vec<(ScalarParam, Expr)>) {
+    let mut animations: Vec<(ScalarParam, Expr)> = Vec::new();
+    let (object, handles) = match kind {
+
+        SceneKind::Demo => {
+            let (object, classic_handles) = demo_scene(params);
+            set_fractal_params(
+                params,
+                &classic_handles,
+                beware_of_bumps::SCALE,
+                beware_of_bumps::ANG1,
+                beware_of_bumps::ANG2,
+                beware_of_bumps::SHIFT,
+                beware_of_bumps::COLOR,
+                beware_of_bumps::ITERS,
+            );
+            (object, SceneHandles::Classic(classic_handles))
+        }
+        SceneKind::ClassicOnly => {
+            let (object, classic_handles) = classic(params);
+            set_fractal_params(
+                params,
+                &classic_handles,
+                beware_of_bumps::SCALE,
+                beware_of_bumps::ANG1,
+                beware_of_bumps::ANG2,
+                beware_of_bumps::SHIFT,
+                beware_of_bumps::COLOR,
+                beware_of_bumps::ITERS,
+            );
+            (object, SceneHandles::Classic(classic_handles))
+        }
+        SceneKind::MengerSponge => {
+            let (object, menger_handles) = menger_sponge(params);
+            set_menger_params(params, &menger_handles, MENGER_DEPTH, MENGER_SPONGE_COLOR);
+            (object, SceneHandles::Menger(menger_handles))
+        }
+        SceneKind::MengerSphere => {
+            let (object, menger_handles) = menger_sphere(params);
+            set_menger_params(params, &menger_handles, MENGER_DEPTH, MENGER_SPHERE_COLOR);
+            (object, SceneHandles::Menger(menger_handles))
+        }
+        SceneKind::MengerOscillatingSphere => {
+            let (object, osc_handles) = menger_oscillating_sphere(params);
+            set_menger_params(
+                params,
+                &osc_handles.menger,
+                MENGER_DEPTH,
+                MENGER_OSCILLATING_SPHERE_COLOR,
+            );
+            // The physics tick overwrites this every tick once it starts
+            // running; the initial value just needs to match what
+            // `radius_anim` evaluates to at tick 0 (MENGER_BITE_MIN_RADIUS)
+            // so the very first rendered frame, before any tick has run,
+            // isn't briefly wrong.
+            params.set_scalar(osc_handles.radius, MENGER_BITE_MIN_RADIUS);
+            animations.push((osc_handles.radius, osc_handles.radius_anim.clone()));
+            (object, SceneHandles::MengerOscillatingSphere(osc_handles))
+        }
+        SceneKind::HollowDonut => {
+            let (object, donut_handles) = hollow_donut(params);
+            (object, SceneHandles::HollowDonut(donut_handles))
+        }
+    };
+    (object, handles, animations)
+}
+
 /// Startup system: builds the selected scene (`config.scene`), generates
 /// its WGSL, and spawns the fullscreen quad that renders it (DESIGN.md §8).
 #[allow(clippy::too_many_arguments)]
@@ -1025,127 +1117,42 @@ pub fn setup(
     let kind = config.scene;
     let mut params = Params::new();
 
-    // CameraOrbit::default() is tuned for the Demo scene specifically (aimed
-    // at the marble's actual resting-surface normal, at a marble_rad-scaled
-    // distance — see its doc comment). The static display fractals are a
-    // completely different world scale (menger_sponge/menger_sphere are
-    // roughly unit-scale after their final 0.33 shrink), so that default's
-    // yaw/pitch/distance don't make sense here — use a view tuned for these
-    // scenes' own scale instead.
+    // `CameraOrbit::default()`'s starting *direction* is tuned for the Demo
+    // scene (aimed at the marble's resting-surface normal — see its doc);
+    // the static display fractals are a completely different world scale, so
+    // they get their own starting direction here.
     //
-    // `yaw`/`pitch` were originally chosen (at `distance = 3.0`, then later
-    // `6.0`) to find an *un-embedded* view of the sponge's exterior corner:
-    // an early attempt at `distance = 3.0` put the camera close enough that
-    // most of a 32x18 probe grid hit the surface within `t ~= 0.4` world
-    // units, giving a normal-estimation epsilon (`1e-4 * max(t, 0.05)`) so
-    // tiny that `calc_normal`'s central difference was dominated by float32
-    // noise -- ~85% of sampled pixels had a degenerate raw normal, the exact
-    // speckle/static look. This was reproduced identically across
-    // `MENGER_DEPTH` 2..14 (recursion depth wasn't the cause), confirming a
-    // "camera embedded in/hugging the geometry" problem specific to being
-    // too close along *this* yaw/pitch's view ray -- the same yaw/pitch is
-    // kept here since it's a verified-safe viewing angle of the corner.
+    // What used to also live here was a per-scene *distance* override
+    // (`0.2` demo / `1.2` Menger / `0.6` HollowDonut), each hand-picked by
+    // screenshot to frame that scene's marble without embedding the eye in
+    // geometry. Those are gone: `smart_camera` derives distance from the
+    // marble's radius, the window's aspect and the input modality (so it is
+    // right on a phone and on a desktop, and right for a `rad = 0.02` marble
+    // and a `rad = 0.15` one), then lets the clearance solver shorten it
+    // wherever geometry demands — which is exactly what HollowDonut's `0.6`
+    // was manually encoding (the tube's interior free radius is `0.85`) and
+    // what the Menger scenes' comments describe as avoiding "embedded-camera
+    // speckle". `rust/CAMERA.md` §4.2 compares the rule's output against all
+    // three of those hand-tuned values.
     //
-    // `distance = 1.2` is tuned relative to the marble's spawn point
-    // (`spawn_params`, not the origin): since the camera always orbits
-    // `marble.pos` (`update_material`), and the marble now spawns in the
-    // open-air pocket just in front of the corner (see `spawn_params`'s doc
-    // for why, and how that point was found) rather than deep inside the
-    // sponge, this is a close, marble-centric framing -- similar in spirit
-    // to the Demo scene's own close default -- verified visually to show
-    // the marble prominently with the corner as a backdrop, no
-    // embedded-camera speckle.
+    // The yaw/pitch below is still worth keeping: the Menger scenes' verified
+    // exterior-corner view is a genuinely better opening shot than the demo
+    // scene's, and a starting direction is a preference, not a constraint —
+    // the camera will deocclude its way out of a bad one on its own now.
     let is_menger = matches!(
         kind,
         SceneKind::MengerSponge | SceneKind::MengerSphere | SceneKind::MengerOscillatingSphere
     );
     if is_menger {
         camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35);
-        // Same close, marble-centric `distance = 1.2` for all three Menger
-        // scenes now (see the doc above) -- `MengerOscillatingSphere` used
-        // to pull back to `9.0` to frame the whole ~6-unit sponge from
-        // outside, since its old corner spawn point never went anywhere
-        // near the bite sphere's effect. Now that it spawns at the center
-        // instead (`spawn_params`'s doc), close framing is the right shot
-        // again: the marble sits right where the hollowing-out is actually
-        // happening, so there's no need to zoom out to see it happen.
-        camera_orbit.distance = 1.2;
     }
     if kind == SceneKind::HollowDonut {
-        // The camera lives *inside* the tube with the marble (interior free
-        // radius `DONUT_MINOR_RADIUS - DONUT_THICKNESS = 0.85`), so the
-        // orbit distance must stay under that or the eye embeds in the
-        // shell wall (the same embedded-camera speckle failure the Menger
-        // distance tuning above documents). `0.6` from a tube-center spawn
-        // leaves `~0.25` of wall clearance at any orbit angle; a mild
-        // yaw/pitch angles the ring's curve into view rather than staring
-        // straight down the tube axis.
+        // A mild yaw/pitch angles the ring's curve into view rather than
+        // staring straight down the tube axis.
         camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(0.5, 0.2);
-        camera_orbit.distance = 0.6;
     }
 
-    let mut animations: Vec<(ScalarParam, Expr)> = Vec::new();
-    let (object, handles) = match kind {
-        SceneKind::Demo => {
-            let (object, classic_handles) = demo_scene(&mut params);
-            set_fractal_params(
-                &mut params,
-                &classic_handles,
-                beware_of_bumps::SCALE,
-                beware_of_bumps::ANG1,
-                beware_of_bumps::ANG2,
-                beware_of_bumps::SHIFT,
-                beware_of_bumps::COLOR,
-                beware_of_bumps::ITERS,
-            );
-            (object, SceneHandles::Classic(classic_handles))
-        }
-        SceneKind::ClassicOnly => {
-            let (object, classic_handles) = classic(&mut params);
-            set_fractal_params(
-                &mut params,
-                &classic_handles,
-                beware_of_bumps::SCALE,
-                beware_of_bumps::ANG1,
-                beware_of_bumps::ANG2,
-                beware_of_bumps::SHIFT,
-                beware_of_bumps::COLOR,
-                beware_of_bumps::ITERS,
-            );
-            (object, SceneHandles::Classic(classic_handles))
-        }
-        SceneKind::MengerSponge => {
-            let (object, menger_handles) = menger_sponge(&mut params);
-            set_menger_params(&mut params, &menger_handles, MENGER_DEPTH, MENGER_SPONGE_COLOR);
-            (object, SceneHandles::Menger(menger_handles))
-        }
-        SceneKind::MengerSphere => {
-            let (object, menger_handles) = menger_sphere(&mut params);
-            set_menger_params(&mut params, &menger_handles, MENGER_DEPTH, MENGER_SPHERE_COLOR);
-            (object, SceneHandles::Menger(menger_handles))
-        }
-        SceneKind::MengerOscillatingSphere => {
-            let (object, osc_handles) = menger_oscillating_sphere(&mut params);
-            set_menger_params(
-                &mut params,
-                &osc_handles.menger,
-                MENGER_DEPTH,
-                MENGER_OSCILLATING_SPHERE_COLOR,
-            );
-            // The physics tick overwrites this every tick once it starts
-            // running; the initial value just needs to match what
-            // `radius_anim` evaluates to at tick 0 (MENGER_BITE_MIN_RADIUS)
-            // so the very first rendered frame, before any tick has run,
-            // isn't briefly wrong.
-            params.set_scalar(osc_handles.radius, MENGER_BITE_MIN_RADIUS);
-            animations.push((osc_handles.radius, osc_handles.radius_anim.clone()));
-            (object, SceneHandles::MengerOscillatingSphere(osc_handles))
-        }
-        SceneKind::HollowDonut => {
-            let (object, donut_handles) = hollow_donut(&mut params);
-            (object, SceneHandles::HollowDonut(donut_handles))
-        }
-    };
+    let (object, handles, animations) = build_scene(kind, &mut params);
 
     let wgsl = generate_shader(&object);
     shaders.insert(
@@ -1353,6 +1360,7 @@ pub fn setup(
 #[allow(clippy::too_many_arguments)]
 pub fn apply_pending_scene_sync(
     mut pending_scene: ResMut<PendingSceneSync>,
+    mut rig: ResMut<CameraRig>,
     mut scene_state: ResMut<SceneState>,
     mut mp: ResMut<MultiplayerSession>,
     mut marble_state: ResMut<MarbleState>,
@@ -1369,6 +1377,13 @@ pub fn apply_pending_scene_sync(
         warn!("multiplayer: received an undecodable scene-sync payload -- ignoring it");
         return;
     };
+
+    // The world is about to be replaced wholesale (and the local marble
+    // teleported to wherever the host says it is): snap the camera rather
+    // than letting its springs sweep across a level that no longer exists,
+    // and re-derive the framing distance for whatever marble radius the new
+    // scene uses.
+    rig.reset();
 
     let wgsl = generate_shader(&scene.object);
     shaders.insert(MARCHER_SHADER_HANDLE.id(), Shader::from_wgsl(wgsl, "generated://marcher.wgsl"));
@@ -1492,7 +1507,7 @@ const ROTATION_PERIOD_TICKS: u64 = 120;
 #[allow(clippy::too_many_arguments)]
 pub fn update_frame_data(
     time: Res<Time>,
-    orbit: Res<CameraOrbit>,
+    rig: Res<CameraRig>,
     marble_state: Res<MarbleState>,
     mp: Res<MultiplayerSession>,
     config: Res<crate::config::Config>,
@@ -1510,7 +1525,7 @@ pub fn update_frame_data(
     let start = web_time::Instant::now();
     update_frame_data_impl(
         time,
-        orbit,
+        rig,
         marble_state,
         mp,
         config,
@@ -1539,7 +1554,7 @@ pub fn update_frame_data(
 #[allow(clippy::too_many_arguments)] // SystemParam count, one more for the marble-rotation tick source
 fn update_frame_data_impl(
     time: Res<Time>,
-    orbit: Res<CameraOrbit>,
+    rig: Res<CameraRig>,
     marble_state: Res<MarbleState>,
     mp: Res<MultiplayerSession>,
     config: Res<crate::config::Config>,
@@ -1587,9 +1602,14 @@ fn update_frame_data_impl(
     let resolution_height = fine_render_target.active_size.y as f32;
 
     // Every scene has a real marble now (`SceneKind::has_marble`): the
-    // camera always follows the local player's.
-    let target = marble_state.local_marble().pos;
-    let (eye, right, up, forward) = orbit.eye_and_basis(target);
+    // camera always follows the local player's -- but through
+    // `smart_camera::CameraRig` (the *realized* camera: framed, deoccluded,
+    // damped) rather than straight off `CameraOrbit` (the player's intent),
+    // which is why this no longer passes the marble position in itself. The
+    // rig's own smoothed focus point is what it looks at, and it has already
+    // been solved for this frame (`main.rs`'s `Update` chain orders
+    // `smart_camera_solve` before this system).
+    let (eye, right, up, forward) = rig.eye_and_basis();
 
     // Marble cubemap Y-axis rotation, 1 revolution per `ROTATION_PERIOD_TICKS`
     // (2 seconds at the 60Hz physics tick) -- deterministic function of
@@ -1605,7 +1625,13 @@ fn update_frame_data_impl(
         cam_pos: eye.extend(0.0),
         cam_right: right.extend(0.0),
         cam_up: up.extend(0.0),
-        cam_forward: forward.extend(1.5),
+        // `cam_forward.w` is the focal length (`1/tan(halfFOV)`). No longer
+        // a literal: the smart camera widens the FOV when geometry forces
+        // the eye closer than the framing rule wanted, which is what keeps
+        // the marble a sensible size on screen inside a tunnel
+        // (`smart_camera`'s doc, §4.8 of rust/CAMERA.md). Equals
+        // `camera::FOCAL_LENGTH` whenever nothing is crowding the camera.
+        cam_forward: forward.extend(rig.focal_length),
         bounding: scene_state.bounding_sphere,
         ..SceneUniforms::default()
     };

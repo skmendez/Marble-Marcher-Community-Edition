@@ -27,8 +27,27 @@ impl Plugin for DebugScreenshotPlugin {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5.0);
-        app.insert_resource(ScreenshotConfig { path, delay_secs })
-            .add_systems(Update, take_screenshot_once);
+        // A *sequence* of captures, `MM_SCREENSHOT_INTERVAL_SECS` apart,
+        // written as `path.0.png`, `path.1.png`, ... when more than one is
+        // asked for. One still says whether the renderer works; a filmstrip
+        // is what actually shows a camera *following* something, which a
+        // single frame cannot.
+        let count: u32 = std::env::var("MM_SCREENSHOT_COUNT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let interval_secs = std::env::var("MM_SCREENSHOT_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3.0);
+        app.insert_resource(ScreenshotConfig {
+            path,
+            delay_secs,
+            count: count.max(1),
+            interval_secs,
+        })
+        .insert_resource(ScreenshotProgress::default())
+        .add_systems(Update, take_screenshot_once);
     }
 }
 
@@ -36,27 +55,44 @@ impl Plugin for DebugScreenshotPlugin {
 struct ScreenshotConfig {
     path: String,
     delay_secs: f32,
+    count: u32,
+    interval_secs: f32,
 }
 
-#[derive(Resource)]
-struct AlreadyTaken;
+#[derive(Resource, Default)]
+struct ScreenshotProgress {
+    taken: u32,
+}
 
 fn take_screenshot_once(
     mut commands: Commands,
     config: Res<ScreenshotConfig>,
     time: Res<Time>,
-    already_taken: Option<Res<AlreadyTaken>>,
+    mut progress: ResMut<ScreenshotProgress>,
 ) {
-    if already_taken.is_some() || time.elapsed_secs() < config.delay_secs {
+    let due_at = config.delay_secs + progress.taken as f32 * config.interval_secs;
+    if progress.taken >= config.count || time.elapsed_secs() < due_at {
         return;
     }
-    commands.insert_resource(AlreadyTaken);
-    let path = config.path.clone();
-    commands
-        .spawn(Screenshot::primary_window())
-        .observe(save_to_disk(path))
-        .observe(|_trigger: Trigger<bevy::render::view::screenshot::ScreenshotCaptured>,
-                  mut exit: EventWriter<AppExit>| {
-            exit.write(AppExit::Success);
-        });
+    let index = progress.taken;
+    progress.taken += 1;
+    let last = progress.taken >= config.count;
+    let path = if config.count > 1 {
+        match config.path.rsplit_once('.') {
+            Some((stem, ext)) => format!("{stem}.{index}.{ext}"),
+            None => format!("{}.{index}", config.path),
+        }
+    } else {
+        config.path.clone()
+    };
+    let mut entity = commands.spawn(Screenshot::primary_window());
+    entity.observe(save_to_disk(path));
+    if last {
+        entity.observe(
+            |_trigger: Trigger<bevy::render::view::screenshot::ScreenshotCaptured>,
+             mut exit: EventWriter<AppExit>| {
+                exit.write(AppExit::Success);
+            },
+        );
+    }
 }
