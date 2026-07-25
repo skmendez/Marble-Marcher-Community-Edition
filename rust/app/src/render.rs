@@ -1292,6 +1292,22 @@ pub fn setup(
             target: RenderTarget::from(fine_image_handle.clone()),
             ..default()
         },
+        // This pass draws exactly one full-screen quad (`MarcherQuad`) --
+        // nothing for MSAA to antialias, so it's pure overhead. Worse than
+        // idle overhead, in fact: without this, Bevy defaults to
+        // `Msaa::Sample4`, which means a multisampled resolve texture sized
+        // to this camera's *viewport* (not the underlying image), recreated
+        // through `TextureCache` any time that viewport size changes. Fine's
+        // viewport tracks `FineRenderTarget::active_size`
+        // (`sync_fine_render_target_and_present`), which
+        // `oscillate_fine_resolution_tier` (debug flag `?res_oscillate=1`)
+        // changes on *every* frame -- a new resolve texture every frame,
+        // and on WebGPU `wgpu`'s `Drop for WebTexture` is a no-op (browser
+        // GC only), so those textures piled up until the tab crashed.
+        // Matches the existing convention on the coarse (`mrrm.rs`) and
+        // shadow (`shadow_pass.rs`) cameras, both of which already spawn
+        // `Msaa::Off` for the same "single full-screen quad" reason.
+        Msaa::Off,
         MarcherCamera,
         // GPU-timestamp-query profiling (`gpu_profile.rs`).
         crate::gpu_profile::GpuProfiledPass(crate::gpu_profile::FINE_PASS_NAME),
@@ -1330,6 +1346,27 @@ pub fn setup(
             order: 1,
             ..default()
         },
+        // Deliberately *not* `Msaa::Off` here, unlike the fine camera above
+        // (and the coarse/shadow cameras) -- measured live (screenshot
+        // diff, same scene/camera state): adding it introduces a real
+        // rendering regression on this camera specifically (visible holes
+        // in the fractal surface that aren't present with Bevy's default
+        // `Msaa::Sample4`), most likely an interaction with
+        // `IsDefaultUiCamera`/bevy_ui sharing this camera's target rather
+        // than anything about the present quad itself. Leaving it off cost
+        // nothing for the bug this was chasing, either:
+        // `sync_fine_render_target_and_present`'s viewport-mutating query
+        // is `Without<PresentCamera>` -- this camera's `Camera.viewport`
+        // is never written at all (stays `None`, i.e. Bevy tracks the
+        // window's actual size directly), so `oscillate_fine_resolution_
+        // tier`'s every-frame churn (the fine camera's fix above) never
+        // touched this camera in the first place. A real window resize
+        // still changes this camera's effective size (same as the fine
+        // camera's `native_size`), so it isn't entirely free of the
+        // underlying MSAA-resolve-texture-churn risk -- but that's a rare,
+        // user-driven event, not a continuous every-frame one, so it's a
+        // much smaller residual risk than the one this fix targets, and
+        // not worth a confirmed visual regression to close.
         RenderLayers::layer(PRESENT_LAYER),
         PresentCamera,
         IsDefaultUiCamera,
