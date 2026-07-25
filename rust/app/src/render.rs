@@ -1402,6 +1402,93 @@ pub fn setup(
     });
 }
 
+/// `Startup` system, chained directly after [`setup`] and before
+/// `mrrm::setup_mrrm_pipeline`/`shadow_pass::setup_shadow_pipeline`
+/// (`main.rs`'s `Startup` chain): if `?snapshot=<encoded>`/`MM_SNAPSHOT` is
+/// present and decodes (`snapshot::SceneSnapshot::from_url_param`), applies
+/// it -- reproducing the exact frozen still frame the "copy snapshot"
+/// dat.gui button (`snapshot::report_snapshot_state`) captured.
+///
+/// Mirrors [`apply_pending_scene_sync`]'s own "adopt a wholesale different
+/// scene, atomically with a tick + marble list" handling (same
+/// `RollbackSim::set_scene` call, same unconditional `frame.params`
+/// reseed, same `bounding_sphere` recompute, same `CameraRig::reset` so the
+/// realized camera snaps to the restored view instead of springing across
+/// the old one first), with two differences that fall directly out of
+/// running at `Startup` instead of `Update`:
+///  - No force-touch of the coarse/shadow materials' bind groups
+///    (`apply_pending_scene_sync`'s doc on why *that* call needs one): this
+///    runs *before* `setup_mrrm_pipeline`/`setup_shadow_pipeline` have ever
+///    built those materials in the first place, so there is no stale bind
+///    group to invalidate -- those two systems build theirs fresh, right
+///    after this one runs, straight from `mp.sim.scene().object` (already
+///    the replaced scene by the time they read it), with no separate
+///    shader-regen call needed here for either of them.
+///  - `CameraOrbit`'s orientation/zoom are also overwritten directly
+///    (`apply_pending_scene_sync` never touches them -- a multiplayer scene
+///    sync never moves the other peer's camera, it only resets the rig's
+///    spring state so *whatever* orbit that peer already has isn't swept
+///    away from).
+///
+/// Solo-only in effect, not by an explicit `MultiplayerSession::is_solo`
+/// check: this only ever runs once, at `Startup`, strictly before any
+/// network connection can exist, so the session is unconditionally solo
+/// at this point regardless of what happens later.
+///
+/// A malformed/truncated/wrong-version `?snapshot=` value is ignored with
+/// a `warn!` (same defensive posture as this function's `Update`-side
+/// counterpart's undecodable scene-sync payload) rather than panicking --
+/// a hand-edited or truncated-in-transit URL shouldn't take the whole page
+/// down.
+///
+/// Known scope limitation: `SceneState::kind`/`handles` are left as
+/// whatever `setup` built from `?scene=`/`Config::scene` -- correct in the
+/// intended usage (the "copy snapshot" button preserves the page's
+/// existing `?scene=` when it builds its URL, so the snapshot's actual
+/// scene always matches), but the live params panel's labeled sliders
+/// would refer to the wrong handles if a `?snapshot=` value is ever
+/// combined with an unrelated `?scene=` by hand.
+pub fn load_snapshot_from_url(
+    mut scene_state: ResMut<SceneState>,
+    mut mp: ResMut<MultiplayerSession>,
+    mut marble_state: ResMut<MarbleState>,
+    mut camera_orbit: ResMut<CameraOrbit>,
+    mut rig: ResMut<CameraRig>,
+    mut shaders: ResMut<Assets<Shader>>,
+    mut frame: ResMut<MarcherFrameData>,
+) {
+    let Some(raw) = crate::config::query_value("snapshot", "MM_SNAPSHOT") else {
+        return;
+    };
+    let Some(snapshot) = crate::snapshot::SceneSnapshot::from_url_param(&raw) else {
+        warn!("snapshot: `?snapshot=` value present but failed to decode -- ignoring it");
+        return;
+    };
+
+    let wgsl = generate_shader(&snapshot.scene.object);
+    shaders.insert(MARCHER_SHADER_HANDLE.id(), Shader::from_wgsl(wgsl, "generated://marcher.wgsl"));
+    scene_state.bounding_sphere = pack_bounding_sphere(&snapshot.scene.object, &snapshot.scene.params);
+    frame.params.clear();
+    frame.params.extend_from_slice(snapshot.scene.params.slots());
+
+    marble_state.start_positions = snapshot.marbles.iter().map(|m| m.pos).collect();
+    marble_state.marbles = snapshot.marbles.clone();
+    mp.sim.set_scene(snapshot.tick, snapshot.scene, snapshot.marbles);
+
+    camera_orbit.orientation = snapshot.camera_orientation;
+    camera_orbit.zoom = snapshot.camera_zoom;
+    // The realized camera (`CameraRig`) only *tracks* `CameraOrbit`,
+    // springing toward it over several frames rather than jumping there
+    // instantly (`smart_camera`'s module doc) -- exactly like a multiplayer
+    // scene sync (`apply_pending_scene_sync`'s identical `rig.reset()`
+    // call), the world/marble/camera are all being replaced wholesale here,
+    // so the next `smart_camera::solve` must snap straight to the restored
+    // orbit instead of visibly sweeping across the old view first.
+    rig.reset();
+
+    info!("snapshot: loaded a `?snapshot=` frame at tick {}", mp.sim.current_tick());
+}
+
 /// `Update` system: applies the host's most recently received scene-sync
 /// bundle, if `physics_sys::marble_physics_tick_impl`'s `FixedUpdate` polling
 /// stashed one this frame (`PendingSceneSync`'s doc) -- decodes it, replaces

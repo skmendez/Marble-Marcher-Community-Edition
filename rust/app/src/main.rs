@@ -22,6 +22,7 @@ mod physics_sys;
 mod render;
 mod shadow_pass;
 mod smart_camera;
+mod snapshot;
 mod step_data;
 mod touch;
 mod web_config;
@@ -44,13 +45,15 @@ use param_ui::{param_ui_input, spawn_param_panel, update_param_panel_text};
 use perfprobe::{perfprobe_tick, spawn_perfprobe_overlay, update_perfprobe_overlay_text, PerfProbeState};
 use physics_sys::{marble_physics_tick, PendingSceneSync};
 use render::{
-    apply_pending_scene_sync, finalize_marble_cubemap, oscillate_fine_resolution_tier,
-    resize_fine_render_target, setup, sync_fine_render_target_and_present, sync_quad_scale,
-    update_frame_data, FineMarcherMaterial, PresentMaterial,
+    apply_pending_scene_sync, finalize_marble_cubemap, load_snapshot_from_url,
+    oscillate_fine_resolution_tier, resize_fine_render_target, setup,
+    sync_fine_render_target_and_present, sync_quad_scale, update_frame_data, FineMarcherMaterial,
+    PresentMaterial,
 };
 use shadow_pass::{resize_shadow_render_target, setup_shadow_pipeline, sync_shadow_quad_scale, ShadowMarcherMaterial};
-use step_data::{setup_step_data_pipeline, StepDataMaterial, StepDataPlugin};
 use smart_camera::{smart_camera_solve, CameraRig, InputProfile};
+use snapshot::report_snapshot_state;
+use step_data::{setup_step_data_pipeline, StepDataMaterial, StepDataPlugin};
 use touch::{touch_camera_input, TouchDebugInfo};
 
 /// `MM_WINDOW_SIZE=WxH` overrides the window's starting resolution — mainly
@@ -262,6 +265,14 @@ fn main() {
                 // depends on `LiveDebugToggles` existing yet.
                 seed_live_debug_toggles,
                 setup,
+                // Dev-only `?snapshot=`/`MM_SNAPSHOT` load (`snapshot.rs`'s
+                // module doc): must run after `setup` (needs its
+                // `SceneState`/`MultiplayerSession`/`MarbleState`/
+                // `MarcherFrameData`) and before `setup_mrrm_pipeline`/
+                // `setup_shadow_pipeline` (so their own from-scratch coarse/
+                // shadow shader builds already see the replaced scene --
+                // `load_snapshot_from_url`'s doc).
+                load_snapshot_from_url,
                 setup_mrrm_pipeline,
                 setup_shadow_pipeline,
                 setup_step_data_pipeline,
@@ -347,6 +358,11 @@ fn main() {
                     draw_thrust_debug.run_if(|config: Res<Config>| config.debug_enabled),
                     poll_net_status,
                     sync_net_ui_text,
+                    // Dev-only "copy snapshot" dat.gui button's data source
+                    // (`snapshot.rs`'s module doc) -- gated the same way
+                    // `draw_thrust_debug` above is, so this is a true no-op
+                    // for a casual player.
+                    report_snapshot_state.run_if(|config: Res<Config>| config.debug_enabled),
                 )
                     .chain(),
             )
