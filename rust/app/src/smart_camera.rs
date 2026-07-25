@@ -322,6 +322,13 @@ pub struct RigDebug {
     /// Distance field value at the eye: how much clearance the camera
     /// actually has. Negative would mean "inside geometry" (I2 violated).
     pub eye_clearance: f32,
+    /// The probe ball's radius this frame ([`CAMERA_RADIUS_MARBLE_RADII`]) --
+    /// the number to compare `eye_clearance` against, and the one whose
+    /// mis-scaling caused the camera to dive at the marble near any surface.
+    /// Shown in the `?debug=1` overlay next to the clearance for that
+    /// reason, and because it doubles as a quick check of *which* build is
+    /// running: a bundle without the fix does not print it.
+    pub camera_radius: f32,
     /// `de` evaluations spent on this frame's sightline march.
     pub steps: u32,
 }
@@ -668,6 +675,7 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
             screen_fraction: screen_fraction(radius, FOCAL_LENGTH, rig.distance, input.aspect),
             deviation: 0.0,
             eye_clearance: sdf.de(rig.eye()),
+            camera_radius,
             steps: sw.steps,
         };
         return;
@@ -980,6 +988,7 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
         screen_fraction: screen_fraction(radius, rig.focal_length, rig.distance, input.aspect),
         deviation,
         eye_clearance: clearance,
+        camera_radius,
         steps: sw.steps,
     };
 }
@@ -1904,5 +1913,187 @@ mod scene_probe {
             }
         }
         assert!(failures.is_empty(), "camera probe failures:\n{}", failures.join("\n"));
+    }
+}
+
+/// The exact scenario reported from play: fly the marble head-on into a
+/// sphere, with the camera directly behind it looking straight at the
+/// sphere. Nothing enters the sightline at any point -- the sphere is
+/// *beyond* the marble the whole time -- so a correct camera does not move
+/// at all, and any movement is the bug.
+#[cfg(test)]
+mod head_on_into_a_sphere {
+    use super::*;
+
+    struct Ball {
+        r: f32,
+    }
+    impl Sdf for Ball {
+        fn de(&self, p: Vec3) -> f32 {
+            p.length() - self.r
+        }
+    }
+
+    /// `(worst deviation of the eye-to-marble distance from the framing
+    /// distance, worst visibility, trace)`.
+    fn fly_in(zoom: f32, aspect: f32, radius: f32, print: bool) -> (f32, f32) {
+        let ball = Ball { r: 1.0 };
+        let mut rig = CameraRig::default();
+        // Identity orientation looks along -Z, so the eye sits at +Z from
+        // the marble: camera behind, sphere dead ahead.
+        let mut inp = SolveInput {
+            marble_pos: Vec3::new(0.0, 0.0, 3.0),
+            marble_radius: radius,
+            intent: Quat::IDENTITY,
+            zoom,
+            aspect,
+            target_fraction: POINTER_TARGET_FRACTION,
+            dt: 1.0 / 60.0,
+            smart: true,
+        };
+        // Settle first, so the run measures the approach and not the
+        // initial snap.
+        for _ in 0..120 {
+            solve(&mut rig, &mut inp, &ball);
+        }
+        let settled = rig.distance;
+        let (mut worst_move, mut worst_vis) = (0.0f32, 1.0f32);
+        for i in 0..300 {
+            // Fly straight at the centre at 2 units/s, stopping where the
+            // marble's surface meets the sphere's.
+            inp.marble_pos.z = (inp.marble_pos.z - 2.0 / 60.0).max(1.0 + radius);
+            solve(&mut rig, &mut inp, &ball);
+            worst_move = worst_move.max((rig.distance - settled).abs() / settled);
+            worst_vis = worst_vis.min(rig.debug.visibility);
+            if print && (i % 20 == 0 || (rig.distance - settled).abs() / settled > 0.02) {
+                println!(
+                    "i={i:3} z={:.3} de(marble)={:+.3} d={:.3}/{:.3} free={:.3} vis={:.2} size={:.3} steps={}",
+                    inp.marble_pos.z,
+                    ball.de(inp.marble_pos),
+                    rig.distance,
+                    rig.debug.desired_distance,
+                    rig.debug.free_distance,
+                    rig.debug.visibility,
+                    rig.debug.screen_fraction,
+                    rig.debug.steps
+                );
+            }
+        }
+        (worst_move, worst_vis)
+    }
+
+    #[test]
+    fn the_camera_does_not_move_at_all() {
+        // The reporter's configuration: `cube_sphere_morph`'s marble radius
+        // and zoom, on a phone in portrait.
+        let (worst_move, worst_vis) = fly_in(3.3, 384.0 / 694.0, 0.15, true);
+        assert!(
+            worst_move < 0.01,
+            "camera distance moved {:.1}% while flying head-on into a sphere",
+            worst_move * 100.0
+        );
+        assert_eq!(worst_vis, 1.0, "nothing ever came between the camera and the marble");
+    }
+
+    #[test]
+    fn and_the_same_at_every_zoom_and_aspect() {
+        for zoom in [0.5f32, 1.0, 3.3, 6.0] {
+            for aspect in [384.0 / 694.0, 1.0, 16.0 / 9.0] {
+                let (worst_move, worst_vis) = fly_in(zoom, aspect, 0.15, false);
+                assert!(
+                    worst_move < 0.01,
+                    "zoom {zoom} aspect {aspect:.2}: camera moved {:.1}%",
+                    worst_move * 100.0
+                );
+                assert_eq!(worst_vis, 1.0, "zoom {zoom} aspect {aspect:.2}: view was obstructed");
+            }
+        }
+    }
+}
+
+/// The reported scene itself, animated: `cube_sphere_morph`'s shape sweeps
+/// between a cube and an inscribed sphere every 12 seconds, so a marble
+/// resting against a face can be *engulfed* as the geometry grows back out
+/// past it. That is the one situation in which no camera position is
+/// correct, and it is worth knowing exactly how the solver degrades.
+#[cfg(test)]
+mod morphing_geometry {
+    use super::*;
+    use crate::render::{build_scene, SceneKind};
+    use marble_csg::physics::{step_marbles, Marble, PhysicsConfig, PlayerInput};
+    use marble_csg::visibility::SceneSdf;
+    use marble_csg::Params;
+
+    #[test]
+    fn a_marble_swallowed_by_growing_geometry_does_not_slam_the_camera() {
+        let kind = SceneKind::CubeSphereMorph;
+        let mut params = Params::new();
+        let (object, _handles, animations) = build_scene(kind, &mut params);
+        let spawn = kind.spawn_params();
+        let cfg = PhysicsConfig::default();
+        let mut marbles = vec![Marble::spawn(spawn.start, spawn.rad)];
+        let starts = vec![spawn.start];
+
+        let mut rig = CameraRig::default();
+        let mut orbit = CameraOrbit { orientation: Quat::IDENTITY, zoom: 3.3 };
+        let dt = 1.0 / 60.0;
+        let mut worst_size: f32 = 0.0;
+        let mut frames_collapsed = 0;
+
+        // A full morph period (12s at 60Hz), with the marble thrusting
+        // straight at the centre the whole time -- exactly "fly into it and
+        // hold".
+        for tick in 0..720u64 {
+            for (handle, expr) in &animations {
+                params.set_scalar(*handle, expr.eval(tick));
+            }
+            let toward_centre = -marbles[0].pos.normalize_or_zero();
+            let (fwd, right) = (rig.orientation * Vec3::NEG_Z, rig.orientation * Vec3::X);
+            let input = PlayerInput {
+                dx: toward_centre.dot(right),
+                dy: toward_centre.dot(fwd),
+                orientation: rig.orientation,
+            };
+            step_marbles(&mut marbles, &[input], &object, &params, &cfg, spawn.kill_y, &starts);
+
+            let sdf = SceneSdf { object: &object, params: &params };
+            let mut inp = SolveInput {
+                marble_pos: marbles[0].pos,
+                marble_radius: marbles[0].rad,
+                intent: orbit.orientation,
+                zoom: orbit.zoom,
+                aspect: 384.0 / 694.0,
+                target_fraction: POINTER_TARGET_FRACTION,
+                dt,
+                smart: true,
+            };
+            solve(&mut rig, &mut inp, &sdf);
+            orbit.orientation = inp.intent;
+
+            if tick > 60 {
+                worst_size = worst_size.max(rig.debug.screen_fraction);
+                if rig.distance <= marbles[0].rad * MIN_DISTANCE_MARBLE_RADII * 1.01 {
+                    frames_collapsed += 1;
+                }
+                if tick % 60 == 0 || rig.debug.screen_fraction > 0.5 {
+                    println!(
+                        "tick={tick:3} de(marble)={:+.3} d={:.3}/{:.3} free={:.3} vis={:.2} size={:.3} steps={}",
+                        sdf.de(marbles[0].pos),
+                        rig.distance,
+                        rig.debug.desired_distance,
+                        rig.debug.free_distance,
+                        rig.debug.visibility,
+                        rig.debug.screen_fraction,
+                        rig.debug.steps
+                    );
+                }
+            }
+        }
+        println!("worst size {worst_size:.3}, {frames_collapsed} frames at the distance floor");
+        assert!(
+            frames_collapsed == 0,
+            "camera slammed to its minimum distance on {frames_collapsed} frames"
+        );
+        assert!(worst_size < 0.6, "marble reached {worst_size:.2} of frame");
     }
 }

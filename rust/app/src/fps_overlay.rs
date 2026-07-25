@@ -379,7 +379,7 @@ fn update_orbit_debug_text(
     // the camera is inside geometry, i.e. a broken invariant).
     let d = rig.debug;
     let camera_line = format!(
-        "{}: vis {:.2} d {:.3}/{:.3} (free {:.3}) size {:.3} dev {:.0}deg clr {:.3} f {:.2} zoom {:.2} steps {}",
+        "{}: vis {:.2} d {:.3}/{:.3} (free {:.3}) size {:.3} dev {:.0}deg clr {:.3}/q{:.3} f {:.2} zoom {:.2} steps {}",
         config.scene.name(),
         d.visibility,
         rig.distance,
@@ -388,6 +388,7 @@ fn update_orbit_debug_text(
         d.screen_fraction,
         d.deviation.to_degrees(),
         d.eye_clearance,
+        d.camera_radius,
         rig.focal_length,
         orbit.zoom,
         d.steps,
