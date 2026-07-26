@@ -12,9 +12,11 @@ a play-test: the framing rule (§4.2) is on either way, the geometry-aware
 behaviors need the flag.
 Sections 1-5 below are the design as written *before* implementation, kept as
 the record of the reasoning; §11 at the end lists what implementation
-changed, what it measured, and what is still missing. Where the two
-disagree, §11 is what the code does. File/line references in §1-5 are to the
-pre-implementation code and are left as they were.
+changed, what it measured, and what is still missing; §12-14 are the
+play-test findings that followed, each with the measurement that reproduced
+it. Where any of them disagree with §1-5, the later section is what the code
+does. File/line references in §1-5 are to the pre-implementation code and
+are left as they were.
 
 ---
 
@@ -1001,3 +1003,111 @@ that underestimates by 20x, in empty space, must not move the camera) and
 `a_thin_occluder_is_eased_past_not_snapped_to` (a shell thinner than the
 probe ball: the camera crosses it, taking more than one frame to do it, and
 never moves more than a fifth of the shot in any single frame).
+
+## 14. The floor a marble is resting on
+
+Reported after §13 shipped: *"the camera is still getting way too close to
+the marble; an example is if the marble is up against a flat plane, if you
+drag the camera into the plane it'll bring the distance to basically 0."*
+
+Reproduced exactly, against an analytic half-space with a marble sitting on
+it and a portrait phone's aspect (`dragging_at_a_floor`). Dragging steadily
+downward settled here:
+
+```
+u.y=-0.214  d=0.450/1.460  free=0.455  vis=1.00  clr=+0.053  dev=109deg
+```
+
+The camera 12° under the horizon, at **31%** of its framing distance, with
+the marble at half the screen — and 109° of stored disagreement with the
+player, which is `MAX_CORRECTION`, i.e. the cap. Two independent faults,
+both of which need this specific shape of scene to show up.
+
+### Fault 1: every shallow ray over a plane exhausts its budget
+
+§13 established that an exhausted march must contribute no constraint,
+because a loose field crawls in open air and the camera would dive at
+nothing. That was right, and it had a blind spot.
+
+A swept sphere trace steps by `h - camera_radius`. Against a plane
+approached at a shallow angle, `h` shrinks toward `camera_radius`
+geometrically, so the steps shrink geometrically too and the march creeps
+without ever formally touching down. Measured against the half-space above,
+by angle below the horizon:
+
+| angle | free  | exact | exhausted? |
+|-------|-------|-------|------------|
+| 3.4°  | 1.460 | 1.460 | no         |
+| 4.6°  | 1.184 | 1.220 | **yes**    |
+| 6.9°  | 0.811 | 0.814 | **yes**    |
+| 9.2°  | 0.612 | 0.612 | **yes**    |
+| 10.3° | 0.545 | 0.545 | no         |
+| 17.2° | 0.330 | 0.330 | no         |
+
+There is a band — and it is exactly the band where the floor first starts to
+cost framing distance — in which the floor did not exist as far as the
+wall-slide constraint was concerned. So the constraint never engaged there;
+the player dragged straight through it and out the far side, where the march
+does terminate and the free distance is already a third of what framing
+wants. The distance solver, doing its job on a now-honest number, dollied to
+it.
+
+Note the third column: the stalled marches had *converged*. Their answers
+were within 3% of exact. They were being discarded as worthless while being
+almost right.
+
+The fix is to distinguish the two ways a budget gets spent, which the final
+sample's clearance already tells apart at no extra cost
+(`visibility::GRAZING_STALL_RADII`):
+
+* Stalled **onto a surface**: `h` is pinned just above `camera_radius` —
+  that is *why* the steps went to zero. `t` is a real bound, and the ball
+  demonstrably cannot get much further.
+* Stalled **in open air**: `h` still has room at every sample; the field is
+  merely slow. `t` means nothing. This is §13's case, unchanged.
+
+The threshold is `1.5` camera radii, which sits between "effectively
+touching" and any clearance a camera would care to keep.
+
+### Fault 2: refused input was banked, not consumed
+
+The `dev=109deg` above is the second bug, and it would have been a bug even
+with a perfect sweep. Every frame the player pushed into the floor, the
+part of the rotation the constraint removed stayed in the intent quaternion,
+so the disagreement grew until it pinned against `MAX_CORRECTION`. The
+player then had to drag 110° back before the camera moved *at all*.
+
+A constraint you can feel resisting is fine. A control that has quietly
+stopped being connected is not — and the second is what a hidden 110° of
+banked input is, no matter how well-justified each frame's refusal was.
+
+The refused rotation is now subtracted from the intent as well as from the
+realized orientation. This is also what collide-and-slide means for input in
+the games §12 borrowed from: the stick deflection that would drive the
+camera into the wall is spent against the wall, and letting go and pushing
+the other way moves the camera on the next frame. Pinned by
+`pushing_into_the_floor_does_not_bank_a_dead_zone`, which asserts both
+halves — no stored deviation, and a reversal that is honoured in full on the
+first frame.
+
+### Where it lands
+
+Same scene, same drag, after both fixes:
+
+```
+u.y=-0.086  d=1.110/1.460  free=1.110  vis=1.00  clr=+0.055  dev=0deg
+```
+
+Stable for the whole run: 4.9° under the horizon at **76%** of the framing
+distance (marble at 0.37 of the frame rather than 0.50), no banked
+disagreement, and the full distance comes back as soon as the player lets go
+(`the_shot_recovers_once_the_player_lets_go`).
+
+76% rather than the 85% comfort threshold because the constraint's strength
+ramps between `WALL_COMFORT_FRACTION` and `WALL_FLOOR_FRACTION`, and the
+drag stalls partway up the ramp — resistance that builds is what keeps this
+from reading as a hard stop.
+
+The seven-scene probe is unchanged to three decimal places, which is the
+point: this was a case the probe's flight paths never entered, not a
+regression in one they did.

@@ -127,6 +127,32 @@ pub struct SweepConfig {
     pub max_steps: u32,
 }
 
+/// How much clearance a stalled march may still have and still be called a
+/// genuine wall rather than "the budget ran out" — in camera radii.
+///
+/// Distinguishes the two ways [`SweepConfig::max_steps`] gets spent, which
+/// call for opposite responses (see [`Sweep::exhausted`]):
+///
+///  - **Converging onto a surface.** The classic grazing ray: each step is
+///    `h - camera_radius`, so a ray closing on a wall at a shallow angle
+///    shrinks its steps geometrically and creeps forever without formally
+///    touching. Its `t` at the stall is a *good* bound — measured against an
+///    analytic plane it lands within 3% of the exact answer — and the ball
+///    demonstrably cannot get much further, because its clearance there is
+///    already down at `camera_radius`.
+///  - **A slow field.** An underestimating `de` (`Object::Morph` is the
+///    worst offender in this crate) makes every step short even in open air.
+///    Here `t` means nothing: the ray may have kilometres of clear space
+///    ahead of it, and reporting `t` as a wall dives the camera at an
+///    obstruction that does not exist.
+///
+/// The clearance at the final sample tells them apart with no extra `de`
+/// calls: the first case stalls with `h` pinned just above `camera_radius`
+/// (that is *why* the steps went to zero), the second stalls with room to
+/// spare. `1.5` sits between "the ball is effectively touching" and any
+/// clearance a camera would care to keep.
+const GRAZING_STALL_RADII: f32 = 1.5;
+
 /// What one march along the sightline found.
 #[derive(Clone, Copy, Debug)]
 pub struct Sweep {
@@ -147,7 +173,18 @@ pub struct Sweep {
     /// `de` evaluations actually spent -- surfaced so the debug overlay can
     /// show what this costs on real geometry rather than guessing.
     pub steps: u32,
-    /// The step budget ran out before reaching `max_dist`.
+    /// The step budget ran out *without establishing anything*:
+    /// [`Self::free_distance`] is where the march happened to stop, not a
+    /// bound on where the camera can go, and callers must not treat it as an
+    /// obstruction (`smart_camera::usable_free_distance`).
+    ///
+    /// Note this is narrower than "the budget ran out". A march that stalls
+    /// while converging onto a surface has spent its budget *and* produced a
+    /// usable bound, and reports `false` here -- see
+    /// [`GRAZING_STALL_RADII`], which is the distinction. Conflating the two
+    /// is what let a camera be dragged through the shallow angles over a
+    /// floor (where every march grazes, and every march therefore stalled)
+    /// as if the floor were not there at all.
     pub exhausted: bool,
 }
 
@@ -218,25 +255,41 @@ pub fn sweep(sdf: &impl Sdf, origin: Vec3, dir: Vec3, max_dist: f32, cfg: SweepC
     let mut steps = 0;
     let mut exhausted = false;
     let mut free_distance = max_dist;
+    // Clearance at the most recent sample, so a stall can be classified when
+    // the loop runs out of budget. Starts at infinity: a march given no
+    // budget at all has learned nothing, which is the `exhausted` case.
+    let mut last_h = f32::INFINITY;
     loop {
         if steps >= cfg.max_steps {
             // Out of budget short of the goal: only clearance out to `t` has
-            // been established, so that is all this may claim. The caller is
-            // told (`exhausted`) so it can distinguish "nothing found" from
-            // "found something here" -- they are very different facts, and
-            // conflating them dives the camera at obstructions that do not
-            // exist (`smart_camera::usable_free_distance`).
-            exhausted = true;
+            // been established, so that is all this may claim. Whether that
+            // is a *bound* or merely where the march gave up depends on how
+            // much room the ball still had -- see `GRAZING_STALL_RADII`. The
+            // caller is told (`exhausted`) so it can distinguish "nothing
+            // found" from "found something here": they are very different
+            // facts, and conflating them either way is a bug the camera can
+            // be made to show (dives at phantom obstructions in one
+            // direction, ignores real floors in the other).
+            exhausted = last_h > cfg.camera_radius * GRAZING_STALL_RADII;
             free_distance = t;
             break;
         }
         let h = sdf.de(origin + dir * t);
+        last_h = h;
         steps += 1;
         if h <= cfg.camera_radius {
             // The ball's surface touches down `camera_radius - h` before
             // this sample (negative when already overlapping, hence the
-            // clamp) -- exact for a plane, conservative otherwise, which is
-            // the safe direction.
+            // clamp).
+            //
+            // Backing off *along the ray* by the shortfall is exact for a
+            // head-on approach and under-corrects by `1/sin(incidence)` on an
+            // oblique one, so a grazing hit can land up to `camera_radius`
+            // deep into the margin. That is the margin's job -- the eye is
+            // still outside the surface, which is what the margin was
+            // reserving room for -- and the alternative costs a gradient
+            // evaluation on every march. `smart_camera`'s step-8 backstop
+            // reads the eye's own clearance and corrects what is left.
             free_distance = (t - (cfg.camera_radius - h)).max(0.0);
             break;
         }
@@ -546,6 +599,100 @@ mod tests {
         // Pass 1's own budget, plus whatever pass 2 spent measuring
         // visibility over the (short) stretch pass 1 established.
         assert!(s.steps >= 24 && s.steps <= 48, "steps = {}", s.steps);
+    }
+
+    #[test]
+    fn a_ray_grazing_a_floor_reports_a_usable_bound_at_every_angle() {
+        // The shallow angles over a plane are exactly where the swept march
+        // creeps: each step is `h - camera_radius`, and a ray closing on the
+        // floor at 5 degrees shrinks its steps by ~9% each time, so it spends
+        // the whole budget without formally touching down.
+        //
+        // Before `GRAZING_STALL_RADII` those angles came back `exhausted`,
+        // i.e. "no information" -- and since the camera solver (correctly)
+        // refuses to be constrained by a march that established nothing, a
+        // marble resting on a plane had a band of downward angles, right
+        // where the floor starts to matter, in which the floor was invisible
+        // to it. Dragging through that band put the camera at a third of its
+        // framing distance with the marble filling the screen, which is
+        // `smart_camera`'s `dragging_the_camera_into_a_floor_...` test and
+        // was reported from play.
+        //
+        // What this asserts is the property the solver actually needs: at
+        // *every* angle, the answer is both usable and close to the truth.
+        struct Floor;
+        impl Sdf for Floor {
+            fn de(&self, p: Vec3) -> f32 {
+                p.y
+            }
+        }
+        let r = 0.15;
+        let origin = Vec3::new(0.0, r, 0.0); // resting on the floor
+        let camera_radius = 0.35 * r;
+        let c = SweepConfig {
+            camera_radius,
+            target_radius: r,
+            min_camera_distance: 1.5 * r,
+            max_steps: 40,
+        };
+        let max_dist = 1.46; // what the framing rule asks for at these sizes
+        for i in 1..=40 {
+            let theta = i as f32 * 0.02; // 1.1 to 46 degrees below horizontal
+            let dir = Vec3::new(theta.cos(), -theta.sin(), 0.0);
+            let s = sweep(&Floor, origin, dir, max_dist, c);
+            // The eye's centre must stay `camera_radius` above the plane.
+            let exact = ((r - camera_radius) / theta.sin()).min(max_dist);
+            assert!(
+                !s.exhausted,
+                "theta {theta}: a march that has converged onto the floor knows where the floor is"
+            );
+            // Never past the floor itself. The bound may sit up to a
+            // camera-radius into the margin the sweep reserves, because the
+            // touchdown correction backs off along the ray rather than along
+            // the surface normal (see `sweep`); it may never sit past the
+            // surface that margin was protecting.
+            assert!(
+                (origin + dir * s.free_distance).y >= 0.0,
+                "theta {theta}: {} puts the eye through the floor",
+                s.free_distance
+            );
+            assert!(
+                s.free_distance <= exact + camera_radius,
+                "theta {theta}: claimed {} against the floor's {exact}",
+                s.free_distance
+            );
+            assert!(
+                s.free_distance > exact * 0.9,
+                "theta {theta}: {} is far short of the {exact} actually available",
+                s.free_distance
+            );
+        }
+    }
+
+    #[test]
+    fn a_slow_field_in_open_air_still_reports_no_information() {
+        // The other half of `GRAZING_STALL_RADII`, and the reason it is a
+        // threshold rather than "a stall is always a wall": an
+        // underestimating field (this crate's `Object::Morph`) makes every
+        // step short even where there is nothing anywhere near. Calling the
+        // stall point a wall here is what dives the camera at obstructions
+        // that do not exist.
+        struct Slow;
+        impl Sdf for Slow {
+            fn de(&self, _p: Vec3) -> f32 {
+                // Sound (it never overestimates) but 50x too small: open
+                // space that the march has to crawl across.
+                0.02
+            }
+        }
+        let s = sweep(&Slow, Vec3::ZERO, Vec3::X, 100.0, SweepConfig {
+            camera_radius: 0.005,
+            target_radius: 0.1,
+            min_camera_distance: 0.1,
+            max_steps: 40,
+        });
+        assert!(s.exhausted, "a march with room to spare at every sample has found no wall");
+        assert!(s.free_distance < 100.0);
     }
 
     #[test]

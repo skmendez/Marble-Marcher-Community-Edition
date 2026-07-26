@@ -920,7 +920,6 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
         max_steps: SWEEP_MAX_STEPS,
     };
     let player_delta = input.intent * rig.last_intent.inverse();
-    rig.last_intent = input.intent;
     let delta_angle = player_delta.angle_between(Quat::IDENTITY);
     if delta_angle > 1e-4 {
         rig.input_idle_for = 0.0;
@@ -934,9 +933,28 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
             probe_dist_for_input,
             input_cfg,
         );
+        // The part of the drag the wall refused is *consumed*, not banked:
+        // take it back out of the intent as well.
+        //
+        // Otherwise every frame the player keeps pushing into a surface adds
+        // to a hidden disagreement between where they have pointed and where
+        // the camera is, and the only thing that bounds it is `MAX_CORRECTION`
+        // -- so a few seconds of pushing down at a floor buys 110 degrees of
+        // dead zone that the player then has to drag back out before the
+        // camera responds at all. That is the opposite of the contract: a
+        // constraint the player can feel resisting is fine, a control that
+        // has silently stopped being connected is not.
+        //
+        // Consuming it is also what "collide and slide" means for input in
+        // the games this borrows from: the stick deflection that would take
+        // the camera into the wall is spent against the wall, and letting go
+        // and pushing the other way moves the camera immediately.
+        let refused = (wanted * rig.orientation.inverse()).normalize();
+        input.intent = (refused.inverse() * input.intent).normalize();
     } else {
         rig.input_idle_for += dt;
     }
+    rig.last_intent = input.intent;
 
     // --- 3. one march along the current sightline ---
     let u = -(rig.orientation * Vec3::NEG_Z); // focus -> eye
@@ -2577,5 +2595,178 @@ mod morphing_geometry {
             "camera slammed to its minimum distance on {frames_collapsed} frames"
         );
         assert!(worst_size < 0.6, "marble reached {worst_size:.2} of frame");
+    }
+}
+
+/// Dragging the camera down into the floor a marble is resting on — the
+/// plainest possible version of "the player steers the camera at a wall",
+/// and the one that was worst.
+///
+/// Reported from play as "the camera is getting way too close to the marble;
+/// if the marble is up against a flat plane, dragging the camera into the
+/// plane brings the distance to basically 0", and it did: the camera settled
+/// at 31% of its framing distance, 12 degrees under the horizon, with the
+/// marble at half the screen.
+///
+/// Two separate faults, both visible only in this shape of scene:
+///
+///  1. A shallow ray over a plane is the worst case for a swept sphere trace
+///     — steps of `h - camera_radius` shrink geometrically as it converges,
+///     so it burns its whole budget without touching down. Every angle
+///     between 4.6 and 9.2 degrees below the horizon came back `exhausted`,
+///     which the solver reads (correctly, for its usual causes) as "this
+///     march established nothing". So there was a band of angles, right
+///     where the floor starts to cost framing distance, in which the floor
+///     did not exist as far as the wall-slide constraint was concerned. The
+///     player dragged straight through it and out the far side, where the
+///     march does terminate and the free distance is already a third of what
+///     framing wants. Fixed in `visibility`'s `GRAZING_STALL_RADII`.
+///  2. Every frame of refused drag was banked as deviation from intent, up
+///     to `MAX_CORRECTION`. Fixed by consuming the refused rotation out of
+///     the intent in [`solve`]'s step 2.
+#[cfg(test)]
+mod dragging_at_a_floor {
+    use super::*;
+
+    /// Solid half-space below y = 0; the marble rests on it.
+    struct Ground;
+    impl Sdf for Ground {
+        fn de(&self, p: Vec3) -> f32 {
+            p.y
+        }
+    }
+
+    const RADIUS: f32 = 0.15;
+
+    /// A phone in portrait, which is where this was reported: the framing
+    /// rule wants the camera furthest back there (narrow screen, target
+    /// fraction measured across it), so the floor bites soonest.
+    fn resting_on_the_ground() -> (CameraRig, SolveInput) {
+        let mut rig = CameraRig::default();
+        // Level with the marble, looking horizontally: the camera starts
+        // exactly where the floor is about to become its problem.
+        let mut inp = SolveInput {
+            marble_pos: Vec3::new(0.0, RADIUS, 0.0),
+            marble_radius: RADIUS,
+            intent: Quat::IDENTITY,
+            zoom: 1.0,
+            aspect: 384.0 / 694.0,
+            target_fraction: TOUCH_TARGET_FRACTION,
+            dt: 1.0 / 60.0,
+            smart: true,
+        };
+        for _ in 0..120 {
+            solve(&mut rig, &mut inp, &Ground);
+        }
+        (rig, inp)
+    }
+
+    /// One frame of the player dragging so the eye swings toward `toward`.
+    /// Written in terms of where the eye should *go* rather than a fixed
+    /// screen delta, so it keeps pushing the same way as the camera turns.
+    fn drag_eye_toward(rig: &CameraRig, inp: &mut SolveInput, toward: Vec3, gain: f32) {
+        let u = -(rig.orientation * Vec3::NEG_Z);
+        let right = rig.orientation * Vec3::X;
+        let up = rig.orientation * Vec3::Y;
+        let tangential = (toward - u * toward.dot(u)).normalize_or_zero();
+        let delta = Vec2::new(-tangential.dot(right), -tangential.dot(up)) * gain;
+        if let Some(r) = CameraOrbit::drag_rotation(rig.orientation, delta) {
+            inp.intent = (r * inp.intent).normalize();
+        }
+    }
+
+    #[test]
+    fn holds_its_distance_instead_of_diving_at_the_marble() {
+        let (mut rig, mut inp) = resting_on_the_ground();
+        let desired = rig.debug.desired_distance;
+        assert!(
+            (rig.distance - desired).abs() < 1e-3,
+            "test setup: nothing is in the way of the settled shot"
+        );
+
+        let mut worst_distance = f32::INFINITY;
+        let mut worst_size: f32 = 0.0;
+        for _ in 0..300 {
+            drag_eye_toward(&rig, &mut inp, Vec3::NEG_Y, 4.0);
+            solve(&mut rig, &mut inp, &Ground);
+            worst_distance = worst_distance.min(rig.distance);
+            worst_size = worst_size.max(rig.debug.screen_fraction);
+            assert!(rig.eye().y > 0.0, "the eye went through the floor");
+        }
+
+        // The constraint ramps to full removal at `WALL_FLOOR_FRACTION`, so
+        // that is the floor on how much distance an elective drag into a
+        // surface may cost. (Measured: it holds at 0.76 of framing, because
+        // the ramp stalls the drag before reaching full strength.)
+        assert!(
+            worst_distance > WALL_FLOOR_FRACTION * desired,
+            "dragging into the floor cost {:.0}% of the framing distance ({worst_distance:.3} \
+             of {desired:.3})",
+            100.0 * (1.0 - worst_distance / desired)
+        );
+        // The user-facing version of the same statement: the marble stayed a
+        // reasonable size (the touch target is 0.28).
+        assert!(worst_size < 0.42, "marble reached {worst_size:.2} of the frame");
+        // And the camera stayed above the horizon-ish rather than being
+        // levered underneath the floor.
+        let u = -(rig.orientation * Vec3::NEG_Z);
+        assert!(u.y > -0.2, "the camera ended up {:.2} below the horizon", -u.y);
+    }
+
+    #[test]
+    fn pushing_into_the_floor_does_not_bank_a_dead_zone() {
+        // A constraint the player can feel resisting is fine. A control that
+        // has quietly stopped being connected is not: before the refused
+        // rotation was consumed out of the intent, ten seconds of pushing
+        // down bought `MAX_CORRECTION` (110 degrees) of drag that did
+        // nothing on the way back.
+        let (mut rig, mut inp) = resting_on_the_ground();
+        for _ in 0..300 {
+            drag_eye_toward(&rig, &mut inp, Vec3::NEG_Y, 4.0);
+            solve(&mut rig, &mut inp, &Ground);
+        }
+        assert!(
+            rig.debug.deviation < 0.2,
+            "banked {:.0} degrees of disagreement with the player",
+            rig.debug.deviation.to_degrees()
+        );
+
+        // Now let go and push the other way: the camera must respond on the
+        // very first frame, and by the amount asked for.
+        let before = -(rig.orientation * Vec3::NEG_Z).y;
+        drag_eye_toward(&rig, &mut inp, Vec3::Y, 4.0);
+        let asked = inp.intent.angle_between(rig.orientation);
+        let was = rig.orientation;
+        solve(&mut rig, &mut inp, &Ground);
+        let moved = rig.orientation.angle_between(was);
+        assert!(
+            moved > 0.9 * asked,
+            "rotating away from the floor was resisted: moved {moved:.4} of {asked:.4} rad"
+        );
+        let after = -(rig.orientation * Vec3::NEG_Z).y;
+        assert!(after > before, "and it moved the wrong way ({before:.4} -> {after:.4})");
+    }
+
+    #[test]
+    fn the_shot_recovers_once_the_player_lets_go() {
+        // Nothing above should leave the camera parked at the constrained
+        // distance: with the drag released and the floor no longer being
+        // pushed into, framing gets its distance back.
+        let (mut rig, mut inp) = resting_on_the_ground();
+        let desired = rig.debug.desired_distance;
+        for _ in 0..300 {
+            drag_eye_toward(&rig, &mut inp, Vec3::NEG_Y, 4.0);
+            solve(&mut rig, &mut inp, &Ground);
+        }
+        // Point back at the level shot and let the solver run unattended.
+        inp.intent = Quat::IDENTITY;
+        for _ in 0..300 {
+            solve(&mut rig, &mut inp, &Ground);
+        }
+        assert!(
+            rig.distance > 0.97 * desired,
+            "settled at {:.3} of the {desired:.3} framing wants",
+            rig.distance
+        );
     }
 }
