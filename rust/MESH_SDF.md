@@ -210,7 +210,121 @@ genuinely sharp-edged geometry (boxes, gears, architecture) is better
 built from the analytic primitives that render it exactly for free. So:
 dense grid for v1, bricks if a hero asset ever demands them, ASDF not
 worth the traversal complexity, hybrid union as the mixed-scale escape
-hatch.
+hatch. **If the requirement is instead "accurate + adaptive + sharp,
+full stop", see §4.6 — the answer changes.**
+
+## 4.6 SOTA survey: accurate + adaptive + sharp, all three at once
+
+What the literature and shipping engines actually offer, surveyed
+2026-07. Four families, and a punchline: **nobody gets sharp creases
+out of denser *sampling*; every approach that achieves sharpness at
+finite budget does it by storing *geometry* (planes or triangles) in
+the cells instead of samples.** Adaptivity and accuracy are otherwise
+well-solved; it is the sharpness requirement that forces the
+representation choice.
+
+**Family 1 — sampled grids, sparse/hierarchical (industry standard).**
+UE5's Mesh Distance Fields (sparse near-surface bricks with mip
+levels, composited into camera-centered Global Distance Field
+clipmaps); Söderlund, Evans & Akenine-Möller, *Ray Tracing of Signed
+Distance Function Grids* (JCGT 2022) — analytic ray-vs-trilinear-cell
+intersection with grid-resolution selection, integrable with RT
+hardware via custom intersection shaders; CrossRT (2024) reports
+hardware-accelerated sparse-brick SDF rendering with near-constant
+cost in model size. Adaptive in the *radial* (narrow-band) sense;
+never sharp — trilinear rounds every crease at ~h, no matter the
+budget.
+
+**Family 2 — adaptive polynomial trees (academic accuracy-per-byte
+frontier).** Frisken's ASDFs (2000, octree + trilinear); Koschier et
+al.'s *hp-adaptive SDFs* (SCA 2016 / follow-up 2017) — error-driven
+octree refinement (h) *and* per-cell polynomial degree (p), large
+memory wins, but the papers themselves note strong subdivision
+blow-up near sharp features and inter-cell continuity headaches;
+Pujol & Chica (Computers & Graphics 2023) — adaptive
+trilinear/tricubic interpolation of values *and derivatives* with
+guaranteed C0/C1 continuity and an error-threshold subdivision rule:
+the current best of this family. The structural limit stands for all
+of them: a polynomial cannot represent the gradient discontinuity *at*
+a crease — these methods chase edges with subdivision (error → 0,
+sharp never, at finite budget).
+
+**Family 3 — sharpness via structure, not resolution (the answer).**
+- In 2D this is *solved*: multi-channel SDFs (Chlumský's msdfgen;
+  Sloup & Chlumský, CGF 2018) reconstruct exact corners from finite
+  samples by storing multiple fields whose median is the true one.
+  **No established 3D equivalent exists** — the decomposition trick
+  does not cleanly generalize to 3D edge networks; treat it as an
+  open problem, not a plan.
+- The insight that does generalize is dual contouring's (Ju et al.,
+  SIGGRAPH 2002): *Hermite data* — intersection points + normals,
+  i.e. plane equations — per cell reproduces sharp edges and corners
+  **exactly**, because near a crease the surface is locally a wedge,
+  and a wedge's SDF is exactly the max/min of a few plane distances.
+  Samples can't say that; planes can.
+- Taken to its logical end: **per-brick exact triangle lists** — each
+  near-surface brick stores the indices of the triangles that can be
+  nearest within it; a query evaluates the exact point-triangle
+  minimum over the local list (the architecture of Media Molecule's
+  Dreams evaluator, with triangles in place of its CSG primitives; a
+  triangle list is the ultimate Hermite data). This hits all three
+  requirements *by construction*: **accurate** (zero geometric error,
+  it *is* the mesh), **sharp** (exact creases, forever), and
+  **adaptive in exactly the mesh's own sense** — the per-brick list is
+  long only where the artist put triangles, so the mesh's budget
+  allocation is *inherited*, not re-derived by an error estimator.
+
+**Family 4 — neural (NGLOD and descendants).** Sparse-octree feature
+volumes with real-time LOD (Takikawa et al. 2021), active follow-up
+work through 2024–25. Genuinely adaptive, impressive compression —
+but smooths sharp features, bakes slowly, and is a nonstarter here
+(wasm size, determinism across peers, no story for exact physics).
+
+**Engine constraint that filters the list**: folds and CSG compose
+*point* queries — a world-space ray becomes a polyline in folded
+canonical space, so anything whose speedup lives in the *ray
+parameterization* (RT-core triangle tracing, Family 1's analytic
+ray-cell intersection, custom intersection shaders) does not survive
+composition with `PolarModulo`/`Modulo`/CSG. WebGPU has no RT pipeline
+anyway. We need `de(p)`, full stop — which is exactly what Family 3
+provides.
+
+**Recommended target for "accurate + adaptive + sharp": two-level
+hybrid, brick + exact local triangles.**
+
+```text
+de(p) =  far from surface:  coarse sampled grid (soundness only --
+                            sphere tracing takes big steps out here,
+                            accuracy is irrelevant by construction)
+         near surface:      brick lookup (indirection texture or hash)
+                            -> exact min over the brick's <= K triangles
+```
+
+- Cost: one indirection fetch + K point-triangle kernels (K ~ 8–16
+  near typical surfaces; cap K per brick and fall back to a finer
+  brick or sampled values in pathological hotspots — graceful
+  degradation instead of a cliff).
+- Sign near the surface via the pseudonormal data of the argmin
+  feature (precomputed per triangle/edge/vertex, fetched for the
+  winning triangle only); far field sign comes baked into the coarse
+  grid.
+- Soundness: exact distances are trivially sound; the far grid uses
+  §4's margins; the near/far handoff takes the max of the two sound
+  bounds where bands overlap.
+- WGSL fit: a storage buffer (triangle + brick arrays) and one small
+  indirection texture — the fine material *already* hand-binds a
+  storage buffer and three textures, and codegen already emits helper
+  functions; this is Tier 1's binding work with a different payload,
+  not a new architecture.
+- CPU side unchanged: §1's BVH is still the right answer there, and
+  the brick bake is just a spatial bucketing of the same triangle
+  data (deterministic, peer-re-bakeable, §5's sync story intact).
+
+This supersedes §7's ladder *if* sharp arbitrary meshes are a real
+requirement: the order becomes CPU core → Tier 0 → **brick + triangle
+lists**, with the plain sampled grid (§2 Tier 1) surviving as the
+far-field half and as the cheap path for organic/smooth meshes where
+edge rounding is invisible anyway.
 
 ## 5. Serialization and multiplayer
 
