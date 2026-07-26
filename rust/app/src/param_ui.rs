@@ -195,6 +195,9 @@ fn build_entries(handles: &SceneHandles, params: &Params) -> Vec<ParamEntry> {
         // tick), so exposing it would just fight the animation -- same
         // reasoning as the oscillating bite radius (module doc).
         SceneHandles::CubeSphereMorph(_) => {}
+        // Both gear phases are Expr-animated too (counter-rotating tooth
+        // phases, overwritten every physics tick) -- nothing to expose.
+        SceneHandles::Gears(_) => {}
     }
     entries
 }

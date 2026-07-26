@@ -188,6 +188,40 @@ impl CodeWriter {
             // counts guarantee seamless closure across both atan2 branch
             // cuts; the smoothstep half-width keeps the stripe edge crisp
             // but slightly antialiased against distance shimmer.
+            // Exact piecewise rotation (see the variant's doc); geometry,
+            // so it emits in both passes, unlike the orbit ops. Component
+            // pair follows `rotate_components`' cyclic convention.
+            Fold::PolarModulo { axis, count, phase } => {
+                let (n1, n2) = match axis {
+                    Axis::X => ("y", "z"),
+                    Axis::Y => ("z", "x"),
+                    Axis::Z => ("x", "y"),
+                };
+                let sector = self.fresh("pm_sector");
+                let a = self.fresh("pm_a");
+                let k = self.fresh("pm_k");
+                let dd = self.fresh("pm_d");
+                let rho = self.fresh("pm_r");
+                self.writeln(&format!(
+                    "let {sector} = 6.2831853 / max(f32({}), 1.0);",
+                    count.wgsl()
+                ));
+                self.writeln(&format!(
+                    "let {a} = atan2(p.{n2}, p.{n1}) - {};",
+                    phase.wgsl()
+                ));
+                self.writeln(&format!("let {k} = round({a} / {sector});"));
+                self.writeln(&format!("let {dd} = {a} - {k} * {sector};"));
+                self.writeln(&format!(
+                    "let {rho} = length(vec2<f32>(p.{n1}, p.{n2}));"
+                ));
+                let (ex, ey, ez) = match axis {
+                    Axis::X => ("p.x".to_string(), format!("{rho} * cos({dd})"), format!("{rho} * sin({dd})")),
+                    Axis::Y => (format!("{rho} * sin({dd})"), "p.y".to_string(), format!("{rho} * cos({dd})")),
+                    Axis::Z => (format!("{rho} * cos({dd})"), format!("{rho} * sin({dd})"), "p.z".to_string()),
+                };
+                self.writeln(&format!("p = vec4<f32>({ex}, {ey}, {ez}, p.w);"));
+            }
             Fold::OrbitBarberPole { major, ring_count, twist_count, color_a, color_b } => {
                 if self.color_pass {
                     let phase = self.fresh("bp_phase");
@@ -221,6 +255,12 @@ impl CodeWriter {
                     "d = de_torus(p, {}, {});",
                     major.wgsl(),
                     minor.wgsl()
+                ));
+            }
+            Object::Cylinder { radius } => {
+                self.writeln(&format!(
+                    "d = (length(p.xz) - {}) / p.w;",
+                    radius.wgsl()
                 ));
             }
             Object::Fractal { fold, base } => {
@@ -2514,6 +2554,41 @@ struct VertexOutput {
         validate_wgsl(&full_coarse_source(&donut));
         validate_wgsl(&full_shadow_source(&donut));
         validate_wgsl(&full_stepdata_source(&donut));
+    }
+
+    #[test]
+    fn cylinder_and_polar_modulo_emission_and_gears_shader_validate() {
+        let obj = Object::Cylinder {
+            radius: ScalarValue::Const(0.155),
+        };
+        let src = generate_scene_functions(&obj);
+        assert!(src.contains("d = (length(p.xz) - 0.155) / p.w;"), "{src}");
+
+        // PolarModulo emits its sector math in *both* passes (it moves
+        // geometry, unlike the orbit-only ops).
+        let obj = Object::Fractal {
+            fold: crate::Fold::PolarModulo {
+                axis: crate::Axis::Y,
+                count: IntValue::Const(12),
+                phase: ScalarValue::Const(0.5),
+            },
+            base: Box::new(sphere(1.0)),
+        };
+        let src = generate_scene_functions(&obj);
+        let split = src.find("fn col_scene").expect("col_scene present");
+        let (de_part, col_part) = src.split_at(split);
+        assert!(de_part.contains("atan2"), "{de_part}");
+        assert!(col_part.contains("atan2"), "{col_part}");
+
+        // The real gears scene: 9 pair subtrees exercising PolarModulo,
+        // Cylinder, and the fresh-name discipline at scale, through all
+        // four generated shader variants.
+        let mut params = Params::new();
+        let (gears_obj, _handles) = scenes::gears(&mut params);
+        validate_wgsl(&full_source(&gears_obj));
+        validate_wgsl(&full_coarse_source(&gears_obj));
+        validate_wgsl(&full_shadow_source(&gears_obj));
+        validate_wgsl(&full_stepdata_source(&gears_obj));
     }
 
     #[test]

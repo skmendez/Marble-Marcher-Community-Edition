@@ -54,10 +54,10 @@ use marble_csg::codegen::generate_shader;
 use marble_csg::expr::Expr;
 use marble_csg::physics::{Marble, PhysicsConfig};
 use marble_csg::scenes::{
-    beware_of_bumps, classic, cube_sphere_morph, demo_scene, hollow_donut,
+    beware_of_bumps, classic, cube_sphere_morph, demo_scene, gears, hollow_donut,
     menger_oscillating_sphere, menger_sphere, menger_sponge, set_fractal_params,
-    set_menger_params, ClassicHandles, CubeSphereMorphHandles, HollowDonutHandles, MengerHandles,
-    MengerOscillatingSphereHandles, MENGER_BITE_MIN_RADIUS,
+    set_menger_params, ClassicHandles, CubeSphereMorphHandles, GearsHandles, HollowDonutHandles,
+    MengerHandles, MengerOscillatingSphereHandles, MENGER_BITE_MIN_RADIUS,
 };
 use marble_csg::{Object, Params, ScalarParam, Scene};
 
@@ -115,6 +115,12 @@ pub enum SceneKind {
     /// *and* color crossfade deterministically on the shared tick clock,
     /// identical on every multiplayer peer through rollback.
     CubeSphereMorph,
+    /// [`marble_csg::scenes::gears`] — iq's spherical gear assembly in its
+    /// constantly-rotating state: 18 interlocking gears (6 face-axis +
+    /// 12 edge-direction) on a half-unit sphere, counter-rotating classes
+    /// driven by two `Expr`-animated `PolarModulo` phases, deterministic
+    /// across peers like every other animated scene.
+    Gears,
 }
 
 /// Marble spawn parameters for a scene: start position, radius, kill-plane
@@ -142,6 +148,7 @@ impl SceneKind {
             Some("menger_oscillating_sphere") => Self::MengerOscillatingSphere,
             Some("hollow_donut") => Self::HollowDonut,
             Some("cube_sphere_morph") => Self::CubeSphereMorph,
+            Some("gears") => Self::Gears,
             _ => Self::MengerOscillatingSphere,
         }
     }
@@ -166,6 +173,7 @@ impl SceneKind {
             Self::MengerOscillatingSphere => "menger_oscillating_sphere",
             Self::HollowDonut => "hollow_donut",
             Self::CubeSphereMorph => "cube_sphere_morph",
+            Self::Gears => "gears",
         }
     }
 
@@ -238,6 +246,16 @@ impl SceneKind {
                 rad: 0.15,
                 kill_y: -50.0,
             },
+            // Floats just off the assembly's equator (bound ~0.56), the
+            // same to-one-side framing as CubeSphereMorph: the camera
+            // orbits the *marble*, so parking it here keeps the gear ball
+            // centered in frame instead of below it. Gear-scale marble:
+            // the teeth themselves are only ~0.04 across.
+            Self::Gears => MarbleSpawn {
+                start: Vec3::new(0.75, 0.1, 0.0),
+                rad: 0.05,
+                kill_y: -5.0,
+            },
         }
     }
 }
@@ -264,6 +282,10 @@ pub enum SceneHandles {
     /// physics tick overwrites it every tick), so the params panel exposes
     /// nothing for it, same reasoning as the oscillating bite radius.
     CubeSphereMorph(CubeSphereMorphHandles),
+    /// [`SceneKind::Gears`]'s two phase params -- both animated (the
+    /// physics tick overwrites them every tick), so the params panel
+    /// exposes nothing for them either.
+    Gears(GearsHandles),
 }
 
 /// Fixed weak handle for the generated ray-marcher shader. A startup system
@@ -1125,6 +1147,14 @@ pub fn build_scene(kind: SceneKind, params: &mut Params) -> (Object, SceneHandle
             animations.push((morph_handles.t, morph_handles.t_anim.clone()));
             (object, SceneHandles::CubeSphereMorph(morph_handles))
         }
+        SceneKind::Gears => {
+            let (object, gears_handles) = gears(params);
+            // Both phases spin every tick; their initial param values
+            // (set inside `gears()`) already match the anims at tick 0.
+            animations.push((gears_handles.face_phase, gears_handles.face_anim.clone()));
+            animations.push((gears_handles.edge_phase, gears_handles.edge_anim.clone()));
+            (object, SceneHandles::Gears(gears_handles))
+        }
     };
     (object, handles, animations)
 }
@@ -1187,6 +1217,18 @@ pub fn setup(
         // size and input modality, which the raw distance did not.
         camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35);
         camera_orbit.zoom = 3.3;
+    }
+    if kind == SceneKind::Gears {
+        // Frame the whole half-unit assembly from just outside, matching
+        // the reference's orbit (`ro ~= (1.3 cos, 0.5, 1.2 sin)`): close
+        // enough that the tooth meshing reads, far enough to see the gear
+        // ball as a ball. The subject is the assembly, not the marble
+        // (parked off the +X side by `spawn_params`), so like
+        // CubeSphereMorph it takes a zoom preset on top of marble framing:
+        // the rule gives ~0.45 for the `rad = 0.05` marble at 16:9, and
+        // `2.9` scales that to the ~1.3 the reference shot uses.
+        camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35);
+        camera_orbit.zoom = 2.9;
     }
     if kind == SceneKind::HollowDonut {
         // A mild yaw/pitch angles the ring's curve into view rather than
