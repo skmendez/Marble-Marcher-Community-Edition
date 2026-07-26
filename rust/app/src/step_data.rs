@@ -81,7 +81,9 @@ use bevy::prelude::*;
 use bevy::render::camera::RenderTarget;
 use bevy::render::gpu_readback::{Readback, ReadbackComplete};
 use bevy::render::render_asset::RenderAssets;
-use bevy::render::render_resource::binding_types::{storage_buffer_read_only, texture_2d, uniform_buffer};
+use bevy::render::render_resource::binding_types::{
+    storage_buffer_read_only, texture_2d, texture_3d, uniform_buffer,
+};
 use bevy::render::render_resource::{
     AsBindGroup, AsBindGroupError, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
     BindGroupLayoutEntry, BindingResources, Extent3d, PreparedBindGroup, ShaderRef, ShaderStages,
@@ -138,6 +140,9 @@ const STEPDATA_SHADER_HANDLE: Handle<Shader> = weak_handle!("2c9f4e6a-8b1d-4f7c-
 pub struct StepDataMaterial {
     pub coarse: Handle<Image>,
     pub shadow: Handle<Image>,
+    /// The mesh-distance grid (`render::MeshSdfImage`; dummy when the
+    /// scene has no `TriMesh`).
+    pub mesh_sdf: Handle<Image>,
 }
 
 impl AsBindGroup for StepDataMaterial {
@@ -162,6 +167,7 @@ impl AsBindGroup for StepDataMaterial {
         let params = buffers.params.binding().ok_or(AsBindGroupError::RetryNextUpdate)?;
         let coarse = images.get(&self.coarse).ok_or(AsBindGroupError::RetryNextUpdate)?;
         let shadow = images.get(&self.shadow).ok_or(AsBindGroupError::RetryNextUpdate)?;
+        let mesh_sdf = images.get(&self.mesh_sdf).ok_or(AsBindGroupError::RetryNextUpdate)?;
         let bind_group = render_device.create_bind_group(
             Self::label(),
             layout,
@@ -170,6 +176,7 @@ impl AsBindGroup for StepDataMaterial {
                 (1, params),
                 (2, &coarse.texture_view),
                 (3, &shadow.texture_view),
+                (4, &mesh_sdf.texture_view),
             )),
         );
         Ok(PreparedBindGroup { bindings: BindingResources(Vec::new()), bind_group, data: () })
@@ -196,6 +203,7 @@ impl AsBindGroup for StepDataMaterial {
                 (1, storage_buffer_read_only::<Vec<Vec4>>(false)),
                 (2, texture_2d(TextureSampleType::Float { filterable: true })),
                 (3, texture_2d(TextureSampleType::Float { filterable: true })),
+                (4, texture_3d(TextureSampleType::Float { filterable: false })),
             ),
         )
         .to_vec()
@@ -297,6 +305,7 @@ pub fn setup_step_data_pipeline(
     coarse_render_target: Res<CoarseRenderTarget>,
     shadow_render_target: Res<crate::shadow_pass::ShadowRenderTarget>,
     mp: Res<MultiplayerSession>,
+    mesh_sdf: Res<crate::render::MeshSdfImage>,
 ) {
     if !config.gpu_profile_enabled {
         return;
@@ -309,6 +318,7 @@ pub fn setup_step_data_pipeline(
     let material = materials.add(StepDataMaterial {
         coarse: coarse_render_target.image.clone(),
         shadow: shadow_render_target.image.clone(),
+        mesh_sdf: mesh_sdf.0.clone(),
     });
 
     commands

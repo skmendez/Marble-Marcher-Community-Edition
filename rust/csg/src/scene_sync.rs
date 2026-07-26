@@ -220,6 +220,25 @@ mod tests {
     }
 
     #[test]
+    fn trimesh_and_bunny_scene_round_trip() {
+        // A small closed mesh (octahedron) as a raw node...
+        let verts = vec![
+            Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z,
+        ];
+        let tris = vec![
+            [0, 2, 4], [2, 1, 4], [1, 3, 4], [3, 0, 4],
+            [2, 0, 5], [1, 2, 5], [3, 1, 5], [0, 3, 5],
+        ];
+        let mesh = crate::trimesh::TriMeshData::new(verts, tris).unwrap();
+        assert_object_round_trips(&Object::TriMesh { mesh: std::sync::Arc::new(mesh) });
+        // ...and the real bunny scene (mesh + floor + color folds), whose
+        // Debug identity is the mesh's content hash.
+        let mut params = Params::new();
+        let object = scenes::bunny(&mut params);
+        assert_object_round_trips(&object);
+    }
+
+    #[test]
     fn deeply_nested_tree_round_trips() {
         let nested = Object::Union(
             Box::new(Object::Fractal {

@@ -198,6 +198,7 @@ fn build_entries(handles: &SceneHandles, params: &Params) -> Vec<ParamEntry> {
         // Both gear phases are Expr-animated too (counter-rotating tooth
         // phases, overwritten every physics tick) -- nothing to expose.
         SceneHandles::Gears(_) => {}
+        SceneHandles::Bunny => {}
     }
     entries
 }

@@ -81,6 +81,15 @@ pub enum Object {
     /// clip it with `Intersect` where a finite bound matters (the gears
     /// scene intersects it with a spherical shell).
     Cylinder { radius: ScalarValue },
+    /// An arbitrary watertight triangle mesh (`rust/MESH_SDF.md`): the CPU
+    /// side is the *exact* signed distance -- BVH closest-feature query with
+    /// angle-weighted pseudonormal sign (`trimesh.rs`'s module doc for the
+    /// closedness precondition, validated at construction/decode). The GPU
+    /// side samples a baked distance grid instead (`codegen`'s `de_mesh`),
+    /// approximate-but-conservative; physics never touches it. `Arc` keeps
+    /// `Object`'s ubiquitous `Clone` cheap -- the mesh (and its BVH and
+    /// pseudonormal tables) is immutable shared data, not per-node state.
+    TriMesh { mesh: std::sync::Arc<crate::trimesh::TriMeshData> },
 }
 
 impl Object {
@@ -121,6 +130,9 @@ impl Object {
                 major.handle_valid_for(slot_count) && minor.handle_valid_for(slot_count)
             }
             Object::Cylinder { radius } => radius.handle_valid_for(slot_count),
+            // No live params in v1: rigid motion comes from wrapping folds,
+            // which have their own handles.
+            Object::TriMesh { .. } => true,
         }
     }
 
@@ -170,6 +182,7 @@ impl Object {
             Object::Cylinder { radius } => {
                 (Vec2::new(p.x, p.z).length() - radius.get(params)) / p.w
             }
+            Object::TriMesh { mesh } => mesh.de(p),
         }
     }
 
@@ -354,6 +367,10 @@ impl Object {
                 let dir = if xz.length() > 1e-9 { xz.normalize() } else { Vec2::X };
                 Vec3::new(dir.x * r, p.y, dir.y * r)
             }
+            // Exact: the BVH query that computes `de` *is* the closest
+            // point (better than Morph's Newton fallback -- see MESH_SDF.md
+            // section 1).
+            Object::TriMesh { mesh } => mesh.closest(p.truncate()).0,
         }
     }
 
@@ -468,6 +485,7 @@ impl Object {
             // Infinite along Y -- genuinely unbounded, resolved by an
             // enclosing `Intersect` exactly like `Modulo` tilings.
             Object::Cylinder { .. } => None,
+            Object::TriMesh { mesh } => Some(mesh.bounding_sphere()),
         }
     }
 
@@ -535,6 +553,10 @@ impl Object {
                 out.push(10);
                 radius.encode(out);
             }
+            Object::TriMesh { mesh } => {
+                out.push(11);
+                mesh.encode(out);
+            }
         }
     }
 
@@ -542,6 +564,28 @@ impl Object {
         let mut out = Vec::new();
         self.encode(&mut out);
         out
+    }
+
+    /// First `TriMesh` node in the tree, if any -- the app bakes and binds
+    /// this mesh's grid, and codegen inlines its [`crate::trimesh::GridSpec`]
+    /// constants into `de_mesh`. **v1 supports one distinct mesh per scene**
+    /// (one bound grid texture); additional `TriMesh` nodes referencing the
+    /// *same* mesh are fine, but a second distinct mesh would render with
+    /// the first one's grid (its CPU physics stays exact regardless).
+    pub fn find_trimesh(&self) -> Option<&std::sync::Arc<crate::trimesh::TriMeshData>> {
+        match self {
+            Object::TriMesh { mesh } => Some(mesh),
+            Object::Sphere { .. }
+            | Object::Cuboid { .. }
+            | Object::Torus { .. }
+            | Object::Cylinder { .. } => None,
+            Object::Fractal { base, .. } => base.find_trimesh(),
+            Object::Union(a, b)
+            | Object::Intersect(a, b)
+            | Object::Difference(a, b) => a.find_trimesh().or_else(|| b.find_trimesh()),
+            Object::Offset { base, .. } | Object::Onion { base, .. } => base.find_trimesh(),
+            Object::Morph { a, b, .. } => a.find_trimesh().or_else(|| b.find_trimesh()),
+        }
     }
 
     /// Inverse of [`Self::encode`]/[`Self::to_bytes`] — `None` on any
@@ -613,6 +657,10 @@ impl Object {
             10 => {
                 let (radius, pos) = ScalarValue::decode_at(bytes, pos)?;
                 (Object::Cylinder { radius }, pos)
+            }
+            11 => {
+                let (mesh, pos) = crate::trimesh::TriMeshData::decode_at(bytes, pos)?;
+                (Object::TriMesh { mesh: std::sync::Arc::new(mesh) }, pos)
             }
             _ => return None,
         };

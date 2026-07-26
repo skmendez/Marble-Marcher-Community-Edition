@@ -45,11 +45,15 @@ use bevy::ecs::system::SystemParamItem;
 use bevy::image::Image;
 use bevy::prelude::*;
 use bevy::render::camera::RenderTarget;
-use bevy::render::render_resource::binding_types::{storage_buffer_read_only, uniform_buffer};
+use bevy::render::render_asset::RenderAssets;
+use bevy::render::render_resource::binding_types::{
+    storage_buffer_read_only, texture_3d, uniform_buffer,
+};
+use bevy::render::texture::GpuImage;
 use bevy::render::render_resource::{
     AsBindGroup, AsBindGroupError, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
     BindGroupLayoutEntry, BindingResources, Extent3d, PreparedBindGroup, ShaderRef, ShaderStages,
-    TextureDimension, TextureFormat, TextureUsages, UnpreparedBindGroup,
+    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, UnpreparedBindGroup,
 };
 use bevy::render::renderer::RenderDevice;
 use bevy::render::view::RenderLayers;
@@ -116,11 +120,15 @@ const COARSE_MARCHER_SHADER_HANDLE: Handle<Shader> =
 /// is never mutated after setup and its bind group is created exactly
 /// once.
 #[derive(Asset, TypePath, Clone)]
-pub struct CoarseMarcherMaterial {}
+pub struct CoarseMarcherMaterial {
+    /// The mesh-distance grid (`render::MeshSdfImage`; dummy when the
+    /// scene has no `TriMesh`) -- the coarse pass marches `de_scene` too.
+    pub mesh_sdf: Handle<Image>,
+}
 
 impl AsBindGroup for CoarseMarcherMaterial {
     type Data = ();
-    type Param = SRes<MarcherGpuBuffers>;
+    type Param = (SRes<MarcherGpuBuffers>, SRes<RenderAssets<GpuImage>>);
 
     fn label() -> Option<&'static str> {
         Some("coarse_marcher_material")
@@ -130,16 +138,21 @@ impl AsBindGroup for CoarseMarcherMaterial {
         &self,
         layout: &BindGroupLayout,
         render_device: &RenderDevice,
-        buffers: &mut SystemParamItem<'_, '_, Self::Param>,
+        (buffers, images): &mut SystemParamItem<'_, '_, Self::Param>,
     ) -> Result<PreparedBindGroup<Self::Data>, AsBindGroupError> {
         // `RetryNextUpdate` until `gpu::write_marcher_buffers`'s first run
         // has allocated the shared buffers (render.rs's fine impl doc).
         let scene = buffers.coarse_scene.binding().ok_or(AsBindGroupError::RetryNextUpdate)?;
         let params = buffers.params.binding().ok_or(AsBindGroupError::RetryNextUpdate)?;
+        let mesh_sdf = images.get(&self.mesh_sdf).ok_or(AsBindGroupError::RetryNextUpdate)?;
         let bind_group = render_device.create_bind_group(
             Self::label(),
             layout,
-            &BindGroupEntries::with_indices(((0, scene), (1, params))),
+            &BindGroupEntries::with_indices((
+                (0, scene),
+                (1, params),
+                (2, &mesh_sdf.texture_view),
+            )),
         );
         Ok(PreparedBindGroup { bindings: BindingResources(Vec::new()), bind_group, data: () })
     }
@@ -163,6 +176,7 @@ impl AsBindGroup for CoarseMarcherMaterial {
             (
                 (0, uniform_buffer::<SceneUniforms>(false)),
                 (1, storage_buffer_read_only::<Vec<Vec4>>(false)),
+                (2, texture_3d(TextureSampleType::Float { filterable: false })),
             ),
         )
         .to_vec()
@@ -287,6 +301,7 @@ pub fn setup_mrrm_pipeline(
     windows: Query<&Window, With<PrimaryWindow>>,
     scene_state: Res<SceneState>,
     mp: Res<MultiplayerSession>,
+    mesh_sdf: Res<crate::render::MeshSdfImage>,
 ) {
     let wgsl = generate_coarse_shader(&mp.sim.scene().object);
     shaders.insert(
@@ -310,7 +325,8 @@ pub fn setup_mrrm_pipeline(
         fine_material.coarse = image_handle.clone();
     }
 
-    let coarse_material = coarse_materials.add(CoarseMarcherMaterial {});
+    let coarse_material =
+        coarse_materials.add(CoarseMarcherMaterial { mesh_sdf: mesh_sdf.0.clone() });
 
     commands.spawn((
         Camera2d,
