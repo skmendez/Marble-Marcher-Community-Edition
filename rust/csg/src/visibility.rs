@@ -49,20 +49,30 @@ pub trait Sdf {
     /// negative inside, never an *over*estimate of the true distance.
     fn de(&self, p: Vec3) -> f32;
 
-    /// Outward direction at `p` (away from the nearest surface), via the
-    /// standard 4-tap tetrahedral gradient. `eps` should be small relative
-    /// to the local feature size but large enough not to be swamped by
-    /// `f32` noise -- callers pass a fraction of the camera radius.
+    /// Gradient of [`Self::de`] at `p`, via the standard 4-tap tetrahedral
+    /// stencil. `eps` should be small relative to the local feature size but
+    /// large enough not to be swamped by `f32` noise -- callers pass a
+    /// fraction of the camera radius.
+    ///
+    /// **The magnitude is meaningful and is the point of returning it.** A
+    /// true distance field has `|grad| == 1` wherever it is differentiable;
+    /// the fields in this crate only ever *under*estimate, and where they
+    /// underestimate badly they do it by going flat (`Object::Morph`'s doc
+    /// makes the `|grad| < 1` promise explicit). So the magnitude is a
+    /// direct, local, four-`de` answer to "can I trust a linear model of
+    /// this field here?" -- which is what [`sweep`] needs to decide whether
+    /// a march that ran out of budget learned anything.
     ///
     /// A default rather than a required method so analytic test worlds get
     /// it for free; [`SceneSdf`] does not override it either (the exact
     /// `Object::nearest_point` alternative costs ~40% more than these four
-    /// `de` calls on the demo scene and is no more accurate for this use,
-    /// which only needs a direction).
-    fn outward(&self, p: Vec3, eps: f32) -> Vec3 {
+    /// `de` calls on the demo scene and is no more accurate for this use).
+    fn gradient(&self, p: Vec3, eps: f32) -> Vec3 {
         // Tetrahedral 4-tap gradient (the standard ray-marching normal):
         // four samples at alternating corners of a tetrahedron, weighted by
-        // their own offset directions.
+        // their own offset directions. The `4 * eps` normalisation is what
+        // makes this the gradient rather than merely its direction: for a
+        // linear field `de(p) = p . a`, the weighted sum comes to `4 eps a`.
         const K: [Vec3; 4] = [
             Vec3::new(1.0, -1.0, -1.0),
             Vec3::new(-1.0, -1.0, 1.0),
@@ -73,7 +83,13 @@ pub trait Sdf {
         for k in K {
             g += k * self.de(p + k * eps);
         }
-        g.normalize_or_zero()
+        g / (4.0 * eps.max(1e-9))
+    }
+
+    /// Outward direction at `p` (away from the nearest surface) — the
+    /// normalised [`Self::gradient`].
+    fn outward(&self, p: Vec3, eps: f32) -> Vec3 {
+        self.gradient(p, eps).normalize_or_zero()
     }
 }
 
@@ -127,31 +143,44 @@ pub struct SweepConfig {
     pub max_steps: u32,
 }
 
-/// How much clearance a stalled march may still have and still be called a
-/// genuine wall rather than "the budget ran out" — in camera radii.
+/// How close to `1` the local `|grad de|` must be for a stalled march to
+/// finish the job by extrapolation rather than give up (see
+/// [`Sweep::exhausted`]).
 ///
-/// Distinguishes the two ways [`SweepConfig::max_steps`] gets spent, which
-/// call for opposite responses (see [`Sweep::exhausted`]):
+/// This is what distinguishes the two ways [`SweepConfig::max_steps`] gets
+/// spent, which call for opposite responses:
 ///
 ///  - **Converging onto a surface.** The classic grazing ray: each step is
 ///    `h - camera_radius`, so a ray closing on a wall at a shallow angle
-///    shrinks its steps geometrically and creeps forever without formally
-///    touching. Its `t` at the stall is a *good* bound — measured against an
-///    analytic plane it lands within 3% of the exact answer — and the ball
-///    demonstrably cannot get much further, because its clearance there is
-///    already down at `camera_radius`.
+///    shrinks its steps geometrically and creeps. This is not a rare corner
+///    — over a floor a marble is resting on it is *every* shallow angle, and
+///    at a 3-unit framing distance it needs 60-130 steps where the budget is
+///    40. But the field there is a real distance field, so where the surface
+///    is can simply be *computed*: one gradient, and the touchdown point
+///    follows.
 ///  - **A slow field.** An underestimating `de` (`Object::Morph` is the
 ///    worst offender in this crate) makes every step short even in open air.
-///    Here `t` means nothing: the ray may have kilometres of clear space
-///    ahead of it, and reporting `t` as a wall dives the camera at an
-///    obstruction that does not exist.
+///    Here nothing can be concluded: the ray may have kilometres of clear
+///    space ahead of it, and inventing a wall dives the camera at an
+///    obstruction that does not exist (`rust/CAMERA.md` §13).
 ///
-/// The clearance at the final sample tells them apart with no extra `de`
-/// calls: the first case stalls with `h` pinned just above `camera_radius`
-/// (that is *why* the steps went to zero), the second stalls with room to
-/// spare. `1.5` sits between "the ball is effectively touching" and any
-/// clearance a camera would care to keep.
-const GRAZING_STALL_RADII: f32 = 1.5;
+/// A true distance field has `|grad| == 1`; a field that underestimates
+/// badly does it by going flat, so the magnitude separates the two directly
+/// and locally. `0.5` is deliberately permissive — the cost of being wrong
+/// in the strict direction is only that a stall falls back to reporting
+/// nothing, which is what it did before extrapolation existed.
+const TRUSTED_GRADIENT: f32 = 0.5;
+
+/// Below this rate of approach, a stalled march does not extrapolate: the
+/// ray is running parallel to (or away from) the surface and the touchdown
+/// point is both enormously far away and enormously sensitive to the
+/// gradient estimate. Reporting nothing is the honest answer there.
+const MIN_CLOSING_RATE: f32 = 0.02;
+
+/// Halvings spent recovering when an extrapolated touchdown turns out to be
+/// inside geometry. Each one is a `de`; four gets within 6% of the crossing,
+/// which is well under the margin `camera_radius` is already reserving.
+const EXTRAPOLATION_BISECTIONS: u32 = 4;
 
 /// What one march along the sightline found.
 #[derive(Clone, Copy, Debug)]
@@ -255,28 +284,65 @@ pub fn sweep(sdf: &impl Sdf, origin: Vec3, dir: Vec3, max_dist: f32, cfg: SweepC
     let mut steps = 0;
     let mut exhausted = false;
     let mut free_distance = max_dist;
-    // Clearance at the most recent sample, so a stall can be classified when
-    // the loop runs out of budget. Starts at infinity: a march given no
-    // budget at all has learned nothing, which is the `exhausted` case.
-    let mut last_h = f32::INFINITY;
     loop {
-        if steps >= cfg.max_steps {
-            // Out of budget short of the goal: only clearance out to `t` has
-            // been established, so that is all this may claim. Whether that
-            // is a *bound* or merely where the march gave up depends on how
-            // much room the ball still had -- see `GRAZING_STALL_RADII`. The
-            // caller is told (`exhausted`) so it can distinguish "nothing
-            // found" from "found something here": they are very different
-            // facts, and conflating them either way is a bug the camera can
-            // be made to show (dives at phantom obstructions in one
-            // direction, ignores real floors in the other).
-            exhausted = last_h > cfg.camera_radius * GRAZING_STALL_RADII;
-            free_distance = t;
+        let h = sdf.de(origin + dir * t);
+        steps += 1;
+        if h > cfg.camera_radius && steps >= cfg.max_steps {
+            // Out of budget short of the goal, with the ball still clear.
+            // Marching further is not an option, but *computing* the rest
+            // may be: the sample gives clearance `h` here, and a gradient
+            // gives the direction the surface lies in and how fast the ray
+            // is closing on it. Where the field is a real distance field
+            // that is a complete local answer -- exact for a plane, which is
+            // what a grazing stall usually is -- and it costs four `de`
+            // calls, paid only on a march that has already given up.
+            //
+            // Where it is *not* (a field that underestimates by going flat)
+            // both tests below fail and this reports `exhausted`, i.e. "no
+            // information", which is what the whole stall case did before.
+            // See `TRUSTED_GRADIENT` for why these are opposite failures and
+            // why they must not be conflated.
+            let g = sdf.gradient(origin + dir * t, cfg.camera_radius * 0.25);
+            let magnitude = g.length();
+            let closing = if magnitude > 1e-9 { -dir.dot(g / magnitude) } else { 0.0 };
+            if magnitude >= TRUSTED_GRADIENT && closing >= MIN_CLOSING_RATE {
+                // The linear model is a *prediction*, so check it before
+                // believing it: one `de` at the predicted touchdown. A
+                // single flat surface -- the case this exists for -- passes
+                // first time. What fails is a scene where the nearest
+                // surface changes identity along the ray (marching down a
+                // corridor between two rows of pillars, the field switches
+                // from one pillar to the next), and there the prediction can
+                // land *inside* geometry, which is the one outcome this
+                // whole module exists to prevent.
+                //
+                // On a miss, bisect back toward the last sample known to be
+                // clear. Four halvings put the answer within 6% of the
+                // crossing and, because only verified-clear midpoints are
+                // ever adopted, always on the safe side of it.
+                let predicted = (t + (h - cfg.camera_radius) / closing).min(max_dist);
+                if sdf.de(origin + dir * predicted) >= cfg.camera_radius {
+                    steps += 1;
+                    free_distance = predicted;
+                } else {
+                    let (mut clear, mut blocked_at) = (t, predicted);
+                    for _ in 0..EXTRAPOLATION_BISECTIONS {
+                        let mid = 0.5 * (clear + blocked_at);
+                        if sdf.de(origin + dir * mid) >= cfg.camera_radius {
+                            clear = mid;
+                        } else {
+                            blocked_at = mid;
+                        }
+                    }
+                    steps += 1 + EXTRAPOLATION_BISECTIONS;
+                    free_distance = clear;
+                }
+            } else {
+                exhausted = true;
+                free_distance = t;
+            }
             break;
         }
-        let h = sdf.de(origin + dir * t);
-        last_h = h;
-        steps += 1;
         if h <= cfg.camera_radius {
             // The ball's surface touches down `camera_radius - h` before
             // this sample (negative when already overlapping, hence the

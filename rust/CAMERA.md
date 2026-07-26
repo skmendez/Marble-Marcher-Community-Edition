@@ -12,7 +12,7 @@ a play-test: the framing rule (§4.2) is on either way, the geometry-aware
 behaviors need the flag.
 Sections 1-5 below are the design as written *before* implementation, kept as
 the record of the reasoning; §11 at the end lists what implementation
-changed, what it measured, and what is still missing; §12-14 are the
+changed, what it measured, and what is still missing; §12-15 are the
 play-test findings that followed, each with the measurement that reproduced
 it. Where any of them disagree with §1-5, the later section is what the code
 does. File/line references in §1-5 are to the pre-implementation code and
@@ -1111,3 +1111,107 @@ from reading as a hard stop.
 The seven-scene probe is unchanged to three decimal places, which is the
 point: this was a case the probe's flight paths never entered, not a
 regression in one they did.
+
+## 15. The same floor, zoomed out
+
+§14 fixed the floor case and shipped, and the reply was "doesn't seem to have
+had much of an effect", with device captures:
+
+```
+bunny: vis 1.00  d 0.816/3.016 (free 0.816)  size 0.335  zoom 3.10   (8.1 deg under)
+bunny: vis 1.00  d 0.195/3.016 (free 0.195)  size 1.623  zoom 3.10  (36.7 deg under)
+```
+
+`zoom 3.10` is the part §14 missed. Zoom multiplies the framing distance, so
+the camera wanted to be 3 units back from a marble sitting 0.15 above a
+floor — a distance no angle more than ~2° below the horizon can deliver.
+§14's regression test ran at zoom 1.0 and passed while the shipped build was
+doing this.
+
+Two mechanisms are supposed to resist. Both had a reason not to, and the
+reasons are at opposite ends of the same range:
+
+| angle under | free  | march steps needed | grad over the 0.05 rad probe |
+|-------------|-------|--------------------|------------------------------|
+| 2.6°        | 2.535 | 127                | 1.33                         |
+| 3.6°        | 1.831 | 90                 | 0.81                         |
+| 5.0°        | 1.319 | 64                 | 0.48                         |
+| 8.1°        | 0.816 | 38                 | 0.21                         |
+| 36.7°       | 0.192 | 5                  | 0.012                        |
+
+The resistance band is `comfort` 2.56 down to `floor` 1.81, i.e. 2.6°–3.6°.
+Resolving *any* of it needs 90–127 march steps against a budget of 40, so
+every angle in the band came back `exhausted` — and §14's fix only rescued
+stalls that had nearly converged, which at this zoom none had. Past the band
+the march resolves easily, and there the *other* guard fired: the gradient
+threshold was a fraction of the **framing** distance, `0.02 × 3.016 =
+0.060`, which is larger than the actual gradient everywhere past 8°. So the
+"equally tight in every direction" escape hatch fired on a gradient that was
+perfectly well-defined, and the constraint switched itself off.
+
+Unreachable from either side. Three fixes.
+
+### Extrapolate through a stall instead of guessing about it
+
+§14's rule — "a stall counts as a wall if the ball was nearly touching" — is
+a proxy for what we actually want to know, and it is a proxy that degrades
+exactly when the march is furthest from finishing.
+
+Ask the question directly instead. At the stall we have a position, a
+clearance, and (for four `de` calls) a gradient. Where the field is a real
+distance field, that is a complete local model of the surface, and the
+touchdown point is arithmetic — exact for a plane, which is what a grazing
+stall usually is. Where it is *not* a real distance field the model is
+worthless, and `|grad de|` says which case this is: a true SDF has `|grad| =
+1`, and the fields that underestimate do it by going flat. §13's phantom
+obstruction was a flat field; this floor is a `|grad| = 1` one. The same
+number separates them, locally, with no reference to the step budget.
+
+The prediction is then *checked* (one `de` at the predicted touchdown) and,
+if it lands inside geometry, bisected back toward the last verified-clear
+sample. That matters where the nearest surface changes identity along the
+ray — down a corridor between two rows of pillars the linear model of the
+pillar you are passing says nothing about the one you are approaching.
+
+### Scale the gradient threshold to the query's error bar, not to the shot
+
+`WALL_GRADIENT_MIN_RADII` is now a quarter of the *camera radius* — the
+sweep's own resolution, since a touchdown located by backing off along the
+ray can be off by about that much. Sizing it to the framing distance was
+wrong by ~50× in the case that mattered.
+
+That threshold was only ever that large to cover a real problem: pressed
+square against a face, clearance improves in *both* screen directions, so
+two one-sided probes both come back positive and their "gradient" points
+diagonally away from a wall that is straight ahead. The fix for that is to
+stop using one-sided differences. The gradient is now central (four probes
+rather than two, paid only when already near a surface), so the symmetric
+case cancels honestly and the threshold no longer has to paper over it.
+
+### A correction that makes things worse is not a correction
+
+Falling out of the pillar test: the last-resort backstop pulls the eye in
+when its clearance is short, three passes of twice the shortfall. But
+"closer to the marble" and "further from the geometry" are not the same
+direction, and with the marble hugging a pillar and the eye in open air
+behind it they are opposites. Unchecked, three passes walked the eye 0.019
+*into* a wall it had been clear of — the last line of defence causing the
+failure it exists to prevent. Each pass is now checked before it is taken,
+and a final fallback takes the sweep's own verified-clear bound if the eye
+is still inside anything.
+
+### Where it lands
+
+Same drag, at the reported zoom and marble size, held for 600 frames:
+
+```
+below 2.44deg  d 2.668/3.017  size 0.090  clr +0.036
+```
+
+88% of the framing distance, with the marble at 0.090 of the frame — which
+is exactly what the framing rule asks for at this zoom, against the 0.335
+and 1.623 in the captures. Pinned by `holds_its_distance_when_zoomed_out_too`,
+kept separate from §14's zoom-1 test precisely because the zoom-1 test is
+the one that said everything was fine.
+
+The nine-scene probe is again unchanged to three decimals.

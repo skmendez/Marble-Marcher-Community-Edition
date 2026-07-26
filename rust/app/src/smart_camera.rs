@@ -250,17 +250,27 @@ const WALL_FLOOR_FRACTION: f32 = 0.6;
 /// (radians, ~3 degrees). Big enough to read past `de` noise on fractal
 /// surfaces, small enough to still be a local gradient.
 const WALL_GRADIENT_EPS: f32 = 0.05;
-/// ...and the smallest clearance change over that angle, as a fraction of
-/// the framing distance, that counts as a real direction to slide along.
+/// ...and the smallest clearance change over that angle, **in camera
+/// radii**, that counts as a real direction to slide along. Below it the two
+/// directions are equally good as far as this query can tell, so there is no
+/// wall to slide along and nothing is constrained.
 ///
-/// Load-bearing rather than hygiene. When the camera is pressed straight at
-/// a wall the gradient is a *minimum*: every direction improves, by almost
-/// nothing, and normalising that near-zero vector produces a confident but
-/// meaningless "into the wall" direction -- which then blocks the player's
-/// rotation in every direction at once, exactly where they most need to get
-/// out. Below this threshold there is no wall direction to speak of, so
-/// nothing is constrained.
-const WALL_GRADIENT_MIN_FRACTION: f32 = 0.02;
+/// Scaled to the camera radius because that is the sweep's own error bar: a
+/// touchdown is located by backing off along the ray, which on an oblique
+/// approach can be off by up to a radius (see `visibility::sweep`). A
+/// difference smaller than that is noise, and normalising noise produces a
+/// confident but meaningless "into the wall" direction.
+///
+/// It was previously a fraction of the *framing* distance, which is the
+/// wrong scale by a factor of ~50 in the case that matters: over a floor at
+/// a steep angle the free distance is small and changes slowly in absolute
+/// terms, so a threshold sized to a 3-unit framing distance discarded a
+/// gradient that was perfectly well-defined and let the camera be dragged
+/// 37 degrees under the floor (`rust/CAMERA.md` §15). That threshold was
+/// only large because the one-sided difference it guarded genuinely was
+/// meaningless when pressed square against a face; the difference is now
+/// central, so that case cancels on its own.
+const WALL_GRADIENT_MIN_RADII: f32 = 0.25;
 
 /// How long after the player stops steering before *elective* repositioning
 /// (the cramped search) is allowed to run again. Safety repositioning -- no
@@ -745,7 +755,21 @@ fn constrain_rotation(
     }
 
     // Which way does clearance improve, in the camera's own screen plane?
-    // Two extra sweeps; only ever paid while actually near a surface.
+    // Four extra sweeps; only ever paid while actually near a surface.
+    //
+    // Central differences, not one-sided. A one-sided pair is half the cost
+    // and gets the *symmetric* case exactly wrong: pressed square against a
+    // face, clearance improves in both directions, so both one-sided probes
+    // come back positive and their "gradient" points diagonally away from a
+    // wall that is really straight ahead -- which then reads half of every
+    // rotation as into-the-surface. That was papered over with a
+    // minimum-magnitude escape hatch, and the hatch is what let the camera
+    // be dragged to 37 degrees under a floor: at a steep angle over a plane
+    // the free distance is small and changes slowly in absolute terms, so a
+    // threshold sized to the *framing* distance swallowed a gradient that
+    // was perfectly well-defined. Central differences make the symmetric
+    // case genuinely cancel, so the threshold can be small and can be scaled
+    // to the only length this query has an error bar in.
     let right = from * Vec3::X;
     let up = from * Vec3::Y;
     let probe = |d: Vec3| {
@@ -755,14 +779,16 @@ fn constrain_rotation(
         // against instead, which contributes zero difference.
         if sw.exhausted { free_wanted } else { sw.free_distance }
     };
+    let central = |axis: Vec3| 0.5 * (probe(u_wanted + axis) - probe(u_wanted - axis));
     let gradient = Vec2::new(
-        probe(u_wanted + right * WALL_GRADIENT_EPS) - free_wanted,
-        probe(u_wanted + up * WALL_GRADIENT_EPS) - free_wanted,
+        central(right * WALL_GRADIENT_EPS),
+        central(up * WALL_GRADIENT_EPS),
     );
-    if gradient.length() < WALL_GRADIENT_MIN_FRACTION * desired {
-        // Equally tight in every direction -- a tunnel, a pocket, or the
-        // camera pressed square against a face. No wall to slide along, so
-        // nothing to constrain (see `WALL_GRADIENT_MIN_FRACTION`).
+    if gradient.length() < WALL_GRADIENT_MIN_RADII * cfg.camera_radius {
+        // Equally tight in both directions -- a tunnel, a pocket, or the
+        // camera pressed square against a face. No wall to slide along, and
+        // (now that the difference is central) no first-order penalty for
+        // turning either way, so nothing to constrain.
         return wanted;
     }
     let into_wall = -gradient.normalize();
@@ -1243,6 +1269,7 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
     // eye a hair inside the surface it was supposed to be pulled out of.
     // Over-correcting is free: the push-out spring gives the distance back
     // as soon as there is room.
+    let eye_at = |d: f32| rig.focus - (rig.orientation * Vec3::NEG_Z) * d;
     let mut clearance = sdf.de(rig.eye());
     if clearance < 0.0 {
         // Actually inside something. Whatever the eased pull-in was doing,
@@ -1267,12 +1294,39 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
     // actually renders -- reporting the pre-correction value (which this
     // did) describes a position that never existed and hides whether the
     // correction worked at all.
+    //
+    // Each pass is also *checked before it is taken*, because "closer to the
+    // marble" and "further from the geometry" are not the same direction and
+    // this loop is exactly where they part company: with the marble hugging
+    // a pillar and the eye in open air behind it, pulling in walks the eye
+    // into the pillar. Unchecked, three passes of that put the eye 0.019
+    // inside a wall it had been clear of, on one frame of the randomised
+    // pillar run -- a correction making things worse, on its own initiative,
+    // in the one piece of code whose entire job is to be the last line of
+    // defence.
     for _ in 0..3 {
         if clearance >= camera_radius || rig.distance <= min_distance {
             break;
         }
-        rig.distance = (rig.distance - 2.0 * (camera_radius - clearance)).max(min_distance);
-        clearance = sdf.de(rig.eye());
+        let candidate = (rig.distance - 2.0 * (camera_radius - clearance)).max(min_distance);
+        let improved = sdf.de(eye_at(candidate));
+        if improved <= clearance {
+            break; // pulling in is not the way out of this one
+        }
+        rig.distance = candidate;
+        clearance = improved;
+    }
+    if clearance < 0.0 {
+        // Still inside. The sweep's own bound is a position its march
+        // verified clear, so prefer it to anything reasoned about above --
+        // but only if it really is better, since a sweep that found nothing
+        // usable can report a bound the eye is no happier at.
+        let bound = free_distance.max(min_distance);
+        let at_bound = sdf.de(eye_at(bound));
+        if at_bound > clearance {
+            rig.distance = bound;
+            clearance = at_bound;
+        }
     }
 
     // --- 9. FOV: widen only as far as geometry has forced us in ---
@@ -2643,14 +2697,28 @@ mod dragging_at_a_floor {
     /// rule wants the camera furthest back there (narrow screen, target
     /// fraction measured across it), so the floor bites soonest.
     fn resting_on_the_ground() -> (CameraRig, SolveInput) {
+        settled(RADIUS, 1.0)
+    }
+
+    /// As above, with the marble radius and zoom the report came in at.
+    ///
+    /// Zoom is not a detail here, it is the whole difficulty: it multiplies
+    /// the framing distance, so at 3.1 the camera wants to be 3 units back
+    /// from a marble sitting 0.15 above the floor. *No* angle below about
+    /// 2 degrees under the horizon can deliver that, the swept march needs
+    /// 60-130 steps to resolve any of the angles that nearly can (budget:
+    /// 40), and past 15 degrees the free distance is so small that its
+    /// gradient looked like nothing next to a 3-unit framing distance. Every
+    /// mechanism that was supposed to resist had a reason not to.
+    fn settled(radius: f32, zoom: f32) -> (CameraRig, SolveInput) {
         let mut rig = CameraRig::default();
         // Level with the marble, looking horizontally: the camera starts
         // exactly where the floor is about to become its problem.
         let mut inp = SolveInput {
-            marble_pos: Vec3::new(0.0, RADIUS, 0.0),
-            marble_radius: RADIUS,
+            marble_pos: Vec3::new(0.0, radius, 0.0),
+            marble_radius: radius,
             intent: Quat::IDENTITY,
-            zoom: 1.0,
+            zoom,
             aspect: 384.0 / 694.0,
             target_fraction: TOUCH_TARGET_FRACTION,
             dt: 1.0 / 60.0,
@@ -2746,6 +2814,39 @@ mod dragging_at_a_floor {
         );
         let after = -(rig.orientation * Vec3::NEG_Z).y;
         assert!(after > before, "and it moved the wrong way ({before:.4} -> {after:.4})");
+    }
+
+    /// The reported configuration exactly: `zoom 3.10`, a `0.10` marble, a
+    /// portrait phone. Kept separate from the zoom-1 case above because it
+    /// is the one that survived the first attempt at this fix — the failure
+    /// scales with zoom, and a test at zoom 1 said everything was fine while
+    /// the shipped build was putting the camera 37 degrees under the floor.
+    #[test]
+    fn holds_its_distance_when_zoomed_out_too() {
+        let (mut rig, mut inp) = settled(0.10, 3.10);
+        let desired = rig.debug.desired_distance;
+        assert!(desired > 2.9, "test setup: reproduces the reported framing distance");
+
+        let mut worst_distance = f32::INFINITY;
+        let mut worst_size: f32 = 0.0;
+        for _ in 0..600 {
+            drag_eye_toward(&rig, &mut inp, Vec3::NEG_Y, 4.0);
+            solve(&mut rig, &mut inp, &Ground);
+            worst_distance = worst_distance.min(rig.distance);
+            worst_size = worst_size.max(rig.debug.screen_fraction);
+            assert!(rig.eye().y > 0.0, "the eye went through the floor");
+        }
+        assert!(
+            worst_distance > WALL_FLOOR_FRACTION * desired,
+            "dragging into the floor cost {:.0}% of the framing distance ({worst_distance:.3} \
+             of {desired:.3})",
+            100.0 * (1.0 - worst_distance / desired)
+        );
+        // The reported screenshots were 0.335 and 1.623 of the frame, with
+        // the framing rule asking for 0.09 at this zoom.
+        assert!(worst_size < 0.20, "marble reached {worst_size:.2} of the frame");
+        let u = -(rig.orientation * Vec3::NEG_Z);
+        assert!(u.y > -0.12, "the camera ended up {:.1} degrees below the horizon", -u.y.asin().to_degrees());
     }
 
     #[test]
