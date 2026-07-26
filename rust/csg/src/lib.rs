@@ -38,6 +38,7 @@ pub mod physics;
 pub mod scene;
 pub mod scene_sync;
 pub mod scenes;
+pub mod trimesh;
 pub mod visibility;
 
 pub use fold::Fold;

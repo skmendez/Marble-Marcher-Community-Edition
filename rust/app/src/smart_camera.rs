@@ -2323,6 +2323,7 @@ mod scene_probe {
             SceneKind::HollowDonut,
             SceneKind::CubeSphereMorph,
             SceneKind::Gears,
+            SceneKind::Bunny,
         ];
         println!(
             "{:<26} {:>5} {:>7} {:>7} {:>7} {:>9} {:>9} {:>9} {:>6} {:>7} {:>7}",

@@ -199,6 +199,7 @@ mod tests {
         assert_eq!(SceneKind::from_value(Some("hollow_donut")), SceneKind::HollowDonut);
         assert_eq!(SceneKind::from_value(Some("cube_sphere_morph")), SceneKind::CubeSphereMorph);
         assert_eq!(SceneKind::from_value(Some("gears")), SceneKind::Gears);
+        assert_eq!(SceneKind::from_value(Some("bunny")), SceneKind::Bunny);
         assert_eq!(SceneKind::from_value(None), SceneKind::MengerOscillatingSphere);
     }
 }

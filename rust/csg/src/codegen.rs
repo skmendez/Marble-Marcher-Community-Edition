@@ -112,6 +112,12 @@ impl CodeWriter {
         self.out
     }
 
+    /// Appends pre-formatted text verbatim (no indentation) -- for helper
+    /// functions built outside the writer, like `mesh_helper`.
+    pub fn raw(&mut self, text: &str) {
+        self.out.push_str(text);
+    }
+
     /// Emit one [`Fold`] step. See the emission table in DESIGN.md §5.
     fn emit_fold(&mut self, fold: &Fold) {
         match fold {
@@ -262,6 +268,13 @@ impl CodeWriter {
                     "d = (length(p.xz) - {}) / p.w;",
                     radius.wgsl()
                 ));
+            }
+            Object::TriMesh { .. } => {
+                // The heavy lifting lives in the `de_mesh` helper emitted by
+                // `generate_scene_functions_with_divisor` with this mesh's
+                // grid constants inlined (one mesh per scene, `Object::
+                // find_trimesh`'s doc).
+                self.writeln("d = de_mesh(p);");
             }
             Object::Fractal { fold, base } => {
                 self.emit_fold(fold);
@@ -566,6 +579,22 @@ const MARBLE_TEXTURE_BINDING: &str = "\
 @group(2) @binding(5) var marble_cubemap: texture_cube<f32>;
 @group(2) @binding(6) var marble_cubemap_sampler: sampler;
 ";
+
+/// The baked mesh-distance grid for `Object::TriMesh` scenes
+/// (`trimesh.rs`'s `bake_grid`, uploaded by the app as a 3D `R32Float`
+/// image). Declared in **every** shader variant -- all four passes march
+/// `de_scene` -- but at a different binding index per variant (each
+/// material's bind-group layout grows by one entry at its own tail; the
+/// index is this function's argument). Scenes without a mesh leave the
+/// declaration unused and bind a 1x1x1 dummy: hand-written bind-group
+/// layouts are static per material type, so the entry must always exist.
+/// Read exclusively with `textureLoad` (manual trilinear in `de_mesh`):
+/// `R32Float` is not filterable without the `float32-filterable` feature,
+/// and exact texel loads keep the sampling math -- including the soundness
+/// margin -- explicit and portable.
+fn mesh_grid_binding(binding: u32) -> String {
+    format!("@group(2) @binding({binding}) var mesh_sdf_tex: texture_3d<f32>;\n")
+}
 
 /// The over-relaxed march loop + its supporting constants, shared verbatim
 /// (DESIGN.md-style "no duplicated logic") between the coarse pass
@@ -1959,9 +1988,68 @@ pub fn generate_scene_functions(obj: &Object) -> String {
 /// [`CodeWriter::iteration_divisor`]'s doc) -- used by
 /// `generate_coarse_shader`/`generate_shadow_shader` to build a cheaper,
 /// lower-detail variant for passes that don't need full fractal fidelity.
+/// `de_mesh` for the scene's (single -- `Object::find_trimesh`'s doc) baked
+/// mesh grid: manual trilinear over `textureLoad` texels, minus a soundness
+/// margin, with the outside-box `max` rule (MESH_SDF.md §4).
+///
+/// The margin is `0.25 * cell` -- a documented compromise, not the rigorous
+/// `cell * sqrt(3)/2` worst case: the worst case is realized only by
+/// features thinner than a cell (a spike through a cell's center), which
+/// construction-side resolution choices avoid, while the full margin would
+/// visibly inflate every mesh by nearly a cell. Marching is robust to the
+/// residual overestimate risk in the usual way: an overshoot lands the next
+/// sample *inside* (negative `d`), which still registers as a hit -- only a
+/// sub-cell-thin wall could be tunneled through, and physics never uses
+/// this field at all (CPU `de` is exact, `trimesh.rs`).
+fn mesh_helper(mesh: &crate::trimesh::TriMeshData) -> String {
+    let g = mesh.grid();
+    let maxi = [g.dims[0] - 1, g.dims[1] - 1, g.dims[2] - 1];
+    format!(
+        "fn de_mesh(p4: vec4<f32>) -> f32 {{\n\
+         \x20   let mg_origin = vec3<f32>({:?}, {:?}, {:?});\n\
+         \x20   let mg_cell = {:?};\n\
+         \x20   let mg_maxi = vec3<f32>({:?}, {:?}, {:?});\n\
+         \x20   let mg_q = clamp((p4.xyz - mg_origin) / mg_cell, vec3<f32>(0.0), mg_maxi - 0.001);\n\
+         \x20   let mg_i = vec3<i32>(floor(mg_q));\n\
+         \x20   let mg_f = mg_q - floor(mg_q);\n\
+         \x20   let s000 = textureLoad(mesh_sdf_tex, mg_i, 0).r;\n\
+         \x20   let s100 = textureLoad(mesh_sdf_tex, mg_i + vec3<i32>(1, 0, 0), 0).r;\n\
+         \x20   let s010 = textureLoad(mesh_sdf_tex, mg_i + vec3<i32>(0, 1, 0), 0).r;\n\
+         \x20   let s110 = textureLoad(mesh_sdf_tex, mg_i + vec3<i32>(1, 1, 0), 0).r;\n\
+         \x20   let s001 = textureLoad(mesh_sdf_tex, mg_i + vec3<i32>(0, 0, 1), 0).r;\n\
+         \x20   let s101 = textureLoad(mesh_sdf_tex, mg_i + vec3<i32>(1, 0, 1), 0).r;\n\
+         \x20   let s011 = textureLoad(mesh_sdf_tex, mg_i + vec3<i32>(0, 1, 1), 0).r;\n\
+         \x20   let s111 = textureLoad(mesh_sdf_tex, mg_i + vec3<i32>(1, 1, 1), 0).r;\n\
+         \x20   let c00 = mix(s000, s100, mg_f.x);\n\
+         \x20   let c10 = mix(s010, s110, mg_f.x);\n\
+         \x20   let c01 = mix(s001, s101, mg_f.x);\n\
+         \x20   let c11 = mix(s011, s111, mg_f.x);\n\
+         \x20   var dm = mix(mix(c00, c10, mg_f.y), mix(c01, c11, mg_f.y), mg_f.z) - {:?};\n\
+         \x20   let mg_hi = mg_origin + mg_maxi * mg_cell;\n\
+         \x20   let mg_out = length(p4.xyz - clamp(p4.xyz, mg_origin, mg_hi));\n\
+         \x20   if (mg_out > 0.0) {{\n\
+         \x20       dm = max(dm, mg_out);\n\
+         \x20   }}\n\
+         \x20   return dm / p4.w;\n\
+         }}\n\n",
+        g.origin.x,
+        g.origin.y,
+        g.origin.z,
+        g.cell,
+        maxi[0] as f32,
+        maxi[1] as f32,
+        maxi[2] as f32,
+        g.cell * 0.25,
+    )
+}
+
 fn generate_scene_functions_with_divisor(obj: &Object, divisor: i32) -> String {
     let mut w = CodeWriter::new();
     w.iteration_divisor = divisor;
+
+    if let Some(mesh) = obj.find_trimesh() {
+        w.raw(&mesh_helper(mesh));
+    }
 
     w.color_pass = false;
     w.writeln("fn de_scene(p_in: vec4<f32>) -> f32 {");
@@ -2008,6 +2096,8 @@ pub fn generate_shader(obj: &Object) -> String {
     s.push('\n');
     s.push_str(MARBLE_TEXTURE_BINDING);
     s.push('\n');
+    s.push_str(&mesh_grid_binding(7));
+    s.push('\n');
     s.push_str(&generate_scene_functions(obj));
     s.push_str("\n\n");
     s.push_str(MARCH_CORE);
@@ -2040,6 +2130,8 @@ pub fn generate_stepdata_shader(obj: &Object) -> String {
     s.push_str(COARSE_TEXTURE_BINDING);
     s.push('\n');
     s.push_str(SHADOW_TEXTURE_BINDING);
+    s.push('\n');
+    s.push_str(&mesh_grid_binding(4));
     s.push('\n');
     s.push_str(&generate_scene_functions(obj));
     s.push_str("\n\n");
@@ -2078,6 +2170,8 @@ pub fn generate_coarse_shader(obj: &Object) -> String {
     let mut s = String::new();
     s.push_str("#import bevy_sprite::mesh2d_vertex_output::VertexOutput\n\n");
     s.push_str(&generate_library());
+    s.push('\n');
+    s.push_str(&mesh_grid_binding(2));
     s.push('\n');
     s.push_str(&generate_scene_functions_with_divisor(
         obj,
@@ -2132,6 +2226,8 @@ pub fn generate_shadow_shader(obj: &Object) -> String {
     s.push_str(&generate_library());
     s.push('\n');
     s.push_str(COARSE_TEXTURE_BINDING);
+    s.push('\n');
+    s.push_str(&mesh_grid_binding(3));
     s.push('\n');
     s.push_str(&generate_scene_functions(obj));
     s.push_str("\n\n");
@@ -2589,6 +2685,38 @@ struct VertexOutput {
         validate_wgsl(&full_coarse_source(&gears_obj));
         validate_wgsl(&full_shadow_source(&gears_obj));
         validate_wgsl(&full_stepdata_source(&gears_obj));
+    }
+
+    #[test]
+    fn trimesh_emission_and_bunny_shader_validate() {
+        let mut params = Params::new();
+        let obj = scenes::bunny(&mut params);
+        // The de arm defers to the grid helper; the helper does manual
+        // trilinear via textureLoad (R32Float is non-filterable) and the
+        // sound outside-box max rule.
+        let src = generate_scene_functions(&obj);
+        assert!(src.contains("d = de_mesh(p);"), "{src}");
+        assert!(src.contains("fn de_mesh"), "{src}");
+        assert!(src.contains("textureLoad(mesh_sdf_tex"), "{src}");
+        assert!(src.contains("dm = max(dm, mg_out);"), "{src}");
+
+        // All four shader variants declare the binding and validate.
+        for full in [
+            full_source(&obj),
+            full_coarse_source(&obj),
+            full_shadow_source(&obj),
+            full_stepdata_source(&obj),
+        ] {
+            assert!(full.contains("var mesh_sdf_tex: texture_3d<f32>;"), "{full}");
+            validate_wgsl(&full);
+        }
+
+        // Scenes *without* a mesh still declare the binding (static
+        // bind-group layouts) but emit no helper and no call.
+        let plain = full_source(&sphere(1.0));
+        assert!(plain.contains("var mesh_sdf_tex: texture_3d<f32>;"));
+        assert!(!plain.contains("fn de_mesh"));
+        validate_wgsl(&plain);
     }
 
     #[test]

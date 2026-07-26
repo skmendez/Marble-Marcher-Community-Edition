@@ -1,5 +1,13 @@
 # Triangle meshes as an `Object` — feasibility analysis
 
+> **Status: implemented** (`csg/src/trimesh.rs`, `Object::TriMesh`,
+> tag 11; `?scene=bunny`). CPU: exact BVH + pseudonormal queries. GPU:
+> §2's Tier 1 baked grid in a `texture_3d`, bound by all four passes.
+> The bunny asset is the res4 zipper scan made watertight offline via
+> winding-number-signed surface nets (its raw form is a triangle soup
+> that `TriMeshData::new`'s closedness validation rightly rejects).
+> §4.6's brick + exact-triangle tier remains future work.
+
 Could `Object::TriMesh` exist, with *every* part of the `Object` API
 implemented efficiently? Short answer: **yes — and the CPU half is easy;
 the design question is entirely on the GPU side.** The right shape is a

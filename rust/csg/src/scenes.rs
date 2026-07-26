@@ -868,6 +868,59 @@ pub fn gears(params: &mut Params) -> (Object, GearsHandles) {
     (object, handles)
 }
 
+/// The embedded Stanford-bunny asset (`csg/assets/bunny.mesh`): the
+/// **full-resolution** zipper reconstruction (34,834 vertices / 69,664
+/// triangles, ~1.2 MB), made watertight offline by fan-filling its five
+/// base boundary loops and dropping unreferenced vertices -- after which
+/// it verifies as a genuine genus-0 closed manifold (Euler characteristic
+/// 2, every edge shared by exactly two consistently-wound faces).
+/// Accuracy-first by explicit request: an earlier attempt shipped the
+/// res4 decimation repaired via winding-number surface nets, and its
+/// ears -- thinner than any affordable extraction cell -- came out
+/// visibly mutilated from every angle. The full scan's visible surface
+/// is untouched here (only the underside holes gain fill triangles);
+/// shrinking the asset again (decimation that respects thin features,
+/// or compression) is a later optimization. Normalized to height 1.0
+/// standing on `y = 0`. The byte layout is exactly
+/// [`crate::trimesh::TriMeshData`]'s serialization, so the asset loader
+/// *is* the decoder.
+const BUNNY_MESH_BYTES: &[u8] = include_bytes!("../assets/bunny.mesh");
+
+/// Pre-albedo-pipeline colors (the [`hollow_donut`] lessons): warm cream
+/// for the bunny, cool slate for the floor it sits on.
+const BUNNY_COLOR: Vec3 = Vec3::new(2.2, 1.6, 1.1);
+const BUNNY_FLOOR_COLOR: Vec3 = Vec3::new(0.25, 0.35, 1.0);
+const BUNNY_FLOOR_HALF: Vec3 = Vec3::new(6.0, 0.15, 6.0);
+
+/// The Stanford bunny standing on a floor slab -- the first
+/// [`Object::TriMesh`] scene (`rust/MESH_SDF.md` made real): CPU physics
+/// collides against the *exact* mesh field (BVH + pseudonormal sign), the
+/// GPU marches the baked grid the app uploads as a `texture_3d`.
+pub fn bunny(_params: &mut Params) -> Object {
+    let (mesh, _len) = crate::trimesh::TriMeshData::decode_at(BUNNY_MESH_BYTES, 0)
+        .expect("embedded bunny asset must decode as a closed manifold");
+    let bunny = Object::Fractal {
+        fold: Fold::OrbitInit(Vec3Value::Const(BUNNY_COLOR)),
+        base: Box::new(Object::TriMesh {
+            mesh: std::sync::Arc::new(mesh),
+        }),
+    };
+    // Floor slab with its top face at y = 0, where the bunny's feet are.
+    let floor = Object::Fractal {
+        fold: Fold::Series(vec![
+            Fold::OrbitInit(Vec3Value::Const(BUNNY_FLOOR_COLOR)),
+            Fold::ScaleTranslate {
+                scale: ScalarValue::Const(1.0),
+                shift: Vec3Value::Const(Vec3::new(0.0, BUNNY_FLOOR_HALF.y, 0.0)),
+            },
+        ]),
+        base: Box::new(Object::Cuboid {
+            half_extent: Vec3Value::Const(BUNNY_FLOOR_HALF),
+        }),
+    };
+    Object::Union(Box::new(floor), Box::new(bunny))
+}
+
 /// Writes a full parameter set for the classic fractal tree built by
 /// [`classic`]/[`demo_scene`]. `ang1`/`ang2` are turned into rotation
 /// matrices via [`rotation_mat2`].
@@ -1472,6 +1525,64 @@ mod tests {
         params.set_scalar(edge_phase, 0.0);
         let de = edge.de(p4, &params);
         assert!(de < -0.005, "offset-less edge gear should present a tooth, de={de}");
+    }
+
+    /// The embedded bunny asset must decode -- which *is* the watertight /
+    /// consistent-orientation check, since `TriMeshData::new` rejects
+    /// anything else (the offline surface-nets repair pipeline's whole
+    /// point).
+    #[test]
+    fn bunny_asset_is_a_closed_manifold() {
+        let (mesh, len) = crate::trimesh::TriMeshData::decode_at(BUNNY_MESH_BYTES, 0)
+            .expect("bunny.mesh must decode");
+        assert_eq!(len, BUNNY_MESH_BYTES.len(), "trailing bytes in the asset");
+        assert!(mesh.tri_count() > 500, "suspiciously small bunny");
+        // Normalized on export: height 1.0 standing on y = 0.
+        let (c, r) = mesh.bounding_sphere();
+        assert!(r > 0.4 && r < 1.0, "bunny bound r={r}");
+        assert!((c.y - 0.5).abs() < 0.1, "bunny should stand on y=0, center {c:?}");
+    }
+
+    #[test]
+    fn bunny_scene_fields_read_correctly() {
+        let mut params = Params::new();
+        let object = bunny(&mut params);
+
+        // Inside the bunny's body.
+        let d = object.de(Vec4::new(0.0, 0.45, 0.0, 1.0), &params);
+        assert!(d < -0.02, "body should be solid, de={d}");
+        // Well above it: free air.
+        let d = object.de(Vec4::new(0.0, 1.6, 0.0, 1.0), &params);
+        assert!(d > 0.3, "air above de={d}");
+        // On the floor top far from the bunny: de is the height above it.
+        let d = object.de(Vec4::new(3.0, 0.5, 3.0, 1.0), &params);
+        assert!((d - 0.5).abs() < 1e-5, "floor-height de={d}");
+        // Inside the floor slab.
+        let d = object.de(Vec4::new(0.0, -0.2, 3.0, 1.0), &params);
+        assert!(d < -0.05, "floor solid de={d}");
+        // Marble spawn (render.rs: (1.1, 0.3, 0.0), rad 0.1) is free with
+        // margin.
+        let d = object.de(Vec4::new(1.1, 0.3, 0.0, 1.0), &params);
+        assert!(d > 0.15, "spawn clearance de={d}");
+
+        // Mesh-branch nearest point is *exact*: for a probe whose nearest
+        // scene surface is the bunny, |p - np| == |de| to float precision
+        // (the BVH query answers both -- stronger than the generic 2x
+        // consistency the approximate nodes get).
+        let p = Vec4::new(0.0, 1.2, 0.0, 1.0);
+        let d = object.de(p, &params);
+        let np = object.nearest_point(p, &params);
+        assert!(
+            ((p.truncate() - np).length() - d.abs()).abs() < 1e-5,
+            "mesh nearest point not exact: |p-np|={} de={d}",
+            (p.truncate() - np).length()
+        );
+
+        // The tree carries exactly one mesh, and the whole scene stays
+        // bounded (floor slab dominates).
+        assert!(object.find_trimesh().is_some());
+        let (_c, r) = object.bounding_sphere(&params).unwrap();
+        assert!(r.is_finite() && r < 15.0);
     }
 
     /// CPU physics path: nearest-point queries on the gears scene must be

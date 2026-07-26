@@ -35,7 +35,7 @@ use bevy::prelude::*;
 use bevy::render::camera::{RenderTarget, Viewport};
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::binding_types::{
-    sampler, storage_buffer_read_only, texture_2d, texture_cube, uniform_buffer,
+    sampler, storage_buffer_read_only, texture_2d, texture_3d, texture_cube, uniform_buffer,
 };
 use bevy::render::render_resource::{
     AsBindGroup, AsBindGroupError, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
@@ -54,7 +54,7 @@ use marble_csg::codegen::generate_shader;
 use marble_csg::expr::Expr;
 use marble_csg::physics::{Marble, PhysicsConfig};
 use marble_csg::scenes::{
-    beware_of_bumps, classic, cube_sphere_morph, demo_scene, gears, hollow_donut,
+    beware_of_bumps, bunny, classic, cube_sphere_morph, demo_scene, gears, hollow_donut,
     menger_oscillating_sphere, menger_sphere, menger_sponge, set_fractal_params,
     set_menger_params, ClassicHandles, CubeSphereMorphHandles, GearsHandles, HollowDonutHandles,
     MengerHandles, MengerOscillatingSphereHandles, MENGER_BITE_MIN_RADIUS,
@@ -121,6 +121,11 @@ pub enum SceneKind {
     /// driven by two `Expr`-animated `PolarModulo` phases, deterministic
     /// across peers like every other animated scene.
     Gears,
+    /// [`marble_csg::scenes::bunny`] -- the Stanford bunny standing on a
+    /// floor slab: the first [`marble_csg::trimesh`] (`Object::TriMesh`)
+    /// scene. Physics collides against the exact BVH mesh field; the shader
+    /// marches the baked grid bound via [`MeshSdfImage`].
+    Bunny,
 }
 
 /// Marble spawn parameters for a scene: start position, radius, kill-plane
@@ -149,6 +154,7 @@ impl SceneKind {
             Some("hollow_donut") => Self::HollowDonut,
             Some("cube_sphere_morph") => Self::CubeSphereMorph,
             Some("gears") => Self::Gears,
+            Some("bunny") => Self::Bunny,
             _ => Self::MengerOscillatingSphere,
         }
     }
@@ -174,6 +180,7 @@ impl SceneKind {
             Self::HollowDonut => "hollow_donut",
             Self::CubeSphereMorph => "cube_sphere_morph",
             Self::Gears => "gears",
+            Self::Bunny => "bunny",
         }
     }
 
@@ -256,6 +263,15 @@ impl SceneKind {
                 rad: 0.05,
                 kill_y: -5.0,
             },
+            // On the floor slab beside the bunny (its bound is a ~0.63
+            // sphere around (0, 0.5, 0)), sized to read against the
+            // 1-unit-tall subject. The kill plane catches a roll off the
+            // slab's 6-unit edge.
+            Self::Bunny => MarbleSpawn {
+                start: Vec3::new(1.1, 0.3, 0.0),
+                rad: 0.1,
+                kill_y: -5.0,
+            },
         }
     }
 }
@@ -286,6 +302,42 @@ pub enum SceneHandles {
     /// physics tick overwrites them every tick), so the params panel
     /// exposes nothing for them either.
     Gears(GearsHandles),
+    /// [`SceneKind::Bunny`] has no live params in v1 (rigid motion for a
+    /// mesh comes from wrapping folds; nothing to expose yet).
+    Bunny,
+}
+
+/// The one live mesh-distance-grid image (`mesh_sdf_tex` in every
+/// generated shader variant): all four marcher materials bind this same
+/// handle, so a scene change re-bakes *into* it (one `Assets::insert`)
+/// and the existing "force-touch the materials" resync dance picks the
+/// new texture view up -- no per-material handle surgery.
+#[derive(Resource, Clone)]
+pub struct MeshSdfImage(pub Handle<Image>);
+
+/// Bakes `object`'s mesh grid into a 3D `R32Float` image, or the 1x1x1
+/// dummy (a single huge positive distance -- "no mesh anywhere") when the
+/// scene has no `TriMesh`. R32Float + `textureLoad`-only sampling avoids
+/// the non-universal `float32-filterable` feature; the bake itself is
+/// `TriMeshData::bake_grid`'s deterministic serial loop of exact queries
+/// (~0.2M queries for a 64-cell grid; a one-time scene-build cost).
+pub fn build_mesh_sdf_image(object: &Object) -> Image {
+    let (dims, data): ([u32; 3], Vec<f32>) = match object.find_trimesh() {
+        Some(mesh) => (mesh.grid().dims, mesh.bake_grid()),
+        None => ([1, 1, 1], vec![1e9]),
+    };
+    let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+    Image::new(
+        Extent3d {
+            width: dims[0],
+            height: dims[1],
+            depth_or_array_layers: dims[2],
+        },
+        TextureDimension::D3,
+        bytes,
+        TextureFormat::R32Float,
+        bevy::asset::RenderAssetUsages::RENDER_WORLD,
+    )
 }
 
 /// Fixed weak handle for the generated ray-marcher shader. A startup system
@@ -456,6 +508,10 @@ pub struct FineMarcherMaterial {
     pub coarse: Handle<Image>,
     pub shadow: Handle<Image>,
     pub marble_texture: Handle<Image>,
+    /// The baked mesh-distance grid ([`MeshSdfImage`]) -- a real bake for
+    /// `TriMesh` scenes, the 1x1x1 dummy otherwise (the layout entry must
+    /// always exist; `marble_csg::codegen`'s `mesh_grid_binding` doc).
+    pub mesh_sdf: Handle<Image>,
 }
 
 impl AsBindGroup for FineMarcherMaterial {
@@ -483,6 +539,7 @@ impl AsBindGroup for FineMarcherMaterial {
         let shadow = images.get(&self.shadow).ok_or(AsBindGroupError::RetryNextUpdate)?;
         let marble_texture =
             images.get(&self.marble_texture).ok_or(AsBindGroupError::RetryNextUpdate)?;
+        let mesh_sdf = images.get(&self.mesh_sdf).ok_or(AsBindGroupError::RetryNextUpdate)?;
         let bind_group = render_device.create_bind_group(
             Self::label(),
             layout,
@@ -494,6 +551,7 @@ impl AsBindGroup for FineMarcherMaterial {
                 (4, marbles),
                 (5, &marble_texture.texture_view),
                 (6, &marble_texture.sampler),
+                (7, &mesh_sdf.texture_view),
             )),
         );
         Ok(PreparedBindGroup { bindings: BindingResources(Vec::new()), bind_group, data: () })
@@ -525,6 +583,10 @@ impl AsBindGroup for FineMarcherMaterial {
                 (4, storage_buffer_read_only::<Vec<Vec4>>(false)),
                 (5, texture_cube(TextureSampleType::Float { filterable: true })),
                 (6, sampler(SamplerBindingType::Filtering)),
+                // R32Float is only `textureLoad`-ed (non-filterable without
+                // the `float32-filterable` feature -- `de_mesh` does manual
+                // trilinear).
+                (7, texture_3d(TextureSampleType::Float { filterable: false })),
             ),
         )
         .to_vec()
@@ -1155,6 +1217,7 @@ pub fn build_scene(kind: SceneKind, params: &mut Params) -> (Object, SceneHandle
             animations.push((gears_handles.edge_phase, gears_handles.edge_anim.clone()));
             (object, SceneHandles::Gears(gears_handles))
         }
+        SceneKind::Bunny => (bunny(params), SceneHandles::Bunny),
     };
     (object, handles, animations)
 }
@@ -1230,6 +1293,13 @@ pub fn setup(
         camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(0.8, 0.35);
         camera_orbit.zoom = 2.9;
     }
+    if kind == SceneKind::Bunny {
+        // Subject is the 1-unit bunny at the origin, marble parked beside
+        // it (the gears convention): zoom the rad-0.1 marble framing
+        // (~0.91) out to a ~2.8 orbit that frames bunny + floor.
+        camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(0.6, 0.25);
+        camera_orbit.zoom = 3.1;
+    }
     if kind == SceneKind::HollowDonut {
         // A mild yaw/pitch angles the ring's curve into view rather than
         // staring straight down the tube axis.
@@ -1247,6 +1317,15 @@ pub fn setup(
         PRESENT_SHADER_HANDLE.id(),
         Shader::from_wgsl(PRESENT_SHADER_WGSL, "generated://present.wgsl"),
     );
+
+    // The mesh-distance grid every material binds (`mesh_sdf_tex`): a real
+    // bake for `TriMesh` scenes, the 1x1x1 "infinitely far away" dummy for
+    // every other scene (the shader never calls `de_mesh` then, but the
+    // bind-group layout entry is static per material type and must always
+    // be satisfiable). Later setup systems (mrrm/shadow/stepdata) and the
+    // scene-sync path reach it through the `MeshSdfImage` resource.
+    let mesh_sdf_handle = images.add(build_mesh_sdf_image(&object));
+    commands.insert_resource(MeshSdfImage(mesh_sdf_handle.clone()));
 
     let bounding_sphere = pack_bounding_sphere(&object, &params);
 
@@ -1292,6 +1371,7 @@ pub fn setup(
         coarse: Handle::default(),
         shadow: Handle::default(),
         marble_texture: images.add(make_placeholder_cubemap()),
+        mesh_sdf: mesh_sdf_handle.clone(),
     });
     commands.insert_resource(MarbleCubemap { loading: marble_cubemap_handle, done: false });
 
@@ -1579,12 +1659,23 @@ pub fn apply_pending_scene_sync(
     mut shadow_materials: ResMut<Assets<ShadowMarcherMaterial>>,
     coarse_quads: Query<&MeshMaterial2d<CoarseMarcherMaterial>, With<CoarseQuad>>,
     shadow_quads: Query<&MeshMaterial2d<ShadowMarcherMaterial>, With<ShadowQuad>>,
+    mut images: ResMut<Assets<Image>>,
+    mesh_sdf: Res<MeshSdfImage>,
 ) {
     let Some(bytes) = pending_scene.0.take() else { return };
     let Some(scene) = Scene::from_bytes(&bytes) else {
         warn!("multiplayer: received an undecodable scene-sync payload -- ignoring it");
         return;
     };
+
+    // Re-bake the mesh grid for the incoming scene (the dummy when it has
+    // no mesh) *into the same image handle*: every material already binds
+    // it, and the force-touch below rebuilds their bind groups against the
+    // fresh texture view. The synced mesh bytes decode through the same
+    // watertightness validation as everything else; the bake is the
+    // deterministic exact-query loop, so host and peer render identical
+    // grids from identical bytes.
+    images.insert(mesh_sdf.0.id(), build_mesh_sdf_image(&scene.object));
 
     // The world is about to be replaced wholesale (and the local marble
     // teleported to wherever the host says it is): snap the camera rather

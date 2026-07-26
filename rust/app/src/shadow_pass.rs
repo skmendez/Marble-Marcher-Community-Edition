@@ -41,7 +41,7 @@ use bevy::prelude::*;
 use bevy::render::camera::RenderTarget;
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::binding_types::{
-    storage_buffer_read_only, texture_2d, uniform_buffer,
+    storage_buffer_read_only, texture_2d, texture_3d, uniform_buffer,
 };
 use bevy::render::render_resource::{
     AsBindGroup, AsBindGroupError, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
@@ -114,6 +114,9 @@ const SHADOW_MARCHER_SHADER_HANDLE: Handle<Shader> =
 #[derive(Asset, TypePath, Clone)]
 pub struct ShadowMarcherMaterial {
     pub coarse: Handle<Image>,
+    /// The mesh-distance grid (`render::MeshSdfImage`; dummy when the
+    /// scene has no `TriMesh`) -- shadow rays march `de_scene` too.
+    pub mesh_sdf: Handle<Image>,
 }
 
 impl AsBindGroup for ShadowMarcherMaterial {
@@ -136,10 +139,16 @@ impl AsBindGroup for ShadowMarcherMaterial {
         let scene = buffers.shadow_scene.binding().ok_or(AsBindGroupError::RetryNextUpdate)?;
         let params = buffers.params.binding().ok_or(AsBindGroupError::RetryNextUpdate)?;
         let coarse = images.get(&self.coarse).ok_or(AsBindGroupError::RetryNextUpdate)?;
+        let mesh_sdf = images.get(&self.mesh_sdf).ok_or(AsBindGroupError::RetryNextUpdate)?;
         let bind_group = render_device.create_bind_group(
             Self::label(),
             layout,
-            &BindGroupEntries::with_indices(((0, scene), (1, params), (2, &coarse.texture_view))),
+            &BindGroupEntries::with_indices((
+                (0, scene),
+                (1, params),
+                (2, &coarse.texture_view),
+                (3, &mesh_sdf.texture_view),
+            )),
         );
         Ok(PreparedBindGroup { bindings: BindingResources(Vec::new()), bind_group, data: () })
     }
@@ -164,6 +173,7 @@ impl AsBindGroup for ShadowMarcherMaterial {
                 (0, uniform_buffer::<SceneUniforms>(false)),
                 (1, storage_buffer_read_only::<Vec<Vec4>>(false)),
                 (2, texture_2d(TextureSampleType::Float { filterable: true })),
+                (3, texture_3d(TextureSampleType::Float { filterable: false })),
             ),
         )
         .to_vec()
@@ -257,6 +267,7 @@ pub fn setup_shadow_pipeline(
     scene_state: Res<SceneState>,
     coarse_render_target: Res<CoarseRenderTarget>,
     mp: Res<MultiplayerSession>,
+    mesh_sdf: Res<crate::render::MeshSdfImage>,
 ) {
     let wgsl = generate_shadow_shader(&mp.sim.scene().object);
     shaders.insert(
@@ -280,8 +291,10 @@ pub fn setup_shadow_pipeline(
         fine_material.shadow = image_handle.clone();
     }
 
-    let shadow_material =
-        shadow_materials.add(ShadowMarcherMaterial { coarse: coarse_render_target.image.clone() });
+    let shadow_material = shadow_materials.add(ShadowMarcherMaterial {
+        coarse: coarse_render_target.image.clone(),
+        mesh_sdf: mesh_sdf.0.clone(),
+    });
 
     commands.spawn((
         Camera2d,
