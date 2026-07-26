@@ -117,10 +117,25 @@ const FOCUS_TAU: f32 = 0.10;
 /// matter how fast it is travelling.
 const MAX_FOCUS_LAG_FRACTION: f32 = 0.25;
 
-/// Distance-spring smoothing when *shortening* (something is in the way).
-/// Near-immediate: lag here means the obstruction is visibly in front of
-/// the marble, or the eye is inside it.
-const PULL_IN_TAU: f32 = 0.05;
+/// Distance-spring smoothing when *shortening* and the eye is already in
+/// contact with something. Near-immediate, because lag here means the eye is
+/// inside geometry and the frame is ruined.
+const PULL_IN_TAU_URGENT: f32 = 0.05;
+/// ...and when it is not. Most pull-ins are not urgent: the space further
+/// out is occupied, but the eye is sitting in clear air and has time to move
+/// like a camera rather than a reflex. Reported from play as a "rapid dolly
+/// in on occlusion", and it was: at the urgent rate, a 4.8-to-0.7 correction
+/// lands in about a twentieth of a second.
+///
+/// Which of the two applies is decided by the eye's *own* clearance, not by
+/// how big the correction is -- a large but safe correction should still be
+/// unhurried, and a small correction into a surface should still be
+/// instant. The two rates are blended continuously across
+/// [`PULL_IN_URGENT_RADII`] so there is no threshold to chatter across.
+const PULL_IN_TAU_SMOOTH: f32 = 0.30;
+/// Clearance, in probe radii, at which the pull-in is fully urgent (0) or
+/// fully unhurried (this value).
+const PULL_IN_URGENT_RADII: f32 = 4.0;
 /// Distance-spring smoothing when *lengthening* (the way is clear again).
 /// Deliberately ~7x slower than pulling in — the asymmetry is what stops a
 /// picket fence of Menger struts from pumping the camera in and out.
@@ -300,10 +315,39 @@ const SEARCH_COMMIT: f32 = 0.4;
 /// situation that triggers it every frame (a marble deep inside a tube).
 const SEARCH_ANGLES: [f32; 2] = [0.7, 1.4];
 
-/// Step budget for the per-frame sightline march. 24 steps costs ~16 µs on
-/// the most expensive scene (`csg/examples/de_bench.rs`); real marches
-/// terminate in a handful of steps.
-const SWEEP_MAX_STEPS: u32 = 24;
+/// Step budget for the per-frame sightline march. Real marches terminate in
+/// a handful of steps; this is the cap for the ones that crawl, which on
+/// this game's fields means anywhere the distance estimate is loose (an
+/// `Object::Morph` mid-blend is loose by construction -- its own doc notes
+/// `|grad| < 1` -- and a crawling march spends its whole budget covering
+/// very little ground). 40 steps costs ~26 µs on the most expensive scene
+/// (`csg/examples/de_bench.rs`).
+const SWEEP_MAX_STEPS: u32 = 40;
+
+/// What a march that ran out of budget means: **not** "blocked here".
+///
+/// A sweep reports `exhausted` when it hit the step cap short of the goal,
+/// and it can only honestly claim clearance out to wherever it got. Treating
+/// that as an obstruction *at* that point is what produced the worst camera
+/// bug of this whole feature: on a loose distance field the march crawls,
+/// runs out of budget a couple of units out, and the solver dives the camera
+/// to a wall that isn't there. Captured on device in `cube_sphere_morph` as
+/// `d 2.063/4.816 (free 2.063) ... clr 0.707 ... steps 36` -- a camera pulled
+/// to 2.06 while its own clearance was 0.707, against a probe radius of
+/// 0.053. Nothing was in the way; the march just gave up.
+///
+/// So an exhausted march contributes no constraint. That is safe *because*
+/// the eye's own clearance is checked independently every frame (step 8 of
+/// [`solve`]), which is a single `de` and cannot crawl: if the camera really
+/// is near a surface, that check finds it and pulls in regardless of what
+/// the march did or didn't manage to establish.
+fn usable_free_distance(sw: &marble_csg::visibility::Sweep, current: f32, desired: f32) -> f32 {
+    if sw.exhausted {
+        current.max(desired.min(sw.free_distance)).max(sw.free_distance)
+    } else {
+        sw.free_distance
+    }
+}
 
 /// Largest simulation step the solver will take in one go. A wasm hitch (a
 /// GC pause, a pipeline compile) otherwise arrives as one enormous `dt` and
@@ -690,7 +734,12 @@ fn constrain_rotation(
     }
 
     let comfort = WALL_COMFORT_FRACTION * desired;
-    let free_wanted = sweep(sdf, focus, u_wanted, probe_dist, cfg).free_distance;
+    let sw_wanted = sweep(sdf, focus, u_wanted, probe_dist, cfg);
+    if sw_wanted.exhausted {
+        // No information, not an obstruction (`usable_free_distance`).
+        return wanted;
+    }
+    let free_wanted = sw_wanted.free_distance;
     if free_wanted >= comfort {
         return wanted; // nothing worth resisting
     }
@@ -699,7 +748,13 @@ fn constrain_rotation(
     // Two extra sweeps; only ever paid while actually near a surface.
     let right = from * Vec3::X;
     let up = from * Vec3::Y;
-    let probe = |d: Vec3| sweep(sdf, focus, d.normalize(), probe_dist, cfg).free_distance;
+    let probe = |d: Vec3| {
+        let sw = sweep(sdf, focus, d.normalize(), probe_dist, cfg);
+        // An exhausted probe says nothing about which way is clearer, so it
+        // must not tilt the gradient; report the sample it is compared
+        // against instead, which contributes zero difference.
+        if sw.exhausted { free_wanted } else { sw.free_distance }
+    };
     let gradient = Vec2::new(
         probe(u_wanted + right * WALL_GRADIENT_EPS) - free_wanted,
         probe(u_wanted + up * WALL_GRADIENT_EPS) - free_wanted,
@@ -790,7 +845,7 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
             desired,
             SweepConfig {
                 camera_radius,
-                target_radius: radius,
+                        target_radius: radius,
                 min_camera_distance: min_distance,
                 max_steps: SWEEP_MAX_STEPS,
             },
@@ -1112,7 +1167,7 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
             deviation = rig.orientation.angle_between(input.intent);
         }
     }
-    let free_distance = sw.free_distance;
+    let free_distance = usable_free_distance(&sw, rig.distance, desired);
 
     // --- 7. distance: fast in, slow out, and only after a hold ---
     let goal = desired.min(free_distance).max(min_distance);
@@ -1130,7 +1185,16 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
     }
     rig.last_goal = goal;
     if goal < rig.distance {
-        spring(&mut rig.distance, &mut rig.distance_vel, goal, PULL_IN_TAU, dt);
+        // How pressed is the camera, right now, at the position it is
+        // actually in? That -- not the size of the correction -- is what
+        // decides whether this needs to be a reflex or a movement.
+        let clearance_now = sdf.de(rig.eye());
+        let urgency =
+            1.0 - (clearance_now / (camera_radius * PULL_IN_URGENT_RADII)).clamp(0.0, 1.0);
+        // Blend the *rates*, not the time constants: a time-constant lerp
+        // spends most of its range near the slow end.
+        let rate = (1.0 / PULL_IN_TAU_SMOOTH) * (1.0 - urgency) + (1.0 / PULL_IN_TAU_URGENT) * urgency;
+        spring(&mut rig.distance, &mut rig.distance_vel, goal, 1.0 / rate, dt);
     } else if rig.room_for > PUSH_OUT_HOLD {
         spring(&mut rig.distance, &mut rig.distance_vel, goal, PUSH_OUT_TAU, dt);
     } else {
@@ -1161,9 +1225,36 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
     // eye a hair inside the surface it was supposed to be pulled out of.
     // Over-correcting is free: the push-out spring gives the distance back
     // as soon as there is room.
-    let clearance = sdf.de(rig.eye());
-    if clearance < camera_radius {
+    let mut clearance = sdf.de(rig.eye());
+    if clearance < 0.0 {
+        // Actually inside something. Whatever the eased pull-in was doing,
+        // it is no longer defensible: take the sweep's bound at once.
+        //
+        // Note this is *not* the same as clamping to the sweep's bound in
+        // general. Sitting beyond it is often perfectly safe -- a thin shell
+        // stops the probe ball while the eye sails past it into clear air on
+        // the far side, which is exactly the case the eased pull-in exists
+        // for. The eye's own clearance is what tells the two apart, and it
+        // is the only thing that can.
+        rig.distance = rig.distance.min(free_distance.max(min_distance));
+        clearance = sdf.de(rig.eye());
+    }
+    // Corrects by *twice* the shortfall, and repeats a few times if that
+    // still isn't enough: pulling in by `d` only recovers `d` of clearance
+    // when the field's gradient along the view ray is 1, and on the grazing
+    // rays where this backstop actually fires it is nowhere near, so a
+    // single correction can leave the eye a hair inside the surface it was
+    // supposed to be pulled out of. Each pass re-reads at the corrected
+    // position, so what ends up reported is the clearance of the camera that
+    // actually renders -- reporting the pre-correction value (which this
+    // did) describes a position that never existed and hides whether the
+    // correction worked at all.
+    for _ in 0..3 {
+        if clearance >= camera_radius || rig.distance <= min_distance {
+            break;
+        }
         rig.distance = (rig.distance - 2.0 * (camera_radius - clearance)).max(min_distance);
+        clearance = sdf.de(rig.eye());
     }
 
     // --- 9. FOV: widen only as far as geometry has forced us in ---
@@ -1780,6 +1871,99 @@ mod tests {
     }
 
     #[test]
+    fn a_march_that_runs_out_of_budget_does_not_invent_an_obstruction() {
+        // Reported from play as a "rapid dolly in on occlusion", captured on
+        // device in `cube_sphere_morph` as
+        // `d 2.063/4.816 (free 2.063) ... clr 0.707/q0.053 ... steps 36`:
+        // a camera pulled in to 2.06 while its own clearance was 0.707,
+        // against a probe radius of 0.053, on a march that had spent its
+        // whole step budget (36 > the 24 it had then). Nothing was in the
+        // way. The march simply crawled -- which is what a march does on a
+        // loose distance estimate, and `Object::Morph`'s mid-blend is loose
+        // by construction -- ran out of budget, and reported "blocked here".
+        //
+        // Modelled here by a field that underestimates by 20x: entirely
+        // empty space that no step budget can cross.
+        struct Molasses;
+        impl Sdf for Molasses {
+            fn de(&self, p: Vec3) -> f32 {
+                // True distance to anything: infinite. Reported: a crawl.
+                (10.0 - p.length()).max(0.0) * 0.05
+            }
+        }
+        let mut rig = CameraRig::default();
+        let mut inp = input(Quat::IDENTITY, 1.0 / 60.0);
+        let want = framing_distance(0.15, FOCAL_LENGTH, POINTER_TARGET_FRACTION, 16.0 / 9.0);
+        for _ in 0..180 {
+            solve(&mut rig, &mut inp, &Molasses);
+        }
+        assert!(
+            (rig.distance - want).abs() < 0.02 * want,
+            "an exhausted march pulled the camera from {want} to {}",
+            rig.distance
+        );
+    }
+
+    #[test]
+    fn a_thin_occluder_is_eased_past_not_snapped_to() {
+        // The other half of the same report. When a *thin* thing crosses the
+        // sightline -- a strut, a gear tooth, fractal filigree -- the camera
+        // ball cannot pass it, so the free distance collapses, but the eye
+        // is still sitting in open air well behind it with real clearance.
+        // That is the case where a 50ms snap is indefensible and an ease is
+        // obviously right, and it is the one the urgency blend exists for:
+        // the rate is chosen from the eye's own clearance, not from the size
+        // of the correction.
+        //
+        // (For a *solid* obstruction the two coincide by construction: the
+        // free distance collapsing and the eye being nearly in contact are
+        // the same event, and the pull-in is fast, as it must be.)
+        // A thin spherical shell around the marble: thinner than the probe
+        // ball, thick enough to block it, and -- unlike a wall or a strut --
+        // equally in the way in every direction, so rotating cannot resolve
+        // it and the distance response is what is under test.
+        struct Shell;
+        impl Sdf for Shell {
+            fn de(&self, p: Vec3) -> f32 {
+                (p.length() - 0.9).abs() - 0.02
+            }
+        }
+        let mut rig = CameraRig::default();
+        let mut inp = input(Quat::IDENTITY, 1.0 / 60.0); // eye at +Z
+        for _ in 0..180 {
+            solve(&mut rig, &mut inp, &Empty);
+        }
+        let open = rig.distance;
+        assert!(open > 1.2, "test setup: expected a roomy start, got {open}");
+
+        let mut frames_to_close_half = None;
+        let mut worst_step = 0.0f32;
+        let mut prev = rig.distance;
+        for i in 0..240 {
+            solve(&mut rig, &mut inp, &Shell);
+            worst_step = worst_step.max((rig.distance - prev).abs());
+            prev = rig.distance;
+            // "Past the shell" -- the shell sits at 0.9, and the camera has
+            // to end up inside it to see the marble at all.
+            if frames_to_close_half.is_none() && rig.distance < 0.88 {
+                frames_to_close_half = Some(i);
+            }
+        }
+        assert!(
+            worst_step < 0.2 * open,
+            "moved {worst_step} in a single frame, {:.0}% of the whole shot",
+            worst_step / open * 100.0
+        );
+        let frames = frames_to_close_half.expect("never pulled in past the shell");
+        assert!(
+            frames >= 6,
+            "closed half the gap in {frames} frames ({:.0}ms) -- that is a cut, not a dolly",
+            frames as f32 / 60.0 * 1000.0
+        );
+        assert!(frames <= 45, "took {frames} frames to react, which is a different bug");
+    }
+
+    #[test]
     fn a_marble_resting_on_a_surface_does_not_collapse_the_shot() {
         // Second half of the reported "camera dives at the marble" bug, and
         // the more serious half: it fired on *approaching* a surface, not
@@ -1987,8 +2171,8 @@ mod scene_probe {
         mean_visibility: f32,
         frames_blocked: usize,
         min_clearance: f32,
-        min_screen_fraction: f32,
         max_screen_fraction: f32,
+        mean_screen_fraction: f32,
         mean_steps: f32,
         frames_too_close: usize,
         max_deviation_deg: f32,
@@ -2023,7 +2207,8 @@ mod scene_probe {
         let frames = 480;
         let (mut min_vis, mut sum_vis, mut blocked) = (1.0f32, 0.0f32, 0usize);
         let mut min_clear = f32::INFINITY;
-        let (mut min_frac, mut max_frac) = (f32::INFINITY, 0.0f32);
+        let mut max_frac = 0.0f32;
+        let mut sum_frac = 0.0f32;
         let mut sum_steps = 0.0f32;
         let mut too_close = 0usize;
         let mut max_dev = 0.0f32;
@@ -2083,8 +2268,8 @@ mod scene_probe {
                 blocked += 1;
             }
             min_clear = min_clear.min(d.eye_clearance);
-            min_frac = min_frac.min(d.screen_fraction);
             max_frac = max_frac.max(d.screen_fraction);
+            sum_frac += d.screen_fraction;
             sum_steps += d.steps as f32;
             if d.screen_fraction > 0.4 {
                 too_close += 1;
@@ -2100,8 +2285,8 @@ mod scene_probe {
             mean_visibility: sum_vis / counted,
             frames_blocked: blocked,
             min_clearance: min_clear,
-            min_screen_fraction: min_frac,
             max_screen_fraction: max_frac,
+            mean_screen_fraction: sum_frac / counted,
             mean_steps: sum_steps / counted,
             frames_too_close: too_close,
             max_deviation_deg: max_dev,
@@ -2123,7 +2308,7 @@ mod scene_probe {
         ];
         println!(
             "{:<26} {:>5} {:>7} {:>7} {:>7} {:>9} {:>9} {:>9} {:>6} {:>7} {:>7}",
-            "scene", "mode", "minVis", "meanVis", "blocked", "minClear", "minSize", "maxSize", "close", "maxDev", "travel"
+            "scene", "mode", "minVis", "meanVis", "blocked", "minClear", "meanSize", "maxSize", "close", "maxDev", "travel"
         );
         let mut failures = Vec::new();
         for kind in scenes {
@@ -2142,7 +2327,7 @@ mod scene_probe {
                 base.frames_blocked,
                 base.frames,
                 base.min_clearance,
-                base.min_screen_fraction,
+                base.mean_screen_fraction,
                 base.max_screen_fraction,
                 base.frames_too_close,
                 base.max_deviation_deg,
@@ -2159,7 +2344,7 @@ mod scene_probe {
                 r.frames_blocked,
                 r.frames,
                 r.min_clearance,
-                r.min_screen_fraction,
+                r.mean_screen_fraction,
                 r.max_screen_fraction,
                 r.frames_too_close,
                 r.max_deviation_deg,
@@ -2190,10 +2375,21 @@ mod scene_probe {
             // exists that would do better while the marble is hugging the
             // wall. Widening the FOV (`MIN_FOCAL_LENGTH`) is what recovers
             // most of the difference; this bound is what's left.
-            let size_bound = if kind == SceneKind::HollowDonut { 0.95 } else { 0.35 };
-            if r.max_screen_fraction > size_bound {
+            // Open scenes are held to the peak; the tube is held to the
+            // *average*, because there the peak is a transient of a camera
+            // squeezing past its own minimum distance in a space that
+            // genuinely cannot fit the shot, while the average is what the
+            // player actually experiences.
+            if kind == SceneKind::HollowDonut {
+                if r.mean_screen_fraction > 0.5 {
+                    failures.push(format!(
+                        "{}: marble averaged {:.2} of frame (bound 0.50)",
+                        r.scene, r.mean_screen_fraction
+                    ));
+                }
+            } else if r.max_screen_fraction > 0.35 {
                 failures.push(format!(
-                    "{}: marble reached {:.2} of frame (bound {size_bound})",
+                    "{}: marble reached {:.2} of frame (bound 0.35)",
                     r.scene, r.max_screen_fraction
                 ));
             }

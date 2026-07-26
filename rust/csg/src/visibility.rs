@@ -221,9 +221,11 @@ pub fn sweep(sdf: &impl Sdf, origin: Vec3, dir: Vec3, max_dist: f32, cfg: SweepC
     loop {
         if steps >= cfg.max_steps {
             // Out of budget short of the goal: only clearance out to `t` has
-            // been established, so that is all this may claim. Never
-            // "clear" -- a march that runs out of budget is grazing
-            // something, and treating that as open is the unsafe direction.
+            // been established, so that is all this may claim. The caller is
+            // told (`exhausted`) so it can distinguish "nothing found" from
+            // "found something here" -- they are very different facts, and
+            // conflating them dives the camera at obstructions that do not
+            // exist (`smart_camera::usable_free_distance`).
             exhausted = true;
             free_distance = t;
             break;
@@ -231,10 +233,10 @@ pub fn sweep(sdf: &impl Sdf, origin: Vec3, dir: Vec3, max_dist: f32, cfg: SweepC
         let h = sdf.de(origin + dir * t);
         steps += 1;
         if h <= cfg.camera_radius {
-            // The camera ball's surface touches down `camera_radius - h`
-            // before this sample (negative when already overlapping, hence
-            // the clamp) -- exact for a plane, conservative otherwise, which
-            // is the safe direction.
+            // The ball's surface touches down `camera_radius - h` before
+            // this sample (negative when already overlapping, hence the
+            // clamp) -- exact for a plane, conservative otherwise, which is
+            // the safe direction.
             free_distance = (t - (cfg.camera_radius - h)).max(0.0);
             break;
         }
@@ -340,7 +342,12 @@ mod tests {
         // Tests that predate `min_camera_distance` keep the old behavior by
         // setting it to the target's own radius (i.e. "the camera's world
         // starts at the target's surface").
-        SweepConfig { camera_radius, target_radius, min_camera_distance: target_radius, max_steps: 64 }
+        SweepConfig {
+            camera_radius,
+            target_radius,
+            min_camera_distance: target_radius,
+            max_steps: 64,
+        }
     }
 
     #[test]

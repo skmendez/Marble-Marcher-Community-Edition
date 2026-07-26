@@ -930,3 +930,74 @@ just pushed?" is otherwise unanswerable from a phone, and answering it wrong
 costs a whole debugging round trip — a bug report against a stale deploy
 looks exactly like a fix that didn't work, which is what happened between
 §11's two fixes.
+
+---
+
+## 13. Phantom obstructions, and how fast a dolly should be
+
+Reported after §12 shipped: still a "rapid dolly in on occlusion". The device
+capture said what no amount of reasoning would have:
+
+```
+vis 0.55  d 2.063/4.816 (free 2.063)  clr 0.707/q0.053  steps 36
+```
+
+A camera pulled in to 2.06 — while its own clearance was **0.707**, against
+a probe radius of **0.053**. Nothing was in the way. And `steps 36`, against
+a step budget of 24.
+
+### The bug: an exhausted march is not an obstruction
+
+The sweep reports `exhausted` when it hits its step cap short of the goal,
+and it could then only honestly claim clearance out to wherever it got. The
+solver read that as "blocked, right here" and dollied to it.
+
+That is fine when the march stops because it *found* something. It is
+catastrophic when the march stops because it ran out of budget — which is
+what happens on a loose distance field, where each step advances by the
+underestimate rather than by the true distance. `Object::Morph`'s mid-blend
+is loose by construction (its own doc says `|grad| < 1`), so in
+`cube_sphere_morph` the march crawled a couple of units, gave up, and the
+camera dived at a wall that was not there. `dev 0deg` in the capture is the
+tell: no rotation ever ran, because on the sightline itself nothing was
+wrong.
+
+An exhausted march now contributes **no constraint at all**. That is safe
+because the eye's own clearance is checked independently every frame — a
+single `de`, which cannot crawl. If the camera really is near a surface,
+that check finds it regardless of what the march did or didn't establish.
+(The step budget also went from 24 to 40, which is a mitigation, not the
+fix: a loose enough field will exhaust any budget.)
+
+### How fast a pull-in should be
+
+The second half of the complaint stands on its own: `PULL_IN_TAU` was
+`0.05s`, which for a large correction is a cut rather than a dolly. It is
+now chosen from the eye's *own* clearance, blending continuously between
+`0.05s` when the eye is in contact with something and `0.30s` when it has
+room — the size of the correction is irrelevant, only whether it is urgent.
+
+Two cases motivate the split, and it is worth being precise about which is
+which, because a plausible-sounding version of this change is wrong:
+
+* For a **solid** obstruction, "the free distance collapsed" and "the eye is
+  nearly touching something" are the *same event* — so the pull-in is fast,
+  as it must be. Nothing changes there.
+* For a **thin** one — a strut, a gear tooth, fractal filigree — the probe
+  ball cannot pass but the eye is in open air well behind it with real
+  clearance. That is where a 50ms snap is indefensible, and where the ease
+  now applies.
+
+Sitting *beyond* the sweep's bound is therefore not automatically unsafe,
+which is why there is no clamp to it: a thin shell stops the probe while the
+eye sails past into clear air on the far side. Only the eye's own clearance
+can tell those apart, so that is what decides — and when it does go
+negative, the camera takes the sweep's bound at once and the backstop
+iterates until it is genuinely out.
+
+Both halves are pinned:
+`a_march_that_runs_out_of_budget_does_not_invent_an_obstruction` (a field
+that underestimates by 20x, in empty space, must not move the camera) and
+`a_thin_occluder_is_eased_past_not_snapped_to` (a shell thinner than the
+probe ball: the camera crosses it, taking more than one frame to do it, and
+never moves more than a fifth of the shot in any single frame).
