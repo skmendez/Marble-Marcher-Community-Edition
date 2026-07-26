@@ -25,10 +25,12 @@
 use glam::{Vec3, Vec4};
 
 /// Grid resolution target for [`TriMeshData::grid`]: cell count along the
-/// mesh's longest axis. 64 puts the cell size of a unit-scale prop near
-/// pixel scale at the game's typical view distances; the volume is
-/// ~64³ f32 ≈ 1 MB, well within budget (MESH_SDF.md §2).
-const GRID_RES: u32 = 64;
+/// mesh's longest axis. 96 keeps thin features several cells thick on the
+/// full-resolution bunny (its ears are ~0.06 of its height; at 64 they
+/// were only ~3 cells and rendered visibly soft) at ~96³ f32 ≈ 3.4 MB --
+/// still fine for a per-scene texture (MESH_SDF.md §2; §4.5's sparse
+/// bricks are the answer if this ever needs to shrink).
+const GRID_RES: u32 = 96;
 
 /// Empty cells of padding around the mesh's AABB on every side. Two cells
 /// keep the trilinear stencil off the boundary for any in-box query and

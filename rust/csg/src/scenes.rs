@@ -868,15 +868,22 @@ pub fn gears(params: &mut Params) -> (Object, GearsHandles) {
     (object, handles)
 }
 
-/// The embedded Stanford-bunny asset (`csg/assets/bunny.mesh`): the res4
-/// zipper reconstruction, made watertight offline (the raw scan is a
-/// notorious triangle soup -- coincident flipped-duplicate flaps, 4- and
-/// 6-fold edges, plus the famous base holes) by extracting the zero level
-/// of its winding-number-signed distance field with surface nets, then
-/// normalized to height 1.0 standing on `y = 0`. 662 vertices / 1316
-/// triangles, ~24 KB -- sized for the scene-sync payload and the wasm
-/// binary alike. The byte layout is exactly [`crate::trimesh::TriMeshData`]'s
-/// serialization, so the asset loader *is* the decoder.
+/// The embedded Stanford-bunny asset (`csg/assets/bunny.mesh`): the
+/// **full-resolution** zipper reconstruction (34,834 vertices / 69,664
+/// triangles, ~1.2 MB), made watertight offline by fan-filling its five
+/// base boundary loops and dropping unreferenced vertices -- after which
+/// it verifies as a genuine genus-0 closed manifold (Euler characteristic
+/// 2, every edge shared by exactly two consistently-wound faces).
+/// Accuracy-first by explicit request: an earlier attempt shipped the
+/// res4 decimation repaired via winding-number surface nets, and its
+/// ears -- thinner than any affordable extraction cell -- came out
+/// visibly mutilated from every angle. The full scan's visible surface
+/// is untouched here (only the underside holes gain fill triangles);
+/// shrinking the asset again (decimation that respects thin features,
+/// or compression) is a later optimization. Normalized to height 1.0
+/// standing on `y = 0`. The byte layout is exactly
+/// [`crate::trimesh::TriMeshData`]'s serialization, so the asset loader
+/// *is* the decoder.
 const BUNNY_MESH_BYTES: &[u8] = include_bytes!("../assets/bunny.mesh");
 
 /// Pre-albedo-pipeline colors (the [`hollow_donut`] lessons): warm cream
