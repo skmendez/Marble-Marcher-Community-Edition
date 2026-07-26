@@ -224,7 +224,7 @@ pub fn touch_camera_input(
                 debug.screen_dir = Some(screen_dir);
                 debug.angle_deg = Some(angle.to_degrees());
             }
-            apply_drag(&mut orbit, &mut rig, delta);
+            apply_drag(&mut orbit, &rig, delta);
         }
     } else if active_count >= 2 {
         if let Some(gesture) = read_two_finger_gesture(&touches) {

@@ -843,3 +843,90 @@ at surface configuration on lavapipe, which broke
 `scripts/headless_screenshot.sh` — was hit here too, but master fixed it
 independently while this branch was in flight, so the merge kept master's
 `cfg(target_arch)`-based version rather than this branch's env-var hatch.)
+
+---
+
+## 12. Orbiting into geometry
+
+Reported from play, after §11 shipped: with a large structure beside the
+marble, rotating the camera slightly took the distance from `1.411` to
+`0.279` in one motion — the camera diving at the marble — while `vis` stayed
+`1.00` the whole time. The marble was never occluded. The camera was simply
+being orbited into a place it could not fit, and the only tool it had was
+the dolly.
+
+### What other games do
+
+The most directly relevant writeup is [Vincent Michel's free-move-zone
+camera design](https://www.gamedeveloper.com/design/third-person-camera-design-with-free-move-zone),
+which spells out a *resolution order* when the character is hidden or the
+camera is crowded:
+
+1. rotate around the free-cam sphere (horizontal first),
+2. move closer, respecting a minimum distance,
+3. both together,
+4. and only as a last resort, approach that minimum.
+
+Two things there matter for this bug. **Rotation comes first and dollying
+second** — the opposite of what this camera was doing. And the camera's
+collider *slides* on the geometry it meets rather than being pushed inward:
+"the camera should never come closer to the minimum distance from the free
+move zone, particularly if it slides on ground/roof when being moved by the
+player."
+
+The same idea shows up as Cinemachine's *Preserve Camera Distance* strategy
+(orbit around the obstruction rather than dolly through it), and the
+[boxcast approach](https://straypixels.net/camera-boxcast/) sizes the probe
+to the near plane for the same reason this camera's probe is a ball: a
+zero-thickness ray reports clear while the near plane is already in the wall.
+
+### What this camera does now
+
+The player's rotation is no longer applied to the realized camera directly.
+Input writes the *intent* only; the solver picks the rotation up in the same
+frame — so it is still exactly 1:1 and undamped — and applies it through
+`constrain_rotation`, which is collide-and-slide in the angular domain:
+
+* Sweep the direction the player is asking for. If it leaves more than
+  `WALL_COMFORT_FRACTION` (0.85) of the framing distance, nothing happens —
+  the constraint is inert in open space, which is almost always.
+* Otherwise, estimate which way clearance improves, in the camera's own
+  screen plane, with two extra sweeps (a finite difference along `right` and
+  `up`). That is the "surface" to slide along.
+* Remove the component of the requested rotation that points into it,
+  ramping from nothing at the comfort distance to *everything* at
+  `WALL_FLOOR_FRACTION` (0.6). So rotation alone can never cost the camera
+  more than 40% of its framing distance, and a rotation that would cost more
+  simply doesn't happen. What remains slides the camera along the surface.
+* Only the into-the-surface component is ever touched: turning away from a
+  wall, or along it, tracks the request exactly.
+
+One subtlety worth stating because it took a debugging round to find. When
+the camera is pressed *square* against a face, the clearance gradient is a
+**minimum**, not a slope: every direction improves, by almost nothing.
+Normalising that near-zero vector yields a confident but meaningless "into
+the wall" direction, which then blocks every rotation at once — precisely
+where the player most needs to get out. So a gradient below
+`WALL_GRADIENT_MIN_FRACTION` of the framing distance is treated as "no wall
+direction here" and nothing is constrained.
+
+The elective reposition (the cramped search, §11) now also waits for the
+player to stop steering (`ELECTIVE_INPUT_IDLE`), and so does the decay back
+toward intent. Safety repositioning — no camera position on this ray at all,
+or a sustained total block — is never gated: it does not compete with the
+player, it rescues them.
+
+Pinned by two tests against a half-space wall, where "into" and "away" are
+unambiguous (`free = 0.6 / u.x`): four seconds of pushing into the wall
+never costs more than the floor allows and never loses sight of the marble;
+and a single frame of turning away tracks the requested rotation to within
+`1e-4` radians while buying clearance back.
+
+### The commit hash in the overlay
+
+`?debug=1`'s last line is now just the build's commit hash, baked in by
+`app/build.rs`. It exists because "is the build I am looking at the build I
+just pushed?" is otherwise unanswerable from a phone, and answering it wrong
+costs a whole debugging round trip — a bug report against a stale deploy
+looks exactly like a fix that didn't work, which is what happened between
+§11's two fixes.

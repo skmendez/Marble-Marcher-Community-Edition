@@ -301,11 +301,11 @@ pub fn orbit_camera_input(
     // seconds, then hands off -- so a capture covers both "the player is
     // steering" and "the player has let go and the solver is on its own".
     if config.autopilot && time.elapsed_secs() < 4.0 {
-        apply_drag(&mut orbit, &mut rig, Vec2::new(1.2, 0.3));
+        apply_drag(&mut orbit, &rig, Vec2::new(1.2, 0.3));
     }
     if mouse_buttons.pressed(MouseButton::Left) {
         for ev in motion.read() {
-            apply_drag(&mut orbit, &mut rig, ev.delta);
+            apply_drag(&mut orbit, &rig, ev.delta);
         }
     } else {
         motion.clear();
@@ -333,15 +333,24 @@ pub fn orbit_camera_input(
     }
 }
 
-/// Applies one swipe to the intent and the realized camera together
-/// ([`orbit_camera_input`]'s doc). Shared with `touch.rs` so a finger swipe
-/// and a mouse drag go through exactly one implementation.
-pub(crate) fn apply_drag(orbit: &mut CameraOrbit, rig: &mut CameraRig, delta: Vec2) {
+/// Applies one swipe to the intent, reading it against the *realized*
+/// camera's screen axes ([`CameraOrbit::drag_rotation`]'s doc). Shared with
+/// `touch.rs` so a finger swipe and a mouse drag go through exactly one
+/// implementation.
+///
+/// The realized camera picks this up in the same frame, inside
+/// `smart_camera::solve`, which applies the same rotation *unless* it would
+/// drive the eye into a surface -- in which case what remains of it slides
+/// the camera along that surface instead
+/// ([`crate::smart_camera::constrain_rotation`]). Applying it to the rig
+/// here as well, which is what this used to do, would defeat that: the rig
+/// would already be inside the wall by the time the solver could object,
+/// leaving it nothing to do but dolly in.
+pub(crate) fn apply_drag(orbit: &mut CameraOrbit, rig: &CameraRig, delta: Vec2) {
     let Some(rotation) = CameraOrbit::drag_rotation(rig.orientation, delta) else {
         return;
     };
     orbit.orientation = (rotation * orbit.orientation).normalize();
-    rig.orientation = (rotation * rig.orientation).normalize();
 }
 
 /// Applies one twist increment to the intent and the realized camera

@@ -199,6 +199,60 @@ const FOCAL_TAU: f32 = 0.5;
 /// on device as `vis 0.00 d 0.225/4.816 (free 0.000) ... steps 1`.
 const CAMERA_RADIUS_MARBLE_RADII: f32 = 0.35;
 
+/// How much of the framing distance the camera wants to keep behind it
+/// before it starts resisting being *rotated* into geometry, and how far it
+/// looks ahead when deciding which way is "into".
+///
+/// The player orbiting the camera into a wall is a different problem from
+/// something moving into the shot, and it wants a different answer. Pulling
+/// in is the right response to an occluder crossing the sightline; it is the
+/// wrong response to the player swinging the camera behind a pillar, where
+/// it reads as the camera suddenly diving at the marble for no reason the
+/// player can see (reported from play: rotating slightly near a large
+/// structure took the distance from 1.411 to 0.279 in one motion, with the
+/// marble fully visible the whole time).
+///
+/// Every third-person camera writeup that treats this case puts *rotation*
+/// first in the resolution order and dollying second -- see `rust/CAMERA.md`
+/// §12. So near geometry, the orbit becomes a constrained one: the component
+/// of the player's rotation that would drive the camera into a surface is
+/// removed, and what remains slides it along the surface instead. The dolly
+/// stays as the safety net it always was, but it stops being the *first*
+/// answer, so it rarely has anywhere dramatic to go.
+const WALL_COMFORT_FRACTION: f32 = 0.85;
+/// ...and the fraction below which the into-the-surface component of a
+/// rotation is removed *entirely*, so the camera simply will not be orbited
+/// any further into a wall. Between the two the removal ramps, which is what
+/// keeps sliding smooth rather than making the controls snag at a threshold.
+///
+/// Together these are the "stay some distance away" the reported behavior
+/// was missing: rotation alone can never cost the camera more than 40% of
+/// its framing distance. Geometry that genuinely gets between the camera and
+/// the marble still can, via the dolly, because that is a real occlusion and
+/// the camera must answer it.
+const WALL_FLOOR_FRACTION: f32 = 0.6;
+/// Finite-difference angle for estimating which way clearance improves
+/// (radians, ~3 degrees). Big enough to read past `de` noise on fractal
+/// surfaces, small enough to still be a local gradient.
+const WALL_GRADIENT_EPS: f32 = 0.05;
+/// ...and the smallest clearance change over that angle, as a fraction of
+/// the framing distance, that counts as a real direction to slide along.
+///
+/// Load-bearing rather than hygiene. When the camera is pressed straight at
+/// a wall the gradient is a *minimum*: every direction improves, by almost
+/// nothing, and normalising that near-zero vector produces a confident but
+/// meaningless "into the wall" direction -- which then blocks the player's
+/// rotation in every direction at once, exactly where they most need to get
+/// out. Below this threshold there is no wall direction to speak of, so
+/// nothing is constrained.
+const WALL_GRADIENT_MIN_FRACTION: f32 = 0.02;
+
+/// How long after the player stops steering before *elective* repositioning
+/// (the cramped search) is allowed to run again. Safety repositioning -- no
+/// camera position on this ray at all, or a sustained total block -- is
+/// never gated: it does not compete with the player, it rescues them.
+const ELECTIVE_INPUT_IDLE: f32 = 0.5;
+
 /// A view is "cramped" when geometry allows less than this fraction of the
 /// distance framing wants. Being cramped is not an emergency -- the marble
 /// is perfectly visible, just too big in frame -- but it is worth *looking*
@@ -294,6 +348,14 @@ pub struct CameraRig {
     search_hold: f32,
     /// Time left on the post-reposition hold. See [`RECOVER_LOCKOUT`].
     recover_lockout: f32,
+    /// The intent as of the previous solve, so this one can recover the
+    /// player's rotation *as a delta* and apply it under the wall-slide
+    /// constraint (see [`WALL_COMFORT_FRACTION`]) instead of the input
+    /// systems applying it to the realized camera directly.
+    last_intent: Quat,
+    /// Seconds since the player last rotated the camera. Gates elective
+    /// repositioning only ([`ELECTIVE_INPUT_IDLE`]).
+    input_idle_for: f32,
     /// Cleared on construction, set the first time [`solve`] runs: the very
     /// first frame snaps rather than springs (there is no previous state to
     /// spring *from*, and starting at distance 0 would put the eye inside
@@ -351,6 +413,8 @@ impl Default for CameraRig {
             search_free: 0.0,
             search_hold: 0.0,
             recover_lockout: 0.0,
+            last_intent: Quat::IDENTITY,
+            input_idle_for: 0.0,
             initialized: false,
             debug: RigDebug::default(),
         }
@@ -595,6 +659,76 @@ fn search_direction(
     best.filter(|(_, _, s)| *s > current_score + 0.25).map(|(dir, free, _)| (dir, free))
 }
 
+/// Applies a requested change of view direction, with the component that
+/// would drive the camera into a surface removed — collide-and-slide, in
+/// the angular domain (see [`WALL_COMFORT_FRACTION`]).
+///
+/// `wanted` is where the camera would go if geometry did not exist: the
+/// player's own rotation this frame, plus any decay back toward their
+/// intent. Returns the orientation to actually adopt.
+///
+/// The removal is proportional, not a threshold: at the comfort distance
+/// nothing is removed, and it ramps to full removal as clearance goes to
+/// zero. So sliding along a wall stays smooth, and a camera that is merely
+/// *near* geometry still turns freely. Only the into-the-surface component
+/// is ever touched — pushing away from a wall, or along it, is untouched, so
+/// the player is never stuck against one.
+fn constrain_rotation(
+    sdf: &impl Sdf,
+    from: Quat,
+    wanted: Quat,
+    focus: Vec3,
+    desired: f32,
+    probe_dist: f32,
+    cfg: SweepConfig,
+) -> Quat {
+    let u_from = -(from * Vec3::NEG_Z);
+    let u_wanted = -(wanted * Vec3::NEG_Z);
+    let motion = u_wanted - u_from;
+    if motion.length_squared() < 1e-12 {
+        return wanted;
+    }
+
+    let comfort = WALL_COMFORT_FRACTION * desired;
+    let free_wanted = sweep(sdf, focus, u_wanted, probe_dist, cfg).free_distance;
+    if free_wanted >= comfort {
+        return wanted; // nothing worth resisting
+    }
+
+    // Which way does clearance improve, in the camera's own screen plane?
+    // Two extra sweeps; only ever paid while actually near a surface.
+    let right = from * Vec3::X;
+    let up = from * Vec3::Y;
+    let probe = |d: Vec3| sweep(sdf, focus, d.normalize(), probe_dist, cfg).free_distance;
+    let gradient = Vec2::new(
+        probe(u_wanted + right * WALL_GRADIENT_EPS) - free_wanted,
+        probe(u_wanted + up * WALL_GRADIENT_EPS) - free_wanted,
+    );
+    if gradient.length() < WALL_GRADIENT_MIN_FRACTION * desired {
+        // Equally tight in every direction -- a tunnel, a pocket, or the
+        // camera pressed square against a face. No wall to slide along, so
+        // nothing to constrain (see `WALL_GRADIENT_MIN_FRACTION`).
+        return wanted;
+    }
+    let into_wall = -gradient.normalize();
+
+    let motion_2d = Vec2::new(motion.dot(right), motion.dot(up));
+    let into = motion_2d.dot(into_wall);
+    if into <= 0.0 {
+        return wanted; // moving along the surface, or away from it
+    }
+    let floor = WALL_FLOOR_FRACTION * desired;
+    let strength = ((comfort - free_wanted) / (comfort - floor).max(1e-4)).clamp(0.0, 1.0);
+    let slid = motion_2d - into_wall * (into * strength);
+    let u_slid = (u_from + right * slid.x + up * slid.y).normalize_or_zero();
+    if u_slid == Vec3::ZERO {
+        return wanted;
+    }
+    // A pure swing, exactly like every other rotation this module applies:
+    // it moves `forward` and cannot introduce twist.
+    (Quat::from_rotation_arc(u_from, u_slid) * from).normalize()
+}
+
 /// One frame of camera solving. Pure: no globals, no time source, no
 /// rendering — everything it needs is in `input` and `sdf`, which is what
 /// makes the behavior testable against analytic worlds (see this module's
@@ -628,6 +762,8 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
         rig.search_dir = None;
         rig.search_hold = 0.0;
         rig.recover_lockout = 0.0;
+        rig.last_intent = input.intent;
+        rig.input_idle_for = ELECTIVE_INPUT_IDLE;
         rig.initialized = true;
     }
 
@@ -641,6 +777,7 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
         // whereas the geometry-aware behaviors are the ones worth being able
         // to switch off when diagnosing a feel complaint.
         rig.orientation = input.intent;
+        rig.last_intent = input.intent;
         rig.focus = input.marble_pos;
         rig.focus_vel = Vec3::ZERO;
         rig.distance_vel = 0.0;
@@ -712,8 +849,41 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
     rig.focus -= forward * depth_error;
     rig.focus_vel -= forward * rig.focus_vel.dot(forward);
 
-    // --- 2. one march along the current sightline ---
+    // --- 2. the player's own rotation, under the wall-slide constraint ---
+    // The input systems write [`CameraOrbit`] only; the realized camera picks
+    // their rotation up here as a delta, so it can be *projected* when it
+    // would drive the camera into a surface. In open space the projection is
+    // inert and this is exactly the rotation the player asked for, applied
+    // the same frame they asked for it -- input stays 1:1 and undamped,
+    // which is the whole contract (`camera::apply_drag`'s doc).
     let camera_radius = CAMERA_RADIUS_MARBLE_RADII * radius;
+    let probe_dist_for_input = desired.max(rig.distance).max(min_distance);
+    let input_cfg = SweepConfig {
+        camera_radius,
+        target_radius: radius,
+        min_camera_distance: min_distance,
+        max_steps: SWEEP_MAX_STEPS,
+    };
+    let player_delta = input.intent * rig.last_intent.inverse();
+    rig.last_intent = input.intent;
+    let delta_angle = player_delta.angle_between(Quat::IDENTITY);
+    if delta_angle > 1e-4 {
+        rig.input_idle_for = 0.0;
+        let wanted = (player_delta * rig.orientation).normalize();
+        rig.orientation = constrain_rotation(
+            sdf,
+            rig.orientation,
+            wanted,
+            rig.focus,
+            desired,
+            probe_dist_for_input,
+            input_cfg,
+        );
+    } else {
+        rig.input_idle_for += dt;
+    }
+
+    // --- 3. one march along the current sightline ---
     let u = -(rig.orientation * Vec3::NEG_Z); // focus -> eye
     // Probe at least as far as the camera currently is: shrinking the probe
     // to `desired` alone would report "clear" for a camera that is already
@@ -729,7 +899,7 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
     };
     let sw = sweep(sdf, rig.focus, u, probe_dist, sweep_cfg);
 
-    // --- 3. direction: slide away from the obstruction, decay to intent ---
+    // --- 4. direction: slide away from the obstruction, decay to intent ---
     let direction_before = rig.orientation;
     // A search commitment (below) outranks both the slide and the decay back
     // to intent for as long as it lasts. Letting them run alongside it is a
@@ -771,12 +941,31 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
     // in the first place, so letting recovery run there would just undo the
     // search's work every frame and leave the camera oscillating in place.
     rig.recover_lockout = (rig.recover_lockout - dt).max(0.0);
+    // Also waits for the player to stop steering: while they are dragging,
+    // the intent is moving under their hand and the realized camera is
+    // already tracking it directly, so a decay toward it does nothing but
+    // fight the wall-slide constraint on the same frame.
     if rig.clear_for > RECOVER_HOLD
         && rig.cramped_for <= 0.0
         && !committed
         && rig.recover_lockout <= 0.0
+        && rig.input_idle_for > ELECTIVE_INPUT_IDLE
     {
-        rig.orientation = rig.orientation.slerp(input.intent, approach(RECOVER_TAU, dt)).normalize();
+        // Through the same constraint as the player's own rotation: the
+        // decay is also a motion toward intent, and intent is exactly where
+        // the camera was prevented from going if the player has been
+        // pushing it into a wall. Unconstrained, it would undo the slide a
+        // little at a time and put the dive back.
+        let wanted = rig.orientation.slerp(input.intent, approach(RECOVER_TAU, dt)).normalize();
+        rig.orientation = constrain_rotation(
+            sdf,
+            rig.orientation,
+            wanted,
+            rig.focus,
+            desired,
+            probe_dist,
+            sweep_cfg,
+        );
     }
 
     // Bound the disagreement with the player (see MAX_CORRECTION) -- by
@@ -804,7 +993,7 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
         deviation = MAX_CORRECTION;
     }
 
-    // --- 4. re-sweep along wherever the direction ended up ---
+    // --- 5. re-sweep along wherever the direction ended up ---
     // Everything above moved the view ray, and `sw` describes it as it was at
     // the *start* of the frame. The distance solve below is the step that
     // actually puts the eye somewhere, so running it on a frame-old free
@@ -820,7 +1009,7 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
         sw
     };
 
-    // --- 5. emergency: this direction has nowhere for the camera to be ---
+    // --- 6. emergency: this direction has nowhere for the camera to be ---
     // A free distance below the minimum means every point on this ray that
     // isn't inside the marble is inside the geometry: the distance solve
     // below has no legal answer and will floor at the minimum, burying the
@@ -847,7 +1036,11 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
 
     let hopeless = sw.free_distance < min_distance * 1.05;
     let stuck = rig.blocked_for > PANIC_AFTER && sw.visibility <= 0.05;
-    let cramped = rig.cramped_for > CRAMPED_HOLD;
+    // Elective only, so it waits for the player to stop steering
+    // ([`ELECTIVE_INPUT_IDLE`]) -- a reposition that fights the hand on the
+    // controls is worse than the cramped shot it is trying to fix. The two
+    // triggers above are safety, and are never gated.
+    let cramped = rig.cramped_for > CRAMPED_HOLD && rig.input_idle_for > ELECTIVE_INPUT_IDLE;
 
     // Pick a target direction, or keep the one already committed to. The
     // commitment is what makes this converge: re-running the search every
@@ -921,7 +1114,7 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
     }
     let free_distance = sw.free_distance;
 
-    // --- 6. distance: fast in, slow out, and only after a hold ---
+    // --- 7. distance: fast in, slow out, and only after a hold ---
     let goal = desired.min(free_distance).max(min_distance);
     // The hold keys off the goal *tightening*, not off the camera being
     // short of it. Keying it off "is there room ahead of me" instead reads a
@@ -947,7 +1140,7 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
     }
     rig.distance = rig.distance.clamp(min_distance, MAX_DISTANCE);
 
-    // --- 7. last-resort clearance check at the eye itself ---
+    // --- 8. last-resort clearance check at the eye itself ---
     // Re-zero the focus's depth error first (step 1 did it against the
     // direction as it was *then*; steps 3-5 have since moved it), so the eye
     // this checks is the eye that renders.
@@ -973,7 +1166,7 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
         rig.distance = (rig.distance - 2.0 * (camera_radius - clearance)).max(min_distance);
     }
 
-    // --- 8. FOV: widen only as far as geometry has forced us in ---
+    // --- 9. FOV: widen only as far as geometry has forced us in ---
     // Expressed as the ratio between where the camera is and where framing
     // wanted it, so a deliberate zoom-in (which lowers `desired` too) does
     // *not* get silently undone by a widening FOV.
@@ -1419,10 +1612,11 @@ mod tests {
             // guarantee there is only that it degrades to the minimum
             // distance rather than misbehaving.
             let pos = Vec3::new(0.75 + (t * 1.7).sin() * 0.2, 0.0, 0.75 + t * 0.5);
-            // Player dragging continuously.
+            // Player dragging continuously. Input writes *intent* only --
+            // the realized camera picks the rotation up inside `solve`,
+            // under the wall-slide constraint (`constrain_rotation`).
             if let Some(r) = CameraOrbit::drag_rotation(rig.orientation, Vec2::new(1.5, 0.4)) {
                 orbit.orientation = (r * orbit.orientation).normalize();
-                rig.orientation = (r * rig.orientation).normalize();
             }
             let mut inp = SolveInput {
                 marble_pos: pos,
@@ -1439,21 +1633,113 @@ mod tests {
         assert!(worst > 0.0, "the eye entered geometry (worst clearance {worst})");
     }
 
-    #[test]
-    fn player_input_is_never_damped_or_fought() {
-        // A drag applied while fully blocked must move the realized camera by
-        // exactly the arcball rotation, same as it would in open space --
-        // the deviation the solver has built up rides along unchanged.
-        let pillar = Pillar { cx: 0.0, cz: 0.7, r: 0.35 };
-        let mut inp = input(Quat::IDENTITY, 1.0 / 60.0);
-        let mut rig = CameraRig::default();
-        for _ in 0..120 {
-            solve(&mut rig, &mut inp, &pillar);
+    /// Solid half-space `x > 0.6`, so the free distance along a direction
+    /// `u` is exactly `0.6 / u.x` -- clearance improves monotonically as the
+    /// camera turns away from +X, which makes "into the wall" and "away from
+    /// it" unambiguous rather than a matter of interpretation.
+    struct SideWall;
+    impl Sdf for SideWall {
+        fn de(&self, p: Vec3) -> f32 {
+            0.6 - p.x
         }
+    }
+
+    /// A camera direction 45 degrees off the wall's normal: tight enough for
+    /// the constraint to be live, with a clear direction of improvement.
+    fn beside_the_wall() -> (CameraRig, SolveInput) {
+        let u = Vec3::new(1.0, 0.0, 1.0).normalize();
+        let mut rig = CameraRig::default();
+        let mut inp = input(Quat::from_rotation_arc(Vec3::Z, u), 1.0 / 60.0);
+        for _ in 0..90 {
+            solve(&mut rig, &mut inp, &SideWall);
+        }
+        (rig, inp)
+    }
+
+    /// The drag delta that moves the *eye* toward `target_dir`. A swipe
+    /// rotates `forward` toward its screen direction, and the eye sits
+    /// opposite `forward`, hence the negation.
+    fn drag_moving_eye_toward(rig: &CameraRig, target_dir: Vec3, pixels: f32) -> Vec2 {
+        let u = -(rig.orientation * Vec3::NEG_Z);
+        let right = rig.orientation * Vec3::X;
+        let up = rig.orientation * Vec3::Y;
+        let tangential = (target_dir - u * target_dir.dot(u)).normalize();
+        Vec2::new(-tangential.dot(right), -tangential.dot(up)) * pixels
+    }
+
+    #[test]
+    fn orbiting_into_a_wall_is_resisted_instead_of_diving_at_the_marble() {
+        // Reported from play: with a large structure beside the marble,
+        // rotating slightly took the distance from 1.411 to 0.279 in one
+        // motion -- the camera swinging behind the structure, with the
+        // marble fully visible throughout. The dolly was doing all the work,
+        // and it is the wrong tool for it. The orbit itself should resist.
+        let (mut rig, mut inp) = beside_the_wall();
+        let open = rig.debug.desired_distance;
+        let mut worst = rig.distance;
+        for _ in 0..240 {
+            let delta = drag_moving_eye_toward(&rig, Vec3::X, 6.0); // straight at the wall
+            if let Some(r) = CameraOrbit::drag_rotation(rig.orientation, delta) {
+                inp.intent = (r * inp.intent).normalize();
+            }
+            solve(&mut rig, &mut inp, &SideWall);
+            worst = worst.min(rig.distance);
+            assert!(rig.debug.eye_clearance > 0.0, "eye entered the wall");
+        }
+        assert!(
+            worst > 0.9 * WALL_FLOOR_FRACTION * open,
+            "four seconds of pushing into a wall cost the camera more than the floor allows: \
+             {worst} of a framing distance of {open}"
+        );
+        assert!(
+            rig.debug.visibility > 0.99,
+            "and it should never have lost sight of the marble ({})",
+            rig.debug.visibility
+        );
+    }
+
+    #[test]
+    fn orbiting_away_from_a_wall_is_never_resisted() {
+        // The constraint may only remove the *into the surface* component:
+        // turning away from a wall has to track the request exactly, or the
+        // player is stuck against it.
+        let (mut rig, mut inp) = beside_the_wall();
+        let free_before = rig.debug.free_distance;
         let before = rig.orientation;
-        let delta = Vec2::new(12.0, -5.0);
+
+        let delta = drag_moving_eye_toward(&rig, Vec3::NEG_X, 6.0);
         let rotation = CameraOrbit::drag_rotation(rig.orientation, delta).unwrap();
-        rig.orientation = (rotation * rig.orientation).normalize();
+        inp.intent = (rotation * inp.intent).normalize();
+        solve(&mut rig, &mut inp, &SideWall);
+
+        let expected = (rotation * before).normalize();
+        assert!(
+            rig.orientation.angle_between(expected) < 1e-4,
+            "turning away from a wall must be unconstrained (off by {} rad)",
+            rig.orientation.angle_between(expected)
+        );
+        assert!(
+            rig.debug.free_distance > free_before,
+            "and it should have bought clearance back: {} -> {}",
+            free_before,
+            rig.debug.free_distance
+        );
+    }
+
+    #[test]
+    fn player_input_is_applied_exactly_in_open_space() {
+        // With nothing to run into, a drag must move the realized camera by
+        // exactly the arcball rotation, in the same frame, with no damping
+        // and no constraint in the way -- the input contract.
+        let mut rig = CameraRig::default();
+        let mut inp = input(Quat::IDENTITY, 1.0 / 60.0);
+        solve(&mut rig, &mut inp, &Empty);
+        let before = rig.orientation;
+
+        let rotation = CameraOrbit::drag_rotation(rig.orientation, Vec2::new(12.0, -5.0)).unwrap();
+        inp.intent = (rotation * inp.intent).normalize();
+        solve(&mut rig, &mut inp, &Empty);
+
         let expected = (rotation * before).normalize();
         assert!(
             rig.orientation.angle_between(expected) < 1e-5,
@@ -1763,7 +2049,6 @@ mod scene_probe {
                 let delta = Vec2::new(2.0, 0.6);
                 if let Some(rotation) = CameraOrbit::drag_rotation(rig.orientation, delta) {
                     orbit.orientation = (rotation * orbit.orientation).normalize();
-                    rig.orientation = (rotation * rig.orientation).normalize();
                 }
             }
 

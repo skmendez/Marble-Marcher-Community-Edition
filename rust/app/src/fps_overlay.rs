@@ -292,6 +292,19 @@ fn spawn_fps_overlay(mut commands: Commands, config: Res<crate::config::Config>)
                 TextColor(Color::srgb(0.75, 0.75, 0.75)),
                 RenderResolutionText::default(),
             ));
+            // Last line, deliberately nothing but the commit hash: the one
+            // piece of information that says *which build this is*, which a
+            // bug report from a deployed page needs and cannot otherwise
+            // carry. Baked in at compile time by `build.rs`; small and dim
+            // because it is a fingerprint, not a readout.
+            parent.spawn((
+                Text::new(env!("MM_COMMIT")),
+                TextFont {
+                    font_size: 10.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.45, 0.45, 0.45)),
+            ));
         });
 }
 
