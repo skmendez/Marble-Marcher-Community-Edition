@@ -159,6 +159,59 @@ sum). This also makes far-field marching exact: rays skip to the box
 at full speed, the classic bounded-object behavior every other
 primitive has via `bounding_sphere`.
 
+## 4.5 The uniformity objection (what a grid loses vs. the mesh)
+
+A fair challenge to the grid tier: dense volumes are indeed the
+industry-standard mesh-SDF representation (Unreal's mesh distance
+fields, Godot's SDFGI, Claybook's ray-marched volumes) — but a uniform
+grid **surrenders two properties the triangle mesh had**:
+
+1. **Adaptive budget allocation.** A mesh spends triangles where the
+   detail is (10k on the face, 50 on the back of the head); a uniform
+   grid spends O(N³) memory at one global resolution, gated by the
+   *finest* feature anywhere. One sharp spike on a smooth body forces
+   the whole volume fine.
+2. **Exact sharp features at any budget.** Qualitatively worse: a cube
+   is 12 triangles and perfectly sharp forever; its sampled SDF rounds
+   every crease at ~h no matter how dense the source mesh was.
+   Sampling low-passes the field, period.
+
+The mismatch is structural, not an implementation accident: a mesh
+answers a *surface* question, sphere tracing asks a *volumetric* one
+(distance from an arbitrary point of R³), and uniformly sampling the
+volumetric answer is what discards the surface representation's
+adaptivity.
+
+Known remedies, in escalating order:
+
+- **Narrow-band / brick sparsity** (what UE actually ships): fine cells
+  only in a shell around the surface, coarse elsewhere, behind an
+  indirection table into a brick atlas. Memory goes from
+  volume-proportional to ~surface-proportional, and it is perfectly
+  matched to sphere tracing, which only needs precision near the
+  surface (far away, steps are huge and coarse values suffice). Lookup
+  stays O(1): one indirection fetch + one brick sample.
+- **Adaptively sampled distance fields** (Frisken 2000): an octree
+  refined where the field has detail — the *direct* restoration of
+  mesh-like adaptivity, invented for exactly this objection. Cost:
+  every sample becomes a tree walk instead of a texture fetch, which
+  is why real-time engines stop at bricks.
+- **Hybrid via our own algebra**: `Union(coarse grid of the body,
+  Tier-0 exact triangles of the detail region)` — min of sound fields
+  is sound, so the 40 triangles that must stay razor-sharp ride as
+  exact geometry over a cheap volume. Unusually natural in this engine,
+  where CSG composition is the native idiom.
+
+Verdict for this project: the objection is real but mostly doesn't
+bite before memory does. The compelling uses (props, statues,
+fold-instanced rings of them) are small objects with their own
+per-mesh box, where 64³–128³ already puts h near pixel scale; and
+genuinely sharp-edged geometry (boxes, gears, architecture) is better
+built from the analytic primitives that render it exactly for free. So:
+dense grid for v1, bricks if a hero asset ever demands them, ASDF not
+worth the traversal complexity, hybrid union as the mixed-scale escape
+hatch.
+
 ## 5. Serialization and multiplayer
 
 The tree encoding gains one tag: `TriMesh { verts, indices, grid_res }`
