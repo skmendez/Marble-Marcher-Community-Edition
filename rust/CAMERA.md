@@ -13,7 +13,7 @@ against. It shipped default-*off* pending a play-test and that was a
 mistake; §16 is what it cost.
 Sections 1-5 below are the design as written *before* implementation, kept as
 the record of the reasoning; §11 at the end lists what implementation
-changed, what it measured, and what is still missing; §12-16 are the
+changed, what it measured, and what is still missing; §12-17 are the
 play-test findings that followed, each with the measurement that reproduced
 it. Where any of them disagree with §1-5, the later section is what the code
 does. File/line references in §1-5 are to the pre-implementation code and
@@ -1303,3 +1303,86 @@ It helps most where things are tightest. HollowDonut, solver on:
 
 More dolly travel, which is the honest cost of a floor in a space that is
 genuinely too small for the shot. Everything else is unchanged.
+
+## 17. The camera rotating on its own
+
+Reported with the solver actually on: *"somehow it seems like we can get
+stuck into a scenario where the camera rapidly rotates and I have no idea
+why; generally the camera shouldn't rotate at all unless we ask it to."*
+
+Three captures, successive frames:
+
+```
+menger_oscillating_sphere: vis 1.00 d 1.459/1.459 (free 1.459) size 0.280
+  dev 109deg clr 2.201/q0.053 steps 4    touches: 0
+```
+
+`dev 109deg` is `MAX_CORRECTION` to the degree (1.9 rad = 108.86°), pinned
+across all three. Two units of eye clearance, nothing occluding, four march
+steps, and `touches: 0`. Nothing in the world is asking the camera to move
+and it is moving anyway.
+
+### A write-back read as input
+
+`solve` does not only consume `input.intent`, it *writes* it — the deviation
+cap drags intent along rather than hauling the camera back (§4.7), and step
+2 consumes a refused rotation out of it (§14). The caller then writes the
+result straight back to `CameraOrbit`. Meanwhile `rig.last_intent`, the
+baseline that turns intent into "what did the player do since last frame",
+was recorded in the middle of step 2 — *before* the cap ran.
+
+So the cap's own adjustment arrived next frame disguised as a drag:
+
+```
+cap rotates intent toward the camera by R
+  -> next frame reads R as player input and applies it to the camera,
+     reopening exactly the gap the cap just closed
+  -> deviation returns to the cap, which fires again with the same R
+  -> forever
+```
+
+Rate-preserving, not decaying: the cap's correction is `excess * deviation`,
+which in the loop's steady state is exactly the R that produced it. Whatever
+rate the loop started at, it keeps. Reproduced at **0.3 rad/frame — 18 rad/s,
+near three revolutions a second** — with deviation sitting at 1.90.
+
+It also suppressed its own cure. The decay back toward the player's intent
+is gated on the player having let go (`ELECTIVE_INPUT_IDLE`), and the
+phantom drag reset that timer every frame, so the one mechanism that would
+have unwound the deviation never ran. Same for the elective repositions.
+
+Reaching the cap is ordinary — any rescue in a tight space does it. Staying
+there forever, in open space, was the bug.
+
+`rig.last_intent` is now recorded at the very end of `solve`, after every
+write the function makes to `input.intent`. Pinned by `a_deviation_at_the_
+cap_does_not_become_a_perpetual_spin`, which puts the camera past the cap in
+empty space with nobody steering and asserts it comes to rest, at the
+player's intent, and stays there.
+
+### What it was also costing
+
+The phantom drag was firing in HollowDonut's probe run too, for the same
+reason, and jamming the same timers:
+
+| solver on | before | after |
+|---|---|---|
+| mean visibility | 0.968 | 0.991 |
+| frames blocked | 15/480 | 4/480 |
+| min eye clearance | 0.0285 | 0.0506 |
+| dolly travel | 3.42 | 1.63 |
+
+Half the dolly motion and a quarter of the blocked frames, from a fix that
+is one line moving down the function. The tightest scene was the one leaning
+hardest on the recovery and repositions that the loop had disabled.
+
+### On "shouldn't rotate unless we ask it to"
+
+Taken as written that would delete deocclusion, so it is worth being exact
+about what remains. The camera still rotates on its own in exactly two
+situations: the view is actually obstructed (`visibility < 1`), or there is
+nowhere on the current sightline the camera can legally be. The probe shows
+what that means in practice — `maxDev` is **0°** in every open scene
+(demo, classic_only, both Mengers, cube_sphere_morph, gears), 17° in bunny,
+and only reaches three figures inside HollowDonut's tube. Outside a genuinely
+tight space, the camera already does not rotate unless asked.

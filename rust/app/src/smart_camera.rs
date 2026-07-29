@@ -998,7 +998,9 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
     } else {
         rig.input_idle_for += dt;
     }
-    rig.last_intent = input.intent;
+    // NOTE: `rig.last_intent` is deliberately *not* recorded here. It is
+    // recorded at the very end of `solve`, after every write this function
+    // makes to `input.intent` — see the note there.
 
     // --- 3. one march along the current sightline ---
     let u = -(rig.orientation * Vec3::NEG_Z); // focus -> eye
@@ -1373,6 +1375,33 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
         .clamp(MIN_FOCAL_LENGTH, FOCAL_LENGTH);
     rig.focal_length += (focal_goal - rig.focal_length) * approach(FOCAL_TAU, dt);
 
+    // Record the intent the *player* will be starting from next frame —
+    // after every write this function makes to it, which is the whole point.
+    //
+    // `player_delta` in step 2 is "how much has the intent moved since I last
+    // looked", and the only legitimate source of that is the input systems.
+    // But `solve` writes `input.intent` too — the deviation cap below step 4,
+    // and step 2's own consumption of a refused rotation — and the caller
+    // writes the result straight back to `CameraOrbit`. Recording
+    // `last_intent` mid-function meant those writes came back next frame
+    // *disguised as player input*, and the deviation cap's version of that is
+    // a self-sustaining spin:
+    //
+    //   cap rotates intent toward the camera by R  ->  next frame reads R as
+    //   a drag and applies it to the camera, reopening the gap by R  ->  the
+    //   cap fires again with the same R  ->  forever.
+    //
+    // Deviation sits pinned at exactly `MAX_CORRECTION` while the camera
+    // rotates at a constant rate that never decays, in open space, with
+    // nothing occluding and nobody touching the screen. It even suppresses
+    // its own cure: `input_idle_for` is reset every frame by the phantom
+    // drag, so the decay back toward intent — which is gated on the player
+    // having let go — never runs. Reported from play as "somehow it seems
+    // like we can get stuck in a scenario where the camera rapidly rotates
+    // and I have no idea why"; pinned by `a_deviation_at_the_cap_does_not_
+    // become_a_perpetual_spin`.
+    rig.last_intent = input.intent;
+
     rig.debug = RigDebug {
         visibility: sw.visibility,
         free_distance,
@@ -1633,6 +1662,68 @@ mod tests {
             rig.distance
         );
         assert!(rig.debug.eye_clearance > 0.0);
+    }
+
+    /// Reported from play: "somehow it seems like we can get stuck into a
+    /// scenario where the camera rapidly rotates and I have no idea why;
+    /// generally the camera shouldn't rotate at all unless we ask it to."
+    ///
+    /// The captures showed `dev 109deg` — exactly `MAX_CORRECTION` — pinned
+    /// across successive frames with `touches: 0`, `vis 1.00`, and two units
+    /// of eye clearance. Nothing occluding, nothing near, nobody steering,
+    /// and the camera turning anyway.
+    ///
+    /// The loop: `solve` writes `input.intent` (the deviation cap does, to
+    /// drag intent along rather than haul the camera back), the caller writes
+    /// that straight back to `CameraOrbit`, and `rig.last_intent` was
+    /// recorded *before* the cap ran — so next frame the cap's own
+    /// adjustment came back as a player drag and was applied to the camera,
+    /// reopening exactly the gap the cap had just closed. Constant rate, no
+    /// decay, and `input_idle_for` reset every frame by the phantom drag so
+    /// the recovery that would have unwound it never ran.
+    ///
+    /// Reaching the cap is ordinary: any rescue in a tight space can do it.
+    /// Staying there forever, in open space, is the bug.
+    #[test]
+    fn a_deviation_at_the_cap_does_not_become_a_perpetual_spin() {
+        let intent = Quat::IDENTITY;
+        let mut inp = input(intent, 1.0 / 60.0);
+        let mut rig = CameraRig::default();
+        solve(&mut rig, &mut inp, &Empty);
+        // Put the camera where a rescue would have left it: past the cap,
+        // in open space, with the player's hands off the controls.
+        rig.orientation = (Quat::from_rotation_y(MAX_CORRECTION + 0.3) * intent).normalize();
+        rig.last_intent = inp.intent;
+
+        let mut travelled = 0.0;
+        let mut previous = rig.orientation;
+        for i in 0..600 {
+            solve(&mut rig, &mut inp, &Empty);
+            let step = rig.orientation.angle_between(previous);
+            previous = rig.orientation;
+            travelled += step;
+            assert!(
+                travelled < 4.0,
+                "frame {i}: {travelled:.2} rad of unrequested rotation and still going \
+                 (deviation {:.2})",
+                rig.debug.deviation
+            );
+        }
+        // Ten seconds of nobody touching anything: the camera must have come
+        // to rest, and at the player's intent, since nothing is in the way.
+        assert!(
+            rig.debug.deviation < 0.05,
+            "settled {:.0} degrees away from where the player pointed",
+            rig.debug.deviation.to_degrees()
+        );
+        let last_second: f32 = {
+            let before = rig.orientation;
+            for _ in 0..60 {
+                solve(&mut rig, &mut inp, &Empty);
+            }
+            rig.orientation.angle_between(before)
+        };
+        assert!(last_second < 1e-3, "still drifting at {last_second:.4} rad/s once settled");
     }
 
     #[test]
