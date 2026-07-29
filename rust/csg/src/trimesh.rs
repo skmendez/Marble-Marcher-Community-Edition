@@ -111,6 +111,13 @@ impl std::fmt::Debug for TriMeshData {
     }
 }
 
+/// Point-only variant for triangle-soup users (`noise3.rs`), which need
+/// no feature classification (their sign comes from a PL interpolant,
+/// not pseudonormals).
+pub(crate) fn closest_point_on_triangle_point(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    closest_point_on_triangle(p, a, b, c).0
+}
+
 fn closest_point_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> (Vec3, Feature) {
     // Ericson, Real-Time Collision Detection §5.1.5, with the Voronoi
     // region kept so the caller knows which pseudonormal applies.

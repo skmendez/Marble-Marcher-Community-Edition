@@ -276,6 +276,12 @@ impl CodeWriter {
                 // find_trimesh`'s doc).
                 self.writeln("d = de_mesh(p);");
             }
+            Object::NoiseSolid { .. } => {
+                // Same baked-grid arrangement as TriMesh (one baked node
+                // per scene, `Object::find_baked`); the helper is the
+                // identical trilinear sampler with this field's grid.
+                self.writeln("d = de_noise(p);");
+            }
             Object::Fractal { fold, base } => {
                 self.emit_fold(fold);
                 self.emit_object(base);
@@ -1998,15 +2004,14 @@ pub fn generate_scene_functions(obj: &Object) -> String {
 /// sample *inside* (negative `d`), which still registers as a hit -- only a
 /// sub-cell-thin wall could be tunneled through, and physics never uses
 /// this field at all (CPU `de` is exact, `trimesh.rs`).
-fn mesh_helper(mesh: &crate::trimesh::TriMeshData) -> String {
-    let g = mesh.grid();
+fn mesh_helper(g: crate::trimesh::GridSpec, fn_name: &str, pos_expr: &str) -> String {
     let maxi = [g.dims[0] - 1, g.dims[1] - 1, g.dims[2] - 1];
     format!(
-        "fn de_mesh(p4: vec4<f32>) -> f32 {{\n\
+        "fn {fn_name}(p4: vec4<f32>) -> f32 {{\n\
          \x20   let mg_origin = vec3<f32>({:?}, {:?}, {:?});\n\
          \x20   let mg_cell = {:?};\n\
          \x20   let mg_maxi = vec3<f32>({:?}, {:?}, {:?});\n\
-         \x20   let mg_q = clamp((p4.xyz - mg_origin) / mg_cell, vec3<f32>(0.0), mg_maxi - 0.001);\n\
+         \x20   let mg_q = clamp(({pos_expr} - mg_origin) / mg_cell, vec3<f32>(0.0), mg_maxi - 0.001);\n\
          \x20   let mg_i = vec3<i32>(floor(mg_q));\n\
          \x20   let mg_f = mg_q - floor(mg_q);\n\
          \x20   let s000 = textureLoad(mesh_sdf_tex, mg_i, 0).r;\n\
@@ -2023,7 +2028,7 @@ fn mesh_helper(mesh: &crate::trimesh::TriMeshData) -> String {
          \x20   let c11 = mix(s011, s111, mg_f.x);\n\
          \x20   var dm = mix(mix(c00, c10, mg_f.y), mix(c01, c11, mg_f.y), mg_f.z) - {:?};\n\
          \x20   let mg_hi = mg_origin + mg_maxi * mg_cell;\n\
-         \x20   let mg_out = length(p4.xyz - clamp(p4.xyz, mg_origin, mg_hi));\n\
+         \x20   let mg_out = length({pos_expr} - clamp({pos_expr}, mg_origin, mg_hi));\n\
          \x20   if (mg_out > 0.0) {{\n\
          \x20       dm = max(dm, mg_out);\n\
          \x20   }}\n\
@@ -2037,6 +2042,8 @@ fn mesh_helper(mesh: &crate::trimesh::TriMeshData) -> String {
         maxi[1] as f32,
         maxi[2] as f32,
         g.cell * 0.25,
+        fn_name = fn_name,
+        pos_expr = pos_expr,
     )
 }
 
@@ -2044,8 +2051,17 @@ fn generate_scene_functions_with_divisor(obj: &Object, divisor: i32) -> String {
     let mut w = CodeWriter::new();
     w.iteration_divisor = divisor;
 
-    if let Some(mesh) = obj.find_trimesh() {
-        w.raw(&mesh_helper(mesh));
+    match obj.find_baked() {
+        Some(crate::object::BakedField::Mesh(mesh)) => {
+            w.raw(&mesh_helper(mesh.grid(), "de_mesh", "p4.xyz"))
+        }
+        // The noise solid is periodic: wrap the sample into the unit
+        // torus (matching the CPU's `closest`), which also makes the
+        // outside-box arm dead code that costs one dead comparison.
+        Some(crate::object::BakedField::Noise(noise)) => {
+            w.raw(&mesh_helper(noise.grid(), "de_noise", "fract(p4.xyz)"))
+        }
+        None => {}
     }
 
     w.color_pass = false;
@@ -2714,6 +2730,25 @@ struct VertexOutput {
         assert!(plain.contains("var mesh_sdf_tex: texture_3d<f32>;"));
         assert!(!plain.contains("fn de_mesh"));
         validate_wgsl(&plain);
+    }
+
+    #[test]
+    fn noise_solid_emission_and_caverns_shader_validate() {
+        let mut params = Params::new();
+        let obj = scenes::noise_caverns(&mut params);
+        let src = generate_scene_functions(&obj);
+        assert!(src.contains("d = de_noise(p);"), "{src}");
+        assert!(src.contains("fn de_noise"), "{src}");
+        // periodic: the sample position wraps into the unit torus
+        assert!(src.contains("(fract(p4.xyz) - mg_origin)"), "{src}");
+        for full in [
+            full_source(&obj),
+            full_coarse_source(&obj),
+            full_shadow_source(&obj),
+            full_stepdata_source(&obj),
+        ] {
+            validate_wgsl(&full);
+        }
     }
 
     #[test]

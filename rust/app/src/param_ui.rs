@@ -199,6 +199,7 @@ fn build_entries(handles: &SceneHandles, params: &Params) -> Vec<ParamEntry> {
         // phases, overwritten every physics tick) -- nothing to expose.
         SceneHandles::Gears(_) => {}
         SceneHandles::Bunny => {}
+        SceneHandles::NoiseCaverns => {}
     }
     entries
 }

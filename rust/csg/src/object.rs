@@ -90,6 +90,26 @@ pub enum Object {
     /// `Object`'s ubiquitous `Clone` cheap -- the mesh (and its BVH and
     /// pseudonormal tables) is immutable shared data, not per-node state.
     TriMesh { mesh: std::sync::Arc<crate::trimesh::TriMeshData> },
+    /// An exact 3-D procedural noise SDF (`noise3.rs`, NOISE_SDF.md's
+    /// eikonal requirement realized in 3-D): marching tetrahedra extract
+    /// the zero set of periodic 3-D Perlin noise as a triangle soup that
+    /// IS the piecewise-linear interpolant's zero set, so `sign(PL) * min
+    /// dist(tri)` is a globally self-consistent exact SDF -- |grad d| = 1
+    /// almost everywhere. Solid where `noise < iso`; unbounded (the field
+    /// tiles the torus): scenes clip with `Intersect` (the `Cylinder`
+    /// convention), certified out to `margin/G` from the unit cube with
+    /// the unsigned distance capped there (a sound underestimate).
+    /// Serialized payload: 8 bytes (seed + iso) -- every triangle and
+    /// lattice value re-derives deterministically on decode.
+    NoiseSolid { noise: std::sync::Arc<crate::noise3::NoiseSolidData> },
+}
+
+/// A node whose field the shader samples from a baked grid texture
+/// rather than evaluating analytically (`MESH_SDF.md`): either kind
+/// carries a `trimesh::GridSpec` and a deterministic bake.
+pub enum BakedField<'a> {
+    Mesh(&'a std::sync::Arc<crate::trimesh::TriMeshData>),
+    Noise(&'a std::sync::Arc<crate::noise3::NoiseSolidData>),
 }
 
 impl Object {
@@ -133,6 +153,7 @@ impl Object {
             // No live params in v1: rigid motion comes from wrapping folds,
             // which have their own handles.
             Object::TriMesh { .. } => true,
+            Object::NoiseSolid { .. } => true,
         }
     }
 
@@ -183,6 +204,7 @@ impl Object {
                 (Vec2::new(p.x, p.z).length() - radius.get(params)) / p.w
             }
             Object::TriMesh { mesh } => mesh.de(p),
+            Object::NoiseSolid { noise } => noise.de(p),
         }
     }
 
@@ -371,6 +393,9 @@ impl Object {
             // point (better than Morph's Newton fallback -- see MESH_SDF.md
             // section 1).
             Object::TriMesh { mesh } => mesh.closest(p.truncate()).0,
+            // Exact: the winning triangle's closest point (capped far
+            // from the surface -- physics only ever asks near contact).
+            Object::NoiseSolid { noise } => noise.nearest_point(p.truncate()),
         }
     }
 
@@ -486,6 +511,8 @@ impl Object {
             // enclosing `Intersect` exactly like `Modulo` tilings.
             Object::Cylinder { .. } => None,
             Object::TriMesh { mesh } => Some(mesh.bounding_sphere()),
+            // Tiles all of space (periodic), like `Modulo`.
+            Object::NoiseSolid { .. } => None,
         }
     }
 
@@ -557,6 +584,10 @@ impl Object {
                 out.push(11);
                 mesh.encode(out);
             }
+            Object::NoiseSolid { noise } => {
+                out.push(12);
+                noise.encode(out);
+            }
         }
     }
 
@@ -573,18 +604,30 @@ impl Object {
     /// *same* mesh are fine, but a second distinct mesh would render with
     /// the first one's grid (its CPU physics stays exact regardless).
     pub fn find_trimesh(&self) -> Option<&std::sync::Arc<crate::trimesh::TriMeshData>> {
+        match self.find_baked() {
+            Some(BakedField::Mesh(m)) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// First grid-baked node in the tree (`TriMesh` or `NoiseWall`) -- the
+    /// one whose grid the app bakes into the shared `mesh_sdf_tex` binding
+    /// and whose constants codegen inlines. One baked node per scene (the
+    /// `find_trimesh` v1 restriction, now shared across both kinds).
+    pub fn find_baked(&self) -> Option<BakedField<'_>> {
         match self {
-            Object::TriMesh { mesh } => Some(mesh),
+            Object::TriMesh { mesh } => Some(BakedField::Mesh(mesh)),
+            Object::NoiseSolid { noise } => Some(BakedField::Noise(noise)),
             Object::Sphere { .. }
             | Object::Cuboid { .. }
             | Object::Torus { .. }
             | Object::Cylinder { .. } => None,
-            Object::Fractal { base, .. } => base.find_trimesh(),
+            Object::Fractal { base, .. } => base.find_baked(),
             Object::Union(a, b)
             | Object::Intersect(a, b)
-            | Object::Difference(a, b) => a.find_trimesh().or_else(|| b.find_trimesh()),
-            Object::Offset { base, .. } | Object::Onion { base, .. } => base.find_trimesh(),
-            Object::Morph { a, b, .. } => a.find_trimesh().or_else(|| b.find_trimesh()),
+            | Object::Difference(a, b) => a.find_baked().or_else(|| b.find_baked()),
+            Object::Offset { base, .. } | Object::Onion { base, .. } => base.find_baked(),
+            Object::Morph { a, b, .. } => a.find_baked().or_else(|| b.find_baked()),
         }
     }
 
@@ -661,6 +704,10 @@ impl Object {
             11 => {
                 let (mesh, pos) = crate::trimesh::TriMeshData::decode_at(bytes, pos)?;
                 (Object::TriMesh { mesh: std::sync::Arc::new(mesh) }, pos)
+            }
+            12 => {
+                let (noise, pos) = crate::noise3::NoiseSolidData::decode_at(bytes, pos)?;
+                (Object::NoiseSolid { noise: std::sync::Arc::new(noise) }, pos)
             }
             _ => return None,
         };

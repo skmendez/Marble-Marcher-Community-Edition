@@ -36,6 +36,7 @@ pub mod fold;
 pub mod object;
 pub mod physics;
 pub mod scene;
+pub mod noise3;
 pub mod scene_sync;
 pub mod scenes;
 pub mod trimesh;

@@ -239,6 +239,15 @@ mod tests {
     }
 
     #[test]
+    fn noise_solid_and_caverns_round_trip() {
+        let noise = crate::noise3::NoiseSolidData::new(11, 0.0).unwrap();
+        assert_object_round_trips(&Object::NoiseSolid { noise: std::sync::Arc::new(noise) });
+        let mut params = Params::new();
+        let object = scenes::noise_caverns(&mut params);
+        assert_object_round_trips(&object);
+    }
+
+    #[test]
     fn deeply_nested_tree_round_trips() {
         let nested = Object::Union(
             Box::new(Object::Fractal {

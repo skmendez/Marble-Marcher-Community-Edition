@@ -1,5 +1,15 @@
 # Noise SDFs — brainstorm (v2: exact unit-gradient noise)
 
+> **Status: realized in 3-D** (`csg/src/noise3.rs`, `Object::NoiseSolid`,
+> tag 12; `?scene=noise_caverns`, 70% sparse). The v2 route shipped:
+> marching tetrahedra extract periodic 3-D Perlin noise's zero set as a
+> triangle soup that IS the piecewise-linear interpolant's zero set, and
+> `sign(PL) * min-dist` (Lovász-extension sign, BVH point-triangle
+> distance, torus-wrapped queries, margin-capped) is an exact, eikonal,
+> physics-grade SDF. 8-byte serialization (seed + iso); ~229k derived
+> triangles at G = 36.
+
+
 Design exploration for adding random-noise geometry to the CSG framework
 (`rust/csg/`), both **standalone** and as a way to **manipulate existing
 objects**.

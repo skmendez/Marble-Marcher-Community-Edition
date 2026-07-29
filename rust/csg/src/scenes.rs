@@ -921,6 +921,87 @@ pub fn bunny(_params: &mut Params) -> Object {
     Object::Union(Box::new(floor), Box::new(bunny))
 }
 
+/// [`noise_caverns`]' generation constants. Seed from the reference
+/// implementation; sparsity per the explicit request: **70% of space
+/// open**, so the solid fraction handed to
+/// [`crate::noise3::iso_for_solid_fraction`] is 0.3.
+pub const CAVERNS_SEED: u32 = 11;
+pub const CAVERNS_SOLID_FRACTION: f32 = 0.3;
+/// World scale: the unit noise torus maps to a `6 x 6` arena footprint
+/// (fold scale `1/6`), clipped to `y in [0, 2]` -- flat-topped rock
+/// formations the marble weaves between.
+pub const CAVERNS_SCALE: f32 = 6.0;
+pub const CAVERNS_HEIGHT: f32 = 2.0;
+const CAVERNS_ROCK_COLOR: Vec3 = Vec3::new(1.7, 0.75, 0.35);
+const CAVERNS_FLOOR_COLOR: Vec3 = Vec3::new(0.15, 0.2, 0.8);
+const CAVERNS_FLOOR_HALF: Vec3 = Vec3::new(3.4, 0.15, 3.4);
+
+/// Marble spawn (render.rs `spawn_params`): the widest pocket found by a
+/// deterministic scan over the arena floor at this seed/iso -- clearance
+/// ~0.98 world units, asserted with margin by the scene test below.
+pub const CAVERNS_SPAWN: Vec3 = Vec3::new(0.0, 0.35, -0.45);
+
+/// Noise caverns ([`Object::NoiseSolid`], `noise3.rs`): the exact 3-D
+/// procedural noise SDF at 70% sparsity, scaled to a 6-unit arena and
+/// clipped to a flat-topped box over a floor slab. The rock the marble
+/// touches is the *exact* piecewise-linear noise isosurface -- physics
+/// collides against |grad d| = 1 geometry with true closest points, and
+/// the whole rock formation serializes as 8 bytes (seed + iso).
+pub fn noise_caverns(_params: &mut Params) -> Object {
+    let iso = crate::noise3::iso_for_solid_fraction(
+        CAVERNS_SEED,
+        CAVERNS_SOLID_FRACTION,
+        0.0,
+        CAVERNS_HEIGHT / CAVERNS_SCALE,
+    );
+    let noise = crate::noise3::NoiseSolidData::new(CAVERNS_SEED, iso)
+        .expect("caverns noise field must build");
+
+    // Unit torus -> world: p' = p/6 + (0.5, 0, 0.5) maps world
+    // [-3,3] x [0,6] x [-3,3] onto the certified cube (and beyond that
+    // the field tiles -- `noise3.rs`'s wrapped queries).
+    let scaled = Object::Fractal {
+        fold: Fold::ScaleTranslate {
+            scale: ScalarValue::Const(1.0 / CAVERNS_SCALE),
+            shift: Vec3Value::Const(Vec3::new(0.5, 0.0, 0.5)),
+        },
+        base: Box::new(Object::NoiseSolid {
+            noise: std::sync::Arc::new(noise),
+        }),
+    };
+    // Clip to the arena box: y in [0, CAVERNS_HEIGHT], footprint 6 x 6.
+    let arena = Object::Fractal {
+        fold: Fold::ScaleTranslate {
+            scale: ScalarValue::Const(1.0),
+            shift: Vec3Value::Const(Vec3::new(0.0, -CAVERNS_HEIGHT / 2.0, 0.0)),
+        },
+        base: Box::new(Object::Cuboid {
+            half_extent: Vec3Value::Const(Vec3::new(
+                CAVERNS_SCALE / 2.0,
+                CAVERNS_HEIGHT / 2.0,
+                CAVERNS_SCALE / 2.0,
+            )),
+        }),
+    };
+    let rock = Object::Fractal {
+        fold: Fold::OrbitInit(Vec3Value::Const(CAVERNS_ROCK_COLOR)),
+        base: Box::new(Object::Intersect(Box::new(scaled), Box::new(arena))),
+    };
+    let floor = Object::Fractal {
+        fold: Fold::Series(vec![
+            Fold::OrbitInit(Vec3Value::Const(CAVERNS_FLOOR_COLOR)),
+            Fold::ScaleTranslate {
+                scale: ScalarValue::Const(1.0),
+                shift: Vec3Value::Const(Vec3::new(0.0, CAVERNS_FLOOR_HALF.y, 0.0)),
+            },
+        ]),
+        base: Box::new(Object::Cuboid {
+            half_extent: Vec3Value::Const(CAVERNS_FLOOR_HALF),
+        }),
+    };
+    Object::Union(Box::new(floor), Box::new(rock))
+}
+
 /// Writes a full parameter set for the classic fractal tree built by
 /// [`classic`]/[`demo_scene`]. `ang1`/`ang2` are turned into rotation
 /// matrices via [`rotation_mat2`].
@@ -1583,6 +1664,65 @@ mod tests {
         assert!(object.find_trimesh().is_some());
         let (_c, r) = object.bounding_sphere(&params).unwrap();
         assert!(r.is_finite() && r < 15.0);
+    }
+
+    #[test]
+    fn noise_caverns_is_playable_and_70_percent_sparse() {
+        let mut params = Params::new();
+        let object = noise_caverns(&mut params);
+
+        // The chosen spawn is genuinely open (marble rad 0.12 + margin).
+        let d = object.de(
+            Vec4::new(CAVERNS_SPAWN.x, CAVERNS_SPAWN.y, CAVERNS_SPAWN.z, 1.0),
+            &params,
+        );
+        assert!(d > 0.3, "spawn clearance de={d}");
+
+        // Above the arena: open air. Inside the floor: solid.
+        assert!(object.de(Vec4::new(0.0, 3.0, 0.0, 1.0), &params) > 0.5);
+        assert!(object.de(Vec4::new(0.0, -0.2, 3.0, 1.0), &params) < -0.05);
+
+        // Sparsity: sample the arena volume; the open fraction must be
+        // near the requested 70% (the rock is the noise solid clipped to
+        // the box, so measure inside the box only).
+        let mut open = 0;
+        let mut total = 0;
+        for i in 0..12 {
+            for j in 0..6 {
+                for k in 0..12 {
+                    let p = Vec4::new(
+                        -2.75 + 0.5 * i as f32,
+                        0.17 + 0.3 * j as f32,
+                        -2.75 + 0.5 * k as f32,
+                        1.0,
+                    );
+                    total += 1;
+                    if object.de(p, &params) > 0.0 {
+                        open += 1;
+                    }
+                }
+            }
+        }
+        let frac = open as f32 / total as f32;
+        assert!(
+            (frac - 0.7).abs() < 0.08,
+            "open fraction {frac} != requested 0.70"
+        );
+
+        // Nearest-point consistency through the scaled fold (exact for
+        // rock-nearest probes below the cap).
+        let probe = Vec3::new(CAVERNS_SPAWN.x, CAVERNS_SPAWN.y, CAVERNS_SPAWN.z);
+        let p4 = Vec4::new(probe.x, probe.y, probe.z, 1.0);
+        let d = object.de(p4, &params);
+        let np = object.nearest_point(p4, &params);
+        let actual = (probe - np).length();
+        assert!(
+            actual <= 1.5 * d.abs().max(1e-4) && d.abs() <= 1.5 * actual.max(1e-4),
+            "|p-np|={actual} vs de={d}"
+        );
+
+        // 8-byte noise payload: the whole scene stays tiny on the wire.
+        assert!(object.to_bytes().len() < 200, "encoded scene unexpectedly large");
     }
 
     /// CPU physics path: nearest-point queries on the gears scene must be

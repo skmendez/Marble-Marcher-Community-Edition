@@ -54,7 +54,7 @@ use marble_csg::codegen::generate_shader;
 use marble_csg::expr::Expr;
 use marble_csg::physics::{Marble, PhysicsConfig};
 use marble_csg::scenes::{
-    beware_of_bumps, bunny, classic, cube_sphere_morph, demo_scene, gears, hollow_donut,
+    beware_of_bumps, bunny, classic, cube_sphere_morph, demo_scene, gears, hollow_donut, noise_caverns,
     menger_oscillating_sphere, menger_sphere, menger_sponge, set_fractal_params,
     set_menger_params, ClassicHandles, CubeSphereMorphHandles, GearsHandles, HollowDonutHandles,
     MengerHandles, MengerOscillatingSphereHandles, MENGER_BITE_MIN_RADIUS,
@@ -126,6 +126,11 @@ pub enum SceneKind {
     /// scene. Physics collides against the exact BVH mesh field; the shader
     /// marches the baked grid bound via [`MeshSdfImage`].
     Bunny,
+    /// [`marble_csg::scenes::noise_caverns`] -- the exact 3-D procedural
+    /// noise SDF (`Object::NoiseSolid`) at 70% sparsity: flat-topped rock
+    /// formations over a floor, physics against the exact |grad d| = 1
+    /// isosurface, the whole formation serialized as 8 bytes.
+    NoiseCaverns,
 }
 
 /// Marble spawn parameters for a scene: start position, radius, kill-plane
@@ -155,6 +160,7 @@ impl SceneKind {
             Some("cube_sphere_morph") => Self::CubeSphereMorph,
             Some("gears") => Self::Gears,
             Some("bunny") => Self::Bunny,
+            Some("noise_caverns") => Self::NoiseCaverns,
             _ => Self::MengerOscillatingSphere,
         }
     }
@@ -181,6 +187,7 @@ impl SceneKind {
             Self::CubeSphereMorph => "cube_sphere_morph",
             Self::Gears => "gears",
             Self::Bunny => "bunny",
+            Self::NoiseCaverns => "noise_caverns",
         }
     }
 
@@ -272,6 +279,14 @@ impl SceneKind {
                 rad: 0.1,
                 kill_y: -5.0,
             },
+            // The widest floor pocket found by a deterministic scan at
+            // this seed/iso (scenes::CAVERNS_SPAWN's doc) -- ~1.0 units
+            // of clearance, asserted by the scene test.
+            Self::NoiseCaverns => MarbleSpawn {
+                start: marble_csg::scenes::CAVERNS_SPAWN,
+                rad: 0.12,
+                kill_y: -5.0,
+            },
         }
     }
 }
@@ -305,6 +320,10 @@ pub enum SceneHandles {
     /// [`SceneKind::Bunny`] has no live params in v1 (rigid motion for a
     /// mesh comes from wrapping folds; nothing to expose yet).
     Bunny,
+    /// [`SceneKind::NoiseCaverns`]: seed/iso are construction-time
+    /// constants (a change rebuilds the primitive set -- structural, not
+    /// a param edit), so nothing to expose.
+    NoiseCaverns,
 }
 
 /// The one live mesh-distance-grid image (`mesh_sdf_tex` in every
@@ -322,8 +341,10 @@ pub struct MeshSdfImage(pub Handle<Image>);
 /// `TriMeshData::bake_grid`'s deterministic serial loop of exact queries
 /// (~0.2M queries for a 64-cell grid; a one-time scene-build cost).
 pub fn build_mesh_sdf_image(object: &Object) -> Image {
-    let (dims, data): ([u32; 3], Vec<f32>) = match object.find_trimesh() {
-        Some(mesh) => (mesh.grid().dims, mesh.bake_grid()),
+    use marble_csg::object::BakedField;
+    let (dims, data): ([u32; 3], Vec<f32>) = match object.find_baked() {
+        Some(BakedField::Mesh(mesh)) => (mesh.grid().dims, mesh.bake_grid()),
+        Some(BakedField::Noise(noise)) => (noise.grid().dims, noise.bake_grid()),
         None => ([1, 1, 1], vec![1e9]),
     };
     let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
@@ -1218,6 +1239,7 @@ pub fn build_scene(kind: SceneKind, params: &mut Params) -> (Object, SceneHandle
             (object, SceneHandles::Gears(gears_handles))
         }
         SceneKind::Bunny => (bunny(params), SceneHandles::Bunny),
+        SceneKind::NoiseCaverns => (noise_caverns(params), SceneHandles::NoiseCaverns),
     };
     (object, handles, animations)
 }
@@ -1299,6 +1321,18 @@ pub fn setup(
         // (~0.91) out to a ~2.8 orbit that frames bunny + floor.
         camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(0.6, 0.25);
         camera_orbit.zoom = 3.1;
+    }
+    if kind == SceneKind::NoiseCaverns {
+        // High vantage over the 6-unit arena so the rock formations read
+        // as a landscape; the rad-0.12 marble framing (~1.09) zoomed to a
+        // ~5-unit orbit. Pitch matters: the always-on eye sweep
+        // (`smart_camera::solve`'s flag-off branch) stops the camera at
+        // the first obstruction along the view ray, and from the spawn
+        // pocket the surrounding rims (rock tops y = 2 within ~1 unit)
+        // block any ray shallower than ~59 deg -- 1.15 rad clears them
+        // with margin, giving a near-overhead landscape shot.
+        camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(0.7, 1.15);
+        camera_orbit.zoom = 4.6;
     }
     if kind == SceneKind::HollowDonut {
         // A mild yaw/pitch angles the ring's curve into view rather than
