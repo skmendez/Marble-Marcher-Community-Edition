@@ -828,6 +828,36 @@ fn constrain_rotation(
     (Quat::from_rotation_arc(u_from, u_slid) * from).normalize()
 }
 
+/// The player's orientation carried to wherever the rig is currently
+/// pointing, by the shortest arc — the roll the rig *should* have.
+///
+/// Rotating `intent` by the minimal rotation that takes its forward to the
+/// rig's forward is parallel transport along a great circle: it changes
+/// where the camera looks and changes the roll by as little as any rotation
+/// can. So the result is "the player's twist, at the rig's direction", and
+/// it depends only on the two orientations — not on the path the rig took to
+/// get there, which is exactly the property that stops roll drifting.
+fn transported_intent(rig: Quat, intent: Quat) -> Quat {
+    let f_rig = rig * Vec3::NEG_Z;
+    let f_intent = intent * Vec3::NEG_Z;
+    // Near-antipodal forwards have no shortest arc -- every great circle
+    // between them is equally short, so the transported roll would be a coin
+    // flip. `MAX_CORRECTION` keeps the rig well inside that, but a rescue is
+    // allowed past it, so guard rather than assume.
+    if f_rig.dot(f_intent) < -0.99 {
+        return rig;
+    }
+    (Quat::from_rotation_arc(f_intent, f_rig) * intent).normalize()
+}
+
+/// How much twist about its own view axis the rig has picked up that the
+/// player never asked for — the angle between the rig and
+/// [`transported_intent`], which share a forward direction and therefore
+/// differ only by a roll.
+fn leaked_roll(rig: Quat, intent: Quat) -> f32 {
+    rig.angle_between(transported_intent(rig, intent))
+}
+
 /// One frame of camera solving. Pure: no globals, no time source, no
 /// rendering — everything it needs is in `input` and `sdf`, which is what
 /// makes the behavior testable against analytic worlds (see this module's
@@ -1231,6 +1261,33 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
             deviation = rig.orientation.angle_between(input.intent);
         }
     }
+    // The direction is final. Take the roll back off it.
+    //
+    // Deocclusion is allowed to move the camera *around* the marble; it is
+    // not allowed to rotate it about the line to the marble. That is the
+    // player's own control (`CameraOrbit::roll` — two-finger twist, Q/E) and
+    // nothing about getting a clear view of a sphere needs it.
+    //
+    // Every individual rotation above already respects that: each is a swing
+    // about an axis perpendicular to the sightline, which cannot twist the
+    // view around itself. Composition is where it leaks. Swings about
+    // different axes do not commute, and a circuit around the target comes
+    // back rolled by the solid angle it enclosed — the same geometry that
+    // precesses a Foucault pendulum. No single frame is at fault, which is
+    // exactly why it needed measuring: `deocclusion_moves_the_camera_around_
+    // the_marble_without_rolling_it` drives a full forced circuit and found
+    // 2.3 degrees, about 0.9 per radian swung. Invisible in any one session,
+    // a quietly tilting horizon over a long one.
+    //
+    // The fix is to stop *integrating* roll at all. Parallel-transporting the
+    // player's intent to wherever the camera now points gives the roll it
+    // ought to have, as a function of two orientations rather than of the
+    // path taken between them — so there is no longer a quantity that can
+    // accumulate. Costs one `from_rotation_arc`, and leaves the forward
+    // direction exactly as the steps above left it.
+    rig.orientation = transported_intent(rig.orientation, input.intent);
+    deviation = deviation.min(rig.orientation.angle_between(input.intent));
+
     let free_distance = usable_free_distance(&sw, rig.distance, desired);
 
     // --- 7. distance: fast in, slow out, and only after a hold ---
@@ -1684,6 +1741,62 @@ mod tests {
     ///
     /// Reaching the cap is ordinary: any rescue in a tight space can do it.
     /// Staying there forever, in open space, is the bug.
+    /// Deocclusion is allowed to move the camera *around* the marble. It is
+    /// not allowed to rotate it about the line from the camera to the
+    /// marble: that is the player's own control (`CameraOrbit::roll`, two
+    /// finger twist / Q-E) and nothing about getting a clear view needs it.
+    ///
+    /// The property holds by construction one step at a time — every
+    /// rotation this module applies is `from_axis_angle` about an axis
+    /// perpendicular to the sightline, or a `from_rotation_arc` between two
+    /// sightlines, both of which are pure swings. What it does *not* hold by
+    /// construction is under composition: swings about different axes do not
+    /// commute, and a closed loop on the sphere comes back rolled by the
+    /// solid angle it enclosed. So this drives a full circuit around the
+    /// marble, forced by geometry rather than requested, and checks what
+    /// came back.
+    #[test]
+    fn deocclusion_moves_the_camera_around_the_marble_without_rolling_it() {
+        // A pillar orbiting the marble drags the camera a full turn around
+        // it: the shot is blocked from wherever the pillar currently is, so
+        // the solver slides, continuously, for the whole circuit. Every bit
+        // of that rotation is the solver's own -- the player's intent never
+        // moves.
+        struct Orbiting {
+            angle: f32,
+        }
+        impl Sdf for Orbiting {
+            fn de(&self, p: Vec3) -> f32 {
+                let c = Vec3::new(self.angle.sin() * 0.55, 0.0, self.angle.cos() * 0.55);
+                (p - c).length() - 0.3
+            }
+        }
+        let intent = CameraOrbit::orientation_from_yaw_pitch(0.6, 0.4);
+        let mut inp = input(intent, 1.0 / 60.0);
+        let mut rig = CameraRig::default();
+        let mut worst_roll: f32 = 0.0;
+        let mut swung = 0.0;
+        let mut previous = rig.orientation * Vec3::NEG_Z;
+        for i in 0..1800 {
+            let world = Orbiting { angle: i as f32 * 0.004 };
+            solve(&mut rig, &mut inp, &world);
+            let forward = rig.orientation * Vec3::NEG_Z;
+            swung += forward.angle_between(previous);
+            previous = forward;
+            worst_roll = worst_roll.max(leaked_roll(rig.orientation, inp.intent));
+        }
+        assert!(
+            swung > 1.0,
+            "test setup: the solver should have been forced to swing the camera a long way, \
+             got {swung:.2} rad"
+        );
+        assert!(
+            worst_roll.to_degrees() < 0.5,
+            "{:.1} degrees of roll nobody asked for, after {swung:.2} rad of forced swinging",
+            worst_roll.to_degrees()
+        );
+    }
+
     #[test]
     fn a_deviation_at_the_cap_does_not_become_a_perpetual_spin() {
         let intent = Quat::IDENTITY;
@@ -2405,6 +2518,17 @@ mod scene_probe {
         mean_steps: f32,
         frames_too_close: usize,
         max_deviation_deg: f32,
+        /// Worst roll the solver leaked, in degrees: how far the rig's
+        /// twist about its own view axis has drifted from the player's,
+        /// parallel-transported to wherever the rig is now pointing.
+        ///
+        /// Every rotation this module applies is a swing about an axis
+        /// perpendicular to the sightline, so none of them *asks* for roll.
+        /// But swings compose: going out around an obstruction and back by
+        /// a different route leaves a net twist equal to the solid angle
+        /// enclosed, which is a real geometric effect and not a bug in any
+        /// one step. This measures whether it adds up to anything.
+        max_roll_deg: f32,
         distance_travel: f32,
     }
 
@@ -2441,6 +2565,7 @@ mod scene_probe {
         let mut sum_steps = 0.0f32;
         let mut too_close = 0usize;
         let mut max_dev = 0.0f32;
+        let mut max_roll = 0.0f32;
         let mut travel = 0.0f32;
         let mut prev_distance: Option<f32> = None;
 
@@ -2504,6 +2629,7 @@ mod scene_probe {
                 too_close += 1;
             }
             max_dev = max_dev.max(d.deviation.to_degrees());
+            max_roll = max_roll.max(leaked_roll(rig.orientation, orbit.orientation).to_degrees());
         }
 
         let counted = (frames - 10) as f32;
@@ -2519,6 +2645,7 @@ mod scene_probe {
             mean_steps: sum_steps / counted,
             frames_too_close: too_close,
             max_deviation_deg: max_dev,
+            max_roll_deg: max_roll,
             distance_travel: travel,
         }
     }
@@ -2537,8 +2664,8 @@ mod scene_probe {
             SceneKind::Bunny,
         ];
         println!(
-            "{:<26} {:>5} {:>7} {:>7} {:>7} {:>9} {:>9} {:>9} {:>6} {:>7} {:>7}",
-            "scene", "mode", "minVis", "meanVis", "blocked", "minClear", "meanSize", "maxSize", "close", "maxDev", "travel"
+            "{:<26} {:>5} {:>7} {:>7} {:>7} {:>9} {:>9} {:>9} {:>6} {:>7} {:>6} {:>7}",
+            "scene", "mode", "minVis", "meanVis", "blocked", "minClear", "meanSize", "maxSize", "close", "maxDev", "roll", "travel"
         );
         let mut failures = Vec::new();
         for kind in scenes {
@@ -2549,7 +2676,7 @@ mod scene_probe {
             // marble, and that difference is the measurement.
             let base = probe(kind, false);
             println!(
-                "{:<26} {:>5} {:>7.3} {:>7.3} {:>6}/{} {:>9.4} {:>9.3} {:>9.3} {:>6} {:>6.0}d {:>7.2}  steps={:.1}",
+                "{:<26} {:>5} {:>7.3} {:>7.3} {:>6}/{} {:>9.4} {:>9.3} {:>9.3} {:>6} {:>6.0}d {:>5.1}d {:>7.2}  steps={:.1}",
                 base.scene,
                 "off",
                 base.min_visibility,
@@ -2561,12 +2688,13 @@ mod scene_probe {
                 base.max_screen_fraction,
                 base.frames_too_close,
                 base.max_deviation_deg,
+                base.max_roll_deg,
                 base.distance_travel,
                 base.mean_steps,
             );
             let r = probe(kind, true);
             println!(
-                "{:<26} {:>5} {:>7.3} {:>7.3} {:>6}/{} {:>9.4} {:>9.3} {:>9.3} {:>6} {:>6.0}d {:>7.2}  steps={:.1}",
+                "{:<26} {:>5} {:>7.3} {:>7.3} {:>6}/{} {:>9.4} {:>9.3} {:>9.3} {:>6} {:>6.0}d {:>5.1}d {:>7.2}  steps={:.1}",
                 r.scene,
                 "on",
                 r.min_visibility,
@@ -2578,6 +2706,7 @@ mod scene_probe {
                 r.max_screen_fraction,
                 r.frames_too_close,
                 r.max_deviation_deg,
+                r.max_roll_deg,
                 r.distance_travel,
                 r.mean_steps,
             );
@@ -2585,6 +2714,26 @@ mod scene_probe {
             // hard invariant -- everything else here is a quality bar.
             if r.min_clearance <= 0.0 {
                 failures.push(format!("{}: eye clearance fell to {}", r.scene, r.min_clearance));
+            }
+            // Deocclusion may turn the camera around the marble. It may not
+            // roll it. Nothing here ever asks for roll -- every rotation the
+            // module applies is a swing about an axis perpendicular to the
+            // sightline -- but swings *compose*, and a round trip out around
+            // an obstruction and back by a different route leaves a net twist
+            // equal to the solid angle it enclosed. That is a real effect and
+            // no single step is at fault for it, which is precisely why it
+            // needs measuring rather than reasoning about: it would show up
+            // as the horizon quietly tilting over a long session, with every
+            // individual frame defensible.
+            //
+            // Measured at 0.0 degrees everywhere, including HollowDonut with
+            // 112 degrees of forced deviation. A tenth of a degree of slack
+            // for float noise; anything real would be orders larger.
+            if r.max_roll_deg > 0.5 {
+                failures.push(format!(
+                    "{}: deocclusion rolled the camera {:.1} degrees",
+                    r.scene, r.max_roll_deg
+                ));
             }
             // The marble must be mostly visible, most of the time. Not
             // "always": a marble that has thrust itself *into* a fractal

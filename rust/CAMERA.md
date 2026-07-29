@@ -13,7 +13,7 @@ against. It shipped default-*off* pending a play-test and that was a
 mistake; §16 is what it cost.
 Sections 1-5 below are the design as written *before* implementation, kept as
 the record of the reasoning; §11 at the end lists what implementation
-changed, what it measured, and what is still missing; §12-17 are the
+changed, what it measured, and what is still missing; §12-18 are the
 play-test findings that followed, each with the measurement that reproduced
 it. Where any of them disagree with §1-5, the later section is what the code
 does. File/line references in §1-5 are to the pre-implementation code and
@@ -1386,3 +1386,64 @@ what that means in practice — `maxDev` is **0°** in every open scene
 (demo, classic_only, both Mengers, cube_sphere_morph, gears), 17° in bunny,
 and only reaches three figures inside HollowDonut's tube. Outside a genuinely
 tight space, the camera already does not rotate unless asked.
+
+## 18. Roll: we don't need it, and now we don't leak it
+
+Asked after §17: *"why do we need axial rotation to deocclude? I don't mean
+rotation about the marble, that's allowed, I mean rotation about the line
+from the camera to the marble."*
+
+We don't, and no step ever asks for it. Every rotation this module applies
+is either `from_axis_angle` about an axis perpendicular to the sightline
+(the wall-slide constraint, the deocclusion slide, the rescue swing) or
+`from_rotation_arc` between two sightlines (the search). Both are pure
+swings in the swing-twist sense: they move where the camera looks and cannot
+rotate it about its own view direction. `CameraOrbit::drag_rotation` is built
+the same way, deliberately — the arcball rewrite in `camera.rs` exists
+because the old yaw/pitch/roll decomposition kept producing pan-vs-twist
+bugs.
+
+The `twist: 143.6deg` in the reports is not the solver either.
+`DebugTwistAccum` is incremented only at `orbit.roll(...)` call sites — two
+finger twist and Q/E — so it is a running total of roll the *player* asked
+for. The solver never touches it.
+
+### Except under composition
+
+Holding one step at a time is not the same as holding. Swings about
+different axes do not commute, and a closed circuit on the sphere comes back
+rotated about its own axis by the solid angle enclosed — the geometry that
+precesses a Foucault pendulum. Nothing is at fault for it; it is what
+integrating a path of swings *means*.
+
+The nine-scene probe said `0.0°` of leaked roll everywhere, which turned out
+to mean only that its flight paths never swung far enough. Driving a full
+forced circuit — a pillar orbiting the marble, so the shot is blocked from
+wherever it currently is and the solver slides continuously — found **2.3°
+after 2.63 rad of swinging**, about 0.9° per radian. Invisible in a session,
+a quietly tilting horizon over many.
+
+The measure is: parallel-transport the player's intent along the shortest
+arc to wherever the camera is now pointing, and compare. That is "the
+player's twist, at the camera's direction", and the difference is roll
+nobody asked for.
+
+### Stop integrating it
+
+The fix is not to correct the drift but to remove the thing that drifts.
+`transported_intent` is a *function of two orientations*, not of the path
+between them, so adopting it as the camera's orientation each frame — same
+forward as the solver just computed, roll taken from the player's intent —
+leaves no quantity that can accumulate. One `from_rotation_arc` per frame.
+
+Now 0.0° over the same circuit. The probe carries a `roll` column and fails
+above 0.5°, so this cannot quietly come back:
+
+| scene | max deviation | leaked roll |
+|---|---|---|
+| hollow_donut | 112° | 0.0° |
+| bunny | 17° | 0.1° |
+| six open scenes | 0° | 0.0° |
+
+Nothing else moved: same visibility, same clearances, same framing, same
+travel.
