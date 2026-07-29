@@ -499,10 +499,10 @@ pub struct MarcherQuad;
 /// these three handles (render-target resize, or the cubemap finishing its
 /// async load) is what re-prepares this material -- which is exactly the
 /// case where the bind group genuinely must be rebuilt (it holds the old
-/// texture's view). See `marble_csg::codegen::COARSE_TEXTURE_BINDING`'s doc
-/// for a known, environment-specific (llvmpipe-only) crash this exact data
-/// flow triggers in this project's native test sandbox -- not a bug in this
-/// binding/shader.
+/// texture's view). (This doc used to point at
+/// `marble_csg::codegen::COARSE_TEXTURE_BINDING` for an llvmpipe-only crash
+/// supposedly triggered by this data flow; that claim has been retracted as
+/// non-reproducible -- see that doc for what actually crashes llvmpipe.)
 #[derive(Asset, TypePath, Clone)]
 pub struct FineMarcherMaterial {
     pub coarse: Handle<Image>,

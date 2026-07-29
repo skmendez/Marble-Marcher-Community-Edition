@@ -516,29 +516,27 @@ fn rot_zx(p: vec4<f32>, m: mat2x2<f32>) -> vec4<f32> {
 /// many-fine-pixels-wide approximation, so exact sampling loses nothing an
 /// interpolated sample would have given anyway.
 ///
-/// ⚠ Known issue, environment-specific, *not* a bug in this shader: on this
-/// project's llvmpipe (Mesa's software Vulkan renderer, used as this
-/// project's native/CI fallback where no real GPU is available) test
-/// environment, feeding *any* value derived from a texture fetch of this
-/// binding -- via `textureLoad` here, or `textureSample` (tried as a
-/// candidate fix, produced an identical result) -- into the fine march
-/// loop's starting `t` (`march_scene` in `MARCH_CORE`, a 256-iteration
-/// branchy loop) reproducibly segfaults llvmpipe's shader JIT. Root-caused
-/// by careful bisection (see this change's session notes/commit message for
-/// the full trail): naga validates the generated shader without error;
-/// simpler variants (the texture fetch computed but *not* fed to
-/// `march_scene`, or fed into a tiny/trivial loop) run without crashing;
-/// the `MM_MRRM=0` fallback (which never executes this data flow at
-/// runtime, since the `if` guarding it is skipped) never crashes either.
-/// This points at a genuine llvmpipe JIT compiler limitation triggered by
-/// this specific code shape, not a spec violation or logic error -- real
-/// GPU drivers (native Vulkan/Metal/DX12) and the browser WebGPU backend
-/// this project also targets (`--features web`) are a completely different
-/// code path and not expected to share it. Shipped as originally designed
-/// (`textureLoad`, no sampler) since that's the simpler, more obviously
-/// correct approach and switching to `textureSample` bought nothing.
-/// Verify this change's actual on-screen behavior on real GPU hardware or
-/// in a browser build before relying on llvmpipe-only testing.
+/// This doc used to carry a ⚠ warning that feeding a fetch of this binding
+/// into the fine march loop's starting `t` reproducibly segfaulted
+/// llvmpipe's shader JIT, and that `MM_MRRM=0` was needed to avoid it. That
+/// is **retracted -- it does not reproduce**, and it should not be used as a
+/// reason to avoid this data flow. Re-tested on the environment
+/// `scripts/headless_screenshot.sh` pins (Mesa 24.0.5 / LLVM 17):
+/// all seven scenes render correctly with MRRM *on*, both before and after
+/// the change that retested it, and MRRM's output agrees with `?mrrm=0`'s to
+/// within a few silhouette pixels. The dates never supported the original
+/// story either -- the `MM_MRRM=0` workaround predates half the data flow it
+/// was blamed on.
+///
+/// The real llvmpipe failure is unrelated to this binding: Mesa 25.x (LLVM
+/// 20) corrupts memory on `de_scene`'s *dynamically bounded* fold loop,
+/// crashing fractal scenes with MRRM on or off alike while non-fractal
+/// scenes are fine. See `scripts/headless_screenshot.sh`'s header for the
+/// full bisection and why the Mesa version stays pinned.
+///
+/// Read with `textureLoad` (exact texel, no sampler) as originally designed,
+/// since that's the simpler approach and `textureSample` bought nothing when
+/// it was tried.
 const COARSE_TEXTURE_BINDING: &str = "\
 @group(2) @binding(2) var coarse_tex: texture_2d<f32>;
 ";
@@ -1585,11 +1583,10 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
             // is still reduced-iteration) and is untouched. Restoring a
             // shadow-tier warm-start is a reasonable follow-up *if* the
             // coarse pass also goes full-fidelity, since the two changes
-            // share a root cause -- but it is a perf optimization on a code
-            // path this change cannot exercise headlessly (llvmpipe segfaults
-            // on the coarse-texture-fed march loop, so `MM_MRRM=0` is forced
-            // in `scripts/headless_screenshot.sh`), so it is deliberately not
-            // bundled in here.
+            // share a root cause. (This comment previously also claimed the
+            // MRRM path could not be exercised headlessly; that turned out to
+            // be false -- see `COARSE_TEXTURE_BINDING`'s doc -- so a follow-up
+            // can now be verified the same way everything else here is.)
             if (coarse_t > 0.0) {
                 // Back off by roughly one coarse-pixel's angular footprint at
                 // that depth, computed from the coarse pass's *own* resolution

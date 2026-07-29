@@ -10,20 +10,40 @@
 #   rust/scripts/headless_screenshot.sh /tmp/shot.png
 #
 # The Mesa version pin matters: noble-updates' Mesa 25.2.8 (LLVM 20)
-# llvmpipe segfaults executing these generated march shaders even with the
-# MM_MRRM=0 mitigation below (reproduced: JIT-code crash on an llvmpipe-0
-# worker thread), while noble GA's 24.0.5 (LLVM 17) runs them fine --
-# matching the Mesa era this project's original llvmpipe verification used
-# (MILESTONES.md M4/M6). SwiftShader's Vulkan ICD is not an alternative:
-# naga-generated SPIR-V for these shaders crashes its Subzero JIT too, and
-# it also lacks VK_KHR_xlib_surface for presenting under Xvfb.
+# llvmpipe corrupts memory executing these generated shaders, while noble
+# GA's 24.0.5 (LLVM 17) runs them fine -- matching the Mesa era this
+# project's original llvmpipe verification used (MILESTONES.md M4/M6).
+#
+# The trigger is specifically `de_scene`'s *dynamically bounded* fold loop
+# (`Fold::Repeat`'s trip count is a runtime uniform -- the scene's iteration
+# count param). Established by bisection on 25.2.8:
+#   - Only fractal scenes crash. cube_sphere_morph and hollow_donut render
+#     fine; menger_*, demo and classic_only segfault. Both groups still run
+#     `march_scene`'s 256-iteration loop, so it is not loops in general.
+#   - Emitting a compile-time-constant trip count instead of the uniform-
+#     derived one makes every crashing scene render fine.
+#   - Symptom is SIGSEGV on an llvmpipe-0 worker thread with JIT'd frames;
+#     at LP_NATIVE_VECTOR_WIDTH=128 it becomes `malloc(): invalid next size`
+#     instead, i.e. heap corruption rather than a clean fault.
+#   - Not worked around by LP_DEBUG=nopt, GALLIVM_DEBUG=nopt, LP_NUM_THREADS=0
+#     or LP_MAX_SHADER_VARIANTS=1. vkcube runs fine on the same driver, so
+#     lavapipe is not broken generally.
+# The shader itself is valid: naga validates it, Mesa 24/LLVM 17 runs it, and
+# real GPU / browser WebGPU backends run it in production. This looks like an
+# upstream llvmpipe+LLVM 20 codegen bug and is worth reporting as one.
+#
+# SwiftShader's Vulkan ICD is not an alternative: naga-generated SPIR-V for
+# these shaders crashes its Subzero JIT too, and it also lacks
+# VK_KHR_xlib_surface for presenting under Xvfb.
+#
+# NOTE: this script used to force MM_MRRM=0, on the belief that llvmpipe
+# segfaulted when a coarse-texture fetch fed the march loop's starting `t`.
+# That is not reproducible: on the pinned 24.0.5 all scenes render correctly
+# with MRRM *on*, and on 25.2.8 they crash identically with MRRM on or off.
+# MRRM is not implicated either way, so the flag is gone and the headless
+# path now exercises the real (MRRM-enabled) shipping configuration.
 #
 # Flags:
-#  - MM_MRRM=0: llvmpipe's shader JIT reproducibly segfaults when a
-#    coarse-texture fetch feeds a march loop's starting `t` (see
-#    `marble_csg::codegen::COARSE_TEXTURE_BINDING`'s doc). The flag skips
-#    that data flow at runtime in both consumers (fine pass, and the shadow
-#    pass via the same `misc.w` lane). Real GPUs don't need this.
 #  - BEVY_ASSET_ROOT: running the binary directly (not `cargo run`) makes
 #    Bevy fall back to resolving `assets/` next to the *executable*
 #    (target/debug/assets, which doesn't exist), silently breaking every
@@ -62,7 +82,6 @@ BEVY_ASSET_ROOT="app" \
 MM_SCREENSHOT="$OUT" \
 MM_SCREENSHOT_DELAY_SECS="$DELAY" \
 MM_WINDOW_SIZE="$SIZE" \
-MM_MRRM=0 \
 WGPU_BACKEND=vulkan \
 xvfb-run -a target/debug/marble-marcher-bevy
 
