@@ -95,17 +95,18 @@ pub struct Config {
     /// on top (`Settings.h`'s `exposure`/`auto_exposure_*`); this is the
     /// fixed-value starting point.
     pub exposure: f32,
-    /// `?smartcam=1`/`MM_SMARTCAM=1` enables the geometry-aware half of the
-    /// camera (`smart_camera.rs`): deocclusion, clearance pull-in, damping,
-    /// FOV compensation.
+    /// `?smartcam=0`/`MM_SMARTCAM=0` *disables* the geometry-aware half of
+    /// the camera (`smart_camera.rs`): deocclusion, clearance pull-in,
+    /// damping, the wall-slide rotation constraint, FOV compensation.
     ///
-    /// **Default off**, pending a play-test -- it changes how the camera
-    /// *moves*, which is the kind of change that has to be felt rather than
-    /// measured, and the measurements it does have
-    /// (`smart_camera::scene_probe`) only establish that it keeps the marble
-    /// visible and the eye out of the geometry, not that it feels good. Off,
-    /// the camera tracks the player's intent exactly and instantly, as it
-    /// always did.
+    /// **Default on.** It shipped default-off pending a play-test, and that
+    /// cost four rounds of feedback: every report was against the *baseline*
+    /// path, which by design has no rotation constraint, no damping and no
+    /// distance floor, so each one read as "the fix did nothing". A flag
+    /// whose whole purpose is to be play-tested has to be on to be
+    /// play-tested. `?smartcam=0` is the way back, and the debug overlay now
+    /// names the active mode so which one you are looking at is never again
+    /// something to deduce from the numbers.
     ///
     /// One thing changes either way: distance comes from the framing rule
     /// (marble sized to the screen, `smart_camera::framing_distance`) rather
@@ -156,9 +157,9 @@ impl Config {
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| *v > 0.0)
                 .unwrap_or(1.0),
-            smart_camera: matches!(
+            smart_camera: !matches!(
                 query_value("smartcam", "MM_SMARTCAM").as_deref(),
-                Some("1") | Some("true")
+                Some("0") | Some("false")
             ),
             autopilot: query_value("autopilot", "MM_AUTOPILOT").as_deref() == Some("1"),
             material_gamma: query_value("material_gamma", "MM_MATERIAL_GAMMA")
@@ -174,7 +175,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mrrm_and_shadow_lod_default_on_everything_else_defaults_off() {
+    fn mrrm_shadow_lod_and_smartcam_default_on_everything_else_defaults_off() {
         // Can't exercise `query_param`/`env::var` themselves in a unit test
         // (native `std::env::var` reads real process state, wasm
         // `query_param` reads a real page URL) -- this just pins the
@@ -190,7 +191,7 @@ mod tests {
         assert!(value != Some("1")); // adaptive_res
         assert!(value != Some("1")); // gpuprofile
         assert!(value != Some("1")); // stepheat
-        assert!(!matches!(value, Some("1") | Some("true"))); // smartcam
+        assert!(!matches!(value, Some("0") | Some("false"))); // smartcam's "default on"
         assert!(value != Some("1")); // autopilot
     }
 

@@ -6,13 +6,14 @@ view of the marble, frames it at a sensible size, moves like a drone operator
 rather than a rigidly-attached boom, and still does exactly what the player
 asks it to.
 
-**Status: implemented, shipped behind `?smartcam=1`/`MM_SMARTCAM=1`**
-(`app/src/smart_camera.rs`, `csg/src/visibility.rs`). Off by default pending
-a play-test: the framing rule (§4.2) is on either way, the geometry-aware
-behaviors need the flag.
+**Status: implemented and on by default** (`app/src/smart_camera.rs`,
+`csg/src/visibility.rs`). `?smartcam=0`/`MM_SMARTCAM=0` falls back to the
+framing rule alone, which is the A/B baseline the probe harness measures
+against. It shipped default-*off* pending a play-test and that was a
+mistake; §16 is what it cost.
 Sections 1-5 below are the design as written *before* implementation, kept as
 the record of the reasoning; §11 at the end lists what implementation
-changed, what it measured, and what is still missing; §12-15 are the
+changed, what it measured, and what is still missing; §12-16 are the
 play-test findings that followed, each with the measurement that reproduced
 it. Where any of them disagree with §1-5, the later section is what the code
 does. File/line references in §1-5 are to the pre-implementation code and
@@ -1215,3 +1216,90 @@ kept separate from §14's zoom-1 test precisely because the zoom-1 test is
 the one that said everything was fine.
 
 The nine-scene probe is again unchanged to three decimals.
+
+## 16. The flag was off
+
+Fourth report of the same thing, against build `fa215a9f`:
+
+```
+bunny: vis 1.00 d 3.016/3.016 (free 3.016) size 0.090 dev 0deg f 1.50
+bunny: vis 1.00 d 1.390/3.016 (free 1.390) size 0.195 dev 0deg f 1.50
+bunny: vis 0.00 d 0.150/3.016 (free 0.117) size 2.424 dev 0deg f 1.50
+```
+
+Simulating the *baseline* path (`smart: false`) with those exact numbers —
+marble centre 0.102 above the plane, radius 0.10, zoom 3.10, 384x694 —
+reproduces them:
+
+| | reported | `smart: false` |
+|---|---|---|
+| jammed distance | 0.150 | 0.150 |
+| marble size | 2.424 | 2.425 |
+| focal length | 1.50 | 1.50 |
+| deviation | 0° | 0° |
+
+With `smart: true` the same drag holds at 1.38° under the horizon and
+2.792 of a 3.017 framing distance, for 600 frames.
+
+**The smart camera was off in every screenshot of every round.** It shipped
+behind `?smartcam=1` (§8's phasing, and the instruction was "merge it under
+a flag"), and nothing in the overlay said which camera was running. Three
+tells were there — `d` exactly equal to `free` on every frame, `dev` pinned
+at 0°, `f` never widening — but they are three inferences about absent
+behavior, which is not a thing anyone should have to notice.
+
+So the flag now defaults **on** (`?smartcam=0` reverts), and the overlay's
+camera line starts with `smartcam` or `basiccam`. A flag whose purpose is to
+be play-tested has to be on to be play-tested, and a screenshot has to say
+which build took it — the same lesson as §12's commit hash, learned again
+one level up.
+
+### What the reports were actually describing
+
+Worth being precise, because it changes what §14 and §15 were: the baseline
+path is `distance = min(desired, free_distance)`, clamped to
+`1.5 * marble_radius`. No rotation constraint, no damping, no floor. It is
+*designed* to dolly straight at whatever the sweep reports, and against a
+plane the sweep correctly reports a free distance that goes to nothing as
+the view tilts under the horizon.
+
+That does not make §13-§15 wrong — the sweep is shared, so the phantom
+obstruction of §13 and the grazing-stall blindness of §14/§15 were real bugs
+affecting both paths, and each is fixed and tested. But the *symptom* being
+reported was the baseline's missing constraint, which no amount of fixing
+the sweep was ever going to address. Four rounds of increasingly precise
+answers to a question nobody had asked.
+
+### A floor, rather than more mechanisms
+
+The fourth report also said what it wanted: *"I want something that ensures
+we stay a certain distance away from the marble."*
+
+Everything protecting the shot until now was a *mechanism* with a local
+justification for yielding — the wall-slide constraint yields where it
+cannot resolve a slide direction, the searches yield to their commitment
+timers, the deviation cap yields to the player — and the distance solve
+silently absorbed the sum. That is why each round landed somewhere
+different: the failure was always at whichever link was weakest that day.
+
+`MIN_FRAMING_FRACTION` bounds the outcome instead of the causes: the dolly's
+goal never goes below 45% of the framing distance, so the marble never
+exceeds about 2.2x its target size. Exactly one thing may override it —
+step 8's eye-clearance backstop, when standing at the floor would put the
+eye inside a wall, which is an argument with no counter. `the_eye_never_
+enters_geometry_across_a_long_randomised_run` now also asserts that
+conditional directly: whenever the camera is inside the floor, standing at
+the floor must have been impossible, and it may not *settle* there in any
+case.
+
+It helps most where things are tightest. HollowDonut, solver on:
+
+| | before | after |
+|---|---|---|
+| min eye clearance | 0.0095 | 0.0285 |
+| mean marble size | 0.461 | 0.429 |
+| max deviation | 164° | 112° |
+| distance travel | 2.20 | 3.42 |
+
+More dolly travel, which is the honest cost of a floor in a space that is
+genuinely too small for the shot. Everything else is unchanged.

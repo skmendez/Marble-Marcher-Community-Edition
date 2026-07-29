@@ -246,6 +246,24 @@ const WALL_COMFORT_FRACTION: f32 = 0.85;
 /// the marble still can, via the dolly, because that is a real occlusion and
 /// the camera must answer it.
 const WALL_FLOOR_FRACTION: f32 = 0.6;
+/// The hard floor on how close the dolly may bring the camera, as a fraction
+/// of the framing distance — "stay a certain distance away from the marble",
+/// stated as a bound rather than hoped for as an emergent property.
+///
+/// Everything else that protects the shot is a mechanism with a local
+/// justification for yielding: the wall-slide constraint yields where it
+/// cannot resolve a slide direction, the searches yield to their commitment
+/// timers, the deviation cap yields to the player. Each yield is defensible
+/// on its own and the distance solve silently absorbs the sum of them, which
+/// is how four separate rounds of "the camera is still getting way too
+/// close" all ended somewhere different. This bounds the outcome instead of
+/// the causes.
+///
+/// `0.45` puts the marble at most ~2.2x its target size — noticeably close,
+/// clearly deliberate, nothing like filling the frame. Only step 8's
+/// eye-clearance backstop may go below it, and only to keep the eye out of a
+/// wall.
+const MIN_FRAMING_FRACTION: f32 = 0.45;
 /// Finite-difference angle for estimating which way clearance improves
 /// (radians, ~3 degrees). Big enough to read past `de` noise on fractal
 /// surfaces, small enough to still be a local gradient.
@@ -1214,7 +1232,25 @@ pub fn solve(rig: &mut CameraRig, input: &mut SolveInput, sdf: &impl Sdf) {
     let free_distance = usable_free_distance(&sw, rig.distance, desired);
 
     // --- 7. distance: fast in, slow out, and only after a hold ---
-    let goal = desired.min(free_distance).max(min_distance);
+    //
+    // `keep_away` is the floor under all of it: whatever geometry says, the
+    // dolly does not go inside this. Everything above it -- the wall-slide
+    // constraint, the searches, the deviation cap -- is a mechanism that
+    // *tends* to preserve the shot, and the reported failures were all cases
+    // where some mechanism had a defensible local reason to yield and the
+    // distance quietly absorbed the result. A floor is not a mechanism; it
+    // is the property those mechanisms are for, asserted directly, so that
+    // the worst case is bounded by construction rather than by the weakest
+    // link in a chain of heuristics.
+    //
+    // It is not absolute, and cannot be: the eye-clearance backstop in step
+    // 8 still overrides it, down to `min_distance`. That is the one argument
+    // that beats "stay this far back" -- the alternative to being too close
+    // is being inside a wall, and there is no third option. But it is now
+    // the *only* argument that does, and it is one the player can see the
+    // reason for.
+    let keep_away = (MIN_FRAMING_FRACTION * desired).max(min_distance);
+    let goal = desired.min(free_distance).max(keep_away);
     // The hold keys off the goal *tightening*, not off the camera being
     // short of it. Keying it off "is there room ahead of me" instead reads a
     // camera sitting exactly at a stable goal as having room to grow, so the
@@ -1765,6 +1801,7 @@ mod tests {
         let mut rig = CameraRig::default();
         let mut orbit = CameraOrbit { orientation: Quat::IDENTITY, zoom: 1.0 };
         let mut worst = f32::INFINITY;
+        let mut stuck_inside = 0u32;
         for i in 0..1200 {
             let t = i as f32 / 60.0;
             // Down the corridor between two columns of pillars, weaving
@@ -1791,6 +1828,35 @@ mod tests {
             // distance before it has ever seen the geometry.
             if i > 10 {
                 worst = worst.min(rig.debug.eye_clearance);
+                // The keep-away floor, stated as the conditional it actually
+                // is: the dolly may only be inside it when standing at it
+                // would have put the eye inside geometry. That is the one
+                // argument allowed to beat "stay this far back", and this
+                // pins that it is the *only* one -- a heuristic that yields
+                // for some other locally-defensible reason shows up here.
+                //
+                // "Does not *settle* inside it" rather than "is never inside
+                // it": the floor bounds the dolly's goal, and the realized
+                // distance approaches that goal through a hold
+                // (`PUSH_OUT_HOLD`) and a spring (`PUSH_OUT_TAU`), so a beat
+                // spent inside the floor on the way back out is the damping
+                // working. Coming to rest in there is the failure.
+                let keep_away =
+                    (MIN_FRAMING_FRACTION * rig.debug.desired_distance).max(0.15 * 1.5);
+                let at_floor = rig.focus - (rig.orientation * Vec3::NEG_Z) * keep_away;
+                let room_at_floor = Pillars.de(at_floor);
+                if rig.distance < keep_away - 1e-4 && room_at_floor >= rig.debug.camera_radius {
+                    stuck_inside += 1;
+                    assert!(
+                        stuck_inside < 120,
+                        "frame {i}: {:.1}s at {:.3}, inside the {keep_away:.3} floor, with \
+                         {room_at_floor:.3} of clearance going spare there",
+                        stuck_inside as f32 / 60.0,
+                        rig.distance
+                    );
+                } else {
+                    stuck_inside = 0;
+                }
             }
         }
         assert!(worst > 0.0, "the eye entered geometry (worst clearance {worst})");

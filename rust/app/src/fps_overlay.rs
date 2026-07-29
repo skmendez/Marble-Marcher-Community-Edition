@@ -394,9 +394,16 @@ fn update_orbit_debug_text(
     // how far the realized camera has had to deviate from the player's
     // intent, and how much clearance the eye itself has (negative would mean
     // the camera is inside geometry, i.e. a broken invariant).
+    //
+    // The mode is on the front of the line because leaving it off cost four
+    // rounds of bug reports: `?smartcam=0` and `?smartcam=1` produce
+    // *plausible* readouts either way, and telling them apart meant noticing
+    // that `d` exactly equalled `free` on every frame. A screenshot has to
+    // say which camera took it.
     let d = rig.debug;
     let camera_line = format!(
-        "{}: vis {:.2} d {:.3}/{:.3} (free {:.3}) size {:.3} dev {:.0}deg clr {:.3}/q{:.3} f {:.2} zoom {:.2} steps {}",
+        "{} {}: vis {:.2} d {:.3}/{:.3} (free {:.3}) size {:.3} dev {:.0}deg clr {:.3}/q{:.3} f {:.2} zoom {:.2} steps {}",
+        if config.smart_camera { "smartcam" } else { "basiccam" },
         config.scene.name(),
         d.visibility,
         rig.distance,
