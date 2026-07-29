@@ -71,6 +71,18 @@ use crate::touch::read_two_finger_gesture;
 #[derive(Resource)]
 pub struct MarbleState {
     pub marbles: Vec<Marble>,
+    /// The previous *fixed tick's* marble list, kept solely so rendering can
+    /// interpolate between the two at the display's own rate
+    /// (`interpolate_render_marbles`). Physics never reads this -- the
+    /// simulation still consumes exact tick states, so determinism and
+    /// rollback are untouched.
+    ///
+    /// Maintained through [`MarbleState::advance_to`] (continuous motion --
+    /// interpolate) and [`MarbleState::snap_to`] (a discontinuity: respawn,
+    /// resync adoption, scene change -- do *not* interpolate across it, or
+    /// the marble visibly smears from its old position to its new one over
+    /// the following frame).
+    pub prev_marbles: Vec<Marble>,
     pub cfg: PhysicsConfig,
     pub start_positions: Vec<Vec3>,
     pub kill_y: f32,
@@ -88,6 +100,110 @@ impl MarbleState {
     pub fn local_marble(&self) -> Marble {
         self.marbles[self.local_player_index]
     }
+
+    /// Adopt a newly simulated tick's marble list, keeping the outgoing one
+    /// as the render-interpolation source. For the *continuous* case only --
+    /// i.e. the normal `RollbackSim::advance` result, where the marble moved
+    /// from `prev_marbles` to `marbles` under physics and interpolating
+    /// between them is exactly right.
+    pub fn advance_to(&mut self, next: Vec<Marble>) {
+        self.prev_marbles = std::mem::replace(&mut self.marbles, next);
+    }
+
+    /// Adopt a marble list that is *not* continuous with the current one --
+    /// a respawn, a resync adoption from the host, or a scene change. Sets
+    /// both lists, so the next frame renders the new state outright instead
+    /// of sliding into it from wherever the marble used to be.
+    pub fn snap_to(&mut self, next: Vec<Marble>) {
+        self.prev_marbles = next.clone();
+        self.marbles = next;
+    }
+}
+
+/// The marble list *as rendered this frame* -- [`MarbleState::prev_marbles`]
+/// and [`MarbleState::marbles`] interpolated by the fixed timestep's
+/// leftover fraction, recomputed once per frame by
+/// [`interpolate_render_marbles`].
+///
+/// Physics runs at a fixed 60 Hz (`Time::<Fixed>::from_hz(60.0)` in
+/// `main.rs`) while the display can refresh far faster -- 120 Hz on the Mac
+/// this was reported from. Without interpolation every simulated position is
+/// held for two consecutive frames at 120 Hz, so consecutive frames are
+/// near-duplicates and the motion reads as a doubled/stuttering image. That
+/// affects more than the marble itself: the camera target is derived from
+/// the local marble's position, so the *entire* view inherited the 60 Hz
+/// staircase.
+///
+/// The smart camera made it worse rather than causing it. `smart_camera_solve`
+/// already runs per-frame on `time.delta_secs()`, so its own damping is
+/// smooth at the display rate -- but it was damping toward a target that
+/// stepped at 60 Hz, which puts two different motion rates in one image and
+/// makes the stepping far more legible than a rigid marble-locked rig did
+/// (there, marble and camera stepped together).
+///
+/// Everything that is *rendering* now reads this: the camera solver
+/// (`smart_camera_solve`), the uniforms/marble buffer (`render::
+/// update_frame_data`), and the debug gizmos. Everything that is
+/// *simulation* keeps reading [`MarbleState`]/`RollbackSim` exactly as
+/// before, so tick states stay bit-exact and rollback/determinism are
+/// untouched -- this is a presentation-layer resource only.
+#[derive(Resource)]
+pub struct RenderMarbles {
+    pub marbles: Vec<Marble>,
+}
+
+impl RenderMarbles {
+    /// The local player's marble, at its interpolated render position.
+    /// Mirrors [`MarbleState::local_marble`]'s indexing.
+    pub fn local_marble(&self, local_player_index: usize) -> Marble {
+        self.marbles[local_player_index.min(self.marbles.len().saturating_sub(1))]
+    }
+}
+
+/// Blends `prev_marbles` -> `marbles` by `Time<Fixed>::overstep_fraction()`
+/// into [`RenderMarbles`], once per frame, before anything that renders
+/// reads a marble position.
+///
+/// This *interpolates* (renders between the last two simulated states)
+/// rather than extrapolating past the newest one. The tradeoff is a fixed
+/// one-tick presentation delay -- ~16.7 ms at 60 Hz, about 8 ms more than
+/// the uninterpolated average -- bought in exchange for motion that is
+/// exactly smooth and never overshoots. Extrapolating (`cur + (cur - prev) *
+/// alpha`) would remove the delay but visibly overshoot and snap back on
+/// every wall bounce, which in a game about bouncing off walls is the worse
+/// artifact. It is a one-line change here if the added latency ever reads
+/// worse than the overshoot would.
+///
+/// Only positions are blended. Velocity and the debug thrust vector are left
+/// at the current tick's values: nothing renders them as a continuous
+/// quantity (the gizmos draw thrust as a direction, and a lerped velocity
+/// would be a fabricated number nothing needs). Radius likewise -- it only
+/// changes on discontinuous events, which route through
+/// [`MarbleState::snap_to`] anyway.
+///
+/// A marble-count change (a join) makes the two lists different lengths for
+/// one frame; indices past `prev_marbles`'s end simply render at their
+/// current position, since there is no prior state to blend from.
+pub fn interpolate_render_marbles(
+    fixed_time: Res<Time<Fixed>>,
+    marble_state: Res<MarbleState>,
+    mut render_marbles: ResMut<RenderMarbles>,
+) {
+    let alpha = fixed_time.overstep_fraction();
+    render_marbles.marbles.clear();
+    blend_marbles(&marble_state.prev_marbles, &marble_state.marbles, alpha, &mut render_marbles.marbles);
+}
+
+/// The blend itself, split out from [`interpolate_render_marbles`] so it's
+/// unit-testable without a `World`: writes `prev` -> `cur` interpolated by
+/// `alpha` into `out`. `alpha` is clamped, so a `Time<Fixed>` that has
+/// somehow overstepped a whole timestep can't extrapolate past `cur`.
+pub fn blend_marbles(prev: &[Marble], cur: &[Marble], alpha: f32, out: &mut Vec<Marble>) {
+    let a = alpha.clamp(0.0, 1.0);
+    out.extend(cur.iter().enumerate().map(|(i, c)| match prev.get(i) {
+        Some(p) => Marble { pos: p.pos.lerp(c.pos, a), ..*c },
+        None => *c,
+    }));
 }
 
 /// The live [`RollbackSim`] + its [`WebRtcTransport`] once connected —
@@ -390,6 +506,86 @@ fn request_resync_on_window_exceeded(mp: &mut MultiplayerSession, role: Role) {
 }
 
 #[cfg(test)]
+mod render_interpolation_tests {
+    use super::*;
+    use marble_csg::physics::Marble;
+
+    fn marble_at(x: f32) -> Marble {
+        Marble { pos: Vec3::new(x, 0.0, 0.0), vel: Vec3::ZERO, rad: 0.1, last_thrust: Vec3::ZERO }
+    }
+
+    fn blend(prev: &[Marble], cur: &[Marble], alpha: f32) -> Vec<Marble> {
+        let mut out = Vec::new();
+        blend_marbles(prev, cur, alpha, &mut out);
+        out
+    }
+
+    #[test]
+    fn blend_walks_from_prev_to_cur_across_the_timestep() {
+        let prev = vec![marble_at(0.0)];
+        let cur = vec![marble_at(10.0)];
+        assert_eq!(blend(&prev, &cur, 0.0)[0].pos.x, 0.0);
+        assert_eq!(blend(&prev, &cur, 0.5)[0].pos.x, 5.0);
+        assert_eq!(blend(&prev, &cur, 1.0)[0].pos.x, 10.0);
+    }
+
+    #[test]
+    fn blend_never_extrapolates_past_the_current_tick() {
+        // A `Time<Fixed>` that overstepped a whole timestep must not fling
+        // the marble beyond the state physics actually simulated.
+        let prev = vec![marble_at(0.0)];
+        let cur = vec![marble_at(10.0)];
+        assert_eq!(blend(&prev, &cur, 2.5)[0].pos.x, 10.0);
+        assert_eq!(blend(&prev, &cur, -1.0)[0].pos.x, 0.0);
+    }
+
+    #[test]
+    fn a_newly_joined_marble_renders_at_its_current_position() {
+        // One frame after a join the lists differ in length; the new marble
+        // has no prior state to blend from and must not be dropped.
+        let prev = vec![marble_at(0.0)];
+        let cur = vec![marble_at(10.0), marble_at(99.0)];
+        let out = blend(&prev, &cur, 0.5);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].pos.x, 5.0);
+        assert_eq!(out[1].pos.x, 99.0);
+    }
+
+    #[test]
+    fn advance_to_keeps_the_outgoing_tick_as_the_blend_source() {
+        let mut st = MarbleState {
+            prev_marbles: vec![marble_at(0.0)],
+            marbles: vec![marble_at(1.0)],
+            cfg: PhysicsConfig::default(),
+            start_positions: vec![Vec3::ZERO],
+            kill_y: -1e6,
+            local_player_index: 0,
+        };
+        st.advance_to(vec![marble_at(2.0)]);
+        assert_eq!(st.prev_marbles[0].pos.x, 1.0, "prev must be the tick we just left");
+        assert_eq!(st.marbles[0].pos.x, 2.0);
+    }
+
+    #[test]
+    fn snap_to_does_not_interpolate_across_a_teleport() {
+        // A respawn/resync/scene-change must render at the new position
+        // immediately, not slide into it from where the marble used to be.
+        let mut st = MarbleState {
+            prev_marbles: vec![marble_at(0.0)],
+            marbles: vec![marble_at(1.0)],
+            cfg: PhysicsConfig::default(),
+            start_positions: vec![Vec3::ZERO],
+            kill_y: -1e6,
+            local_player_index: 0,
+        };
+        st.snap_to(vec![marble_at(500.0)]);
+        for alpha in [0.0, 0.5, 1.0] {
+            assert_eq!(blend(&st.prev_marbles, &st.marbles, alpha)[0].pos.x, 500.0);
+        }
+    }
+}
+
+#[cfg(test)]
 mod window_exceeded_resync_tests {
     use super::*;
     use marble_csg::scenes::demo_scene;
@@ -578,7 +774,9 @@ fn apply_resync_payload(mp: &mut MultiplayerSession, marble_state: &mut MarbleSt
     // (the old `base + offset` scheme this whole flow replaces): it's
     // just whatever the host said, same as everything else here.
     marble_state.start_positions = mp.sim.marbles().iter().map(|m| m.pos).collect();
-    marble_state.marbles = mp.sim.marbles().to_vec();
+    // Discontinuous: adopting the host's authoritative state can teleport
+    // this client's marble (`snap_to`'s doc).
+    marble_state.snap_to(mp.sim.marbles().to_vec());
 }
 
 #[cfg(test)]
@@ -601,6 +799,7 @@ mod resync_payload_tests {
         mp.joined = true;
         mp.transport = Some(WebRtcTransport::new(Role::Joiner));
         let marble_state = MarbleState {
+            prev_marbles: marbles.clone(),
             marbles: marbles.clone(),
             cfg: PhysicsConfig::default(),
             start_positions: marbles.iter().map(|m| m.pos).collect(),
@@ -854,7 +1053,8 @@ fn marble_physics_tick_impl(
         let idx = marble_state.local_player_index;
         let start = marble_state.start_positions[idx];
         mp.sim.respawn(idx, start);
-        marble_state.marbles = mp.sim.marbles().to_vec();
+        // Discontinuous: a respawn teleports the marble to its start.
+        marble_state.snap_to(mp.sim.marbles().to_vec());
         return;
     }
 
@@ -1102,7 +1302,9 @@ fn marble_physics_tick_impl(
         request_resync_on_window_exceeded(mp, net.role);
     }
     mp.sim.advance(&marble_state.cfg, kill_y, &starts);
-    marble_state.marbles = mp.sim.marbles().to_vec();
+    // The one continuous path: physics moved the marbles one tick, so the
+    // outgoing list becomes the render-interpolation source.
+    marble_state.advance_to(mp.sim.marbles().to_vec());
 
     // Gated on `mp.joined && mp.scene_synced` too: comparing/publishing
     // checksums only makes sense once this is genuinely a synced 2-player

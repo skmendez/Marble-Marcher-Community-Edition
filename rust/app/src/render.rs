@@ -1515,7 +1515,9 @@ pub fn setup(
     let scene = Scene { object, params, animations };
     commands.insert_resource(MultiplayerSession::new_solo(scene, marbles.clone()));
 
+    commands.insert_resource(crate::physics_sys::RenderMarbles { marbles: marbles.clone() });
     commands.insert_resource(MarbleState {
+        prev_marbles: marbles.clone(),
         marbles,
         cfg: PhysicsConfig::default(),
         start_positions,
@@ -1594,7 +1596,8 @@ pub fn load_snapshot_from_url(
     frame.params.extend_from_slice(snapshot.scene.params.slots());
 
     marble_state.start_positions = snapshot.marbles.iter().map(|m| m.pos).collect();
-    marble_state.marbles = snapshot.marbles.clone();
+    // Discontinuous: a scene change relocates every marble.
+    marble_state.snap_to(snapshot.marbles.clone());
     mp.sim.set_scene(snapshot.tick, snapshot.scene, snapshot.marbles);
 
     camera_orbit.orientation = snapshot.camera_orientation;
@@ -1693,7 +1696,8 @@ pub fn apply_pending_scene_sync(
         Some((tick, marbles)) => {
             mp.sim.set_scene(tick, scene, marbles.clone());
             marble_state.start_positions = marbles.iter().map(|m| m.pos).collect();
-            marble_state.marbles = marbles;
+            // Discontinuous: joining adopts the host's marble positions.
+            marble_state.snap_to(marbles);
         }
         None => {
             error!(
@@ -1806,8 +1810,9 @@ const ROTATION_PERIOD_TICKS: u64 = 120;
 #[allow(clippy::too_many_arguments)]
 pub fn update_frame_data(
     time: Res<Time>,
+    fixed_time: Res<Time<Fixed>>,
     rig: Res<CameraRig>,
-    marble_state: Res<MarbleState>,
+    render_marbles: Res<crate::physics_sys::RenderMarbles>,
     mp: Res<MultiplayerSession>,
     config: Res<crate::config::Config>,
     toggles: Res<crate::live_debug::LiveDebugToggles>,
@@ -1824,8 +1829,9 @@ pub fn update_frame_data(
     let start = web_time::Instant::now();
     update_frame_data_impl(
         time,
+        fixed_time,
         rig,
-        marble_state,
+        render_marbles,
         mp,
         config,
         toggles,
@@ -1853,8 +1859,9 @@ pub fn update_frame_data(
 #[allow(clippy::too_many_arguments)] // SystemParam count, one more for the marble-rotation tick source
 fn update_frame_data_impl(
     time: Res<Time>,
+    fixed_time: Res<Time<Fixed>>,
     rig: Res<CameraRig>,
-    marble_state: Res<MarbleState>,
+    render_marbles: Res<crate::physics_sys::RenderMarbles>,
     mp: Res<MultiplayerSession>,
     config: Res<crate::config::Config>,
     toggles: Res<crate::live_debug::LiveDebugToggles>,
@@ -1916,9 +1923,16 @@ fn update_frame_data_impl(
     // same marble at the same phase for the same tick (this fn's own doc).
     // Reduced modulo the period *before* the `f32` cast, not after, so this
     // stays numerically exact no matter how long a session runs.
+    // Advanced by the fixed timestep's leftover fraction as well, for the
+    // same reason the marble's position is (`RenderMarbles`'s doc): a purely
+    // tick-quantized angle visibly steps at 60 Hz on a faster display. The
+    // sub-tick offset is local presentation only -- peers still agree on the
+    // whole-tick phase, which is all `ROTATION_PERIOD_TICKS` determinism ever
+    // meant, and a fraction of one tick of cubemap spin is not an observable
+    // difference between clients.
     let tick_in_period = mp.sim.current_tick() % ROTATION_PERIOD_TICKS;
-    let marble_rotation =
-        tick_in_period as f32 * (std::f32::consts::TAU / ROTATION_PERIOD_TICKS as f32);
+    let marble_rotation = (tick_in_period as f32 + fixed_time.overstep_fraction())
+        * (std::f32::consts::TAU / ROTATION_PERIOD_TICKS as f32);
 
     let base = SceneUniforms {
         cam_pos: eye.extend(0.0),
@@ -2020,9 +2034,13 @@ fn update_frame_data_impl(
     // (`FineMarcherMaterial`; `Coarse`/`ShadowMarcherMaterial` don't bind
     // marbles) gets force-touched exactly on that rare frame (see this fn's
     // doc and `gpu.rs`'s module doc).
-    let marbles_len_changed = frame.marbles.len() != marble_state.marbles.len();
+    // Render (interpolated) positions, not the raw 60 Hz tick positions --
+    // this is what the marble is actually drawn at (`RenderMarbles`'s doc).
+    // The count is the same either way, so the force-touch check is
+    // unaffected by reading it from here.
+    let marbles_len_changed = frame.marbles.len() != render_marbles.marbles.len();
     frame.marbles.clear();
-    frame.marbles.extend(marble_state.marbles.iter().map(|m| m.pos.extend(m.rad)));
+    frame.marbles.extend(render_marbles.marbles.iter().map(|m| m.pos.extend(m.rad)));
     if marbles_len_changed {
         materials.get_mut(&scene_state.material);
     }

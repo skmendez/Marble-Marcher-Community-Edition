@@ -1503,6 +1503,7 @@ pub fn smart_camera_solve(
     config: Res<crate::config::Config>,
     touches: Res<bevy::input::touch::Touches>,
     marble_state: Res<crate::physics_sys::MarbleState>,
+    render_marbles: Res<crate::physics_sys::RenderMarbles>,
     mp: Res<crate::physics_sys::MultiplayerSession>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     mut profile: ResMut<InputProfile>,
@@ -1513,7 +1514,10 @@ pub fn smart_camera_solve(
     if touches.iter().next().is_some() {
         profile.touch_seen = true;
     }
-    let marble = marble_state.local_marble();
+    // The *render* position, not the raw 60 Hz tick position: damping
+    // toward a target that steps at half the display rate is what made the
+    // stutter so legible (`RenderMarbles`'s doc).
+    let marble = render_marbles.local_marble(marble_state.local_player_index);
     let aspect = windows.single().map(|w| w.width() / w.height().max(1.0)).unwrap_or(1.0);
     let scene = mp.sim.scene();
     let sdf = marble_csg::visibility::SceneSdf { object: &scene.object, params: &scene.params };

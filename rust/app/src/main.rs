@@ -45,7 +45,7 @@ use mrrm::{resize_coarse_render_target, setup_mrrm_pipeline, sync_coarse_quad_sc
 use net::{poll_net_status, setup_networking, spawn_net_ui, sync_net_ui_text};
 use param_ui::{param_ui_input, spawn_param_panel, update_param_panel_text};
 use perfprobe::{perfprobe_tick, spawn_perfprobe_overlay, update_perfprobe_overlay_text, PerfProbeState};
-use physics_sys::{marble_physics_tick, PendingSceneSync};
+use physics_sys::{interpolate_render_marbles, marble_physics_tick, PendingSceneSync};
 use render::{
     apply_pending_scene_sync, finalize_marble_cubemap, load_snapshot_from_url,
     oscillate_fine_resolution_tier, resize_fine_render_target, setup,
@@ -352,6 +352,13 @@ fn main() {
                     // very geometry this solves against), and before
                     // `update_frame_data` (so the solved pose reaches this
                     // frame's uniforms rather than landing one frame late).
+                    // Must run before `smart_camera_solve` (which damps
+                    // toward the marble) and before `update_frame_data`
+                    // (which writes the marble buffer): everything that
+                    // renders reads the interpolated positions this
+                    // produces, not the raw 60 Hz tick positions
+                    // (`physics_sys::RenderMarbles`'s doc).
+                    interpolate_render_marbles,
                     smart_camera_solve,
                     // Must run before `update_frame_data`: a same-frame
                     // `mrrm`/view-mode toggle (`live_debug.rs`) needs to
