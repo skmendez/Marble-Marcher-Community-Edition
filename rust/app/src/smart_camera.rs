@@ -2667,6 +2667,7 @@ mod scene_probe {
             SceneKind::Gears,
             SceneKind::Bunny,
             SceneKind::NoiseCaverns,
+            SceneKind::LogoWave,
         ];
         println!(
             "{:<26} {:>5} {:>7} {:>7} {:>7} {:>9} {:>9} {:>9} {:>6} {:>7} {:>6} {:>7}",

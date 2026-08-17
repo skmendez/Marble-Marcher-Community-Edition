@@ -200,6 +200,7 @@ fn build_entries(handles: &SceneHandles, params: &Params) -> Vec<ParamEntry> {
         SceneHandles::Gears(_) => {}
         SceneHandles::Bunny => {}
         SceneHandles::NoiseCaverns => {}
+        SceneHandles::LogoWave(_) => {}
     }
     entries
 }

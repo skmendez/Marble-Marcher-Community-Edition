@@ -102,6 +102,18 @@ pub enum Object {
     /// Serialized payload: 8 bytes (seed + iso) -- every triangle and
     /// lattice value re-derives deterministically on decode.
     NoiseSolid { noise: std::sync::Arc<crate::noise3::NoiseSolidData> },
+    /// The region between two parallel planes: `de = |p[axis]| - half_depth`
+    /// (exact; no C++ counterpart). Unbounded across the other two axes
+    /// (`bounding_sphere` `None`, the `Cylinder`/`Modulo` convention) --
+    /// scenes clip it with `Intersect`. Its reason to exist: `half_depth`
+    /// is a **`ScalarValue`**, so the scalar animation table can drive it
+    /// directly -- `Intersect(prism, Slab)` is an extrusion whose depth
+    /// animates as real geometry, no `Cuboid` `Vec3Value` (not scalar-
+    /// animatable) and no morph-of-two-boxes workaround.
+    Slab {
+        axis: crate::Axis,
+        half_depth: ScalarValue,
+    },
 }
 
 /// A node whose field the shader samples from a baked grid texture
@@ -154,6 +166,7 @@ impl Object {
             // which have their own handles.
             Object::TriMesh { .. } => true,
             Object::NoiseSolid { .. } => true,
+            Object::Slab { half_depth, .. } => half_depth.handle_valid_for(slot_count),
         }
     }
 
@@ -205,6 +218,9 @@ impl Object {
             }
             Object::TriMesh { mesh } => mesh.de(p),
             Object::NoiseSolid { noise } => noise.de(p),
+            Object::Slab { axis, half_depth } => {
+                (p[axis.index()].abs() - half_depth.get(params)) / p.w
+            }
         }
     }
 
@@ -396,6 +412,14 @@ impl Object {
             // Exact: the winning triangle's closest point (capped far
             // from the surface -- physics only ever asks near contact).
             Object::NoiseSolid { noise } => noise.nearest_point(p.truncate()),
+            // Project the axis component onto the nearer face; exact.
+            Object::Slab { axis, half_depth } => {
+                let h = half_depth.get(params);
+                let mut q = p.truncate();
+                let i = axis.index();
+                q[i] = if q[i] >= 0.0 { h } else { -h };
+                q
+            }
         }
     }
 
@@ -513,6 +537,7 @@ impl Object {
             Object::TriMesh { mesh } => Some(mesh.bounding_sphere()),
             // Tiles all of space (periodic), like `Modulo`.
             Object::NoiseSolid { .. } => None,
+            Object::Slab { .. } => None,
         }
     }
 
@@ -588,6 +613,11 @@ impl Object {
                 out.push(12);
                 noise.encode(out);
             }
+            Object::Slab { axis, half_depth } => {
+                out.push(13);
+                axis.encode(out);
+                half_depth.encode(out);
+            }
         }
     }
 
@@ -621,7 +651,8 @@ impl Object {
             Object::Sphere { .. }
             | Object::Cuboid { .. }
             | Object::Torus { .. }
-            | Object::Cylinder { .. } => None,
+            | Object::Cylinder { .. }
+            | Object::Slab { .. } => None,
             Object::Fractal { base, .. } => base.find_baked(),
             Object::Union(a, b)
             | Object::Intersect(a, b)
@@ -708,6 +739,11 @@ impl Object {
             12 => {
                 let (noise, pos) = crate::noise3::NoiseSolidData::decode_at(bytes, pos)?;
                 (Object::NoiseSolid { noise: std::sync::Arc::new(noise) }, pos)
+            }
+            13 => {
+                let (axis, pos) = crate::Axis::decode_at(bytes, pos)?;
+                let (half_depth, pos) = ScalarValue::decode_at(bytes, pos)?;
+                (Object::Slab { axis, half_depth }, pos)
             }
             _ => return None,
         };

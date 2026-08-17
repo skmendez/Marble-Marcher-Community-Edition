@@ -54,10 +54,11 @@ use marble_csg::codegen::generate_shader;
 use marble_csg::expr::Expr;
 use marble_csg::physics::{Marble, PhysicsConfig};
 use marble_csg::scenes::{
-    beware_of_bumps, bunny, classic, cube_sphere_morph, demo_scene, gears, hollow_donut, noise_caverns,
+    beware_of_bumps, bunny, classic, cube_sphere_morph, demo_scene, gears, hollow_donut, logo_wave,
+    noise_caverns,
     menger_oscillating_sphere, menger_sphere, menger_sponge, set_fractal_params,
     set_menger_params, ClassicHandles, CubeSphereMorphHandles, GearsHandles, HollowDonutHandles,
-    MengerHandles, MengerOscillatingSphereHandles, MENGER_BITE_MIN_RADIUS,
+    LogoWaveHandles, MengerHandles, MengerOscillatingSphereHandles, MENGER_BITE_MIN_RADIUS,
 };
 use marble_csg::{Object, Params, ScalarParam, Scene};
 
@@ -131,6 +132,11 @@ pub enum SceneKind {
     /// formations over a floor, physics against the exact |grad d| = 1
     /// isosurface, the whole formation serialized as 8 bytes.
     NoiseCaverns,
+    /// [`marble_csg::scenes::logo_wave`] -- the uploaded SVG logo (diamond
+    /// + two chevrons) extruded into Z, each shape's depth oscillating
+    /// between the diamond's width and twice it, phase-staggered into a
+    /// traveling wave (three `Expr`-driven `Morph` parameters).
+    LogoWave,
 }
 
 /// Marble spawn parameters for a scene: start position, radius, kill-plane
@@ -161,6 +167,7 @@ impl SceneKind {
             Some("gears") => Self::Gears,
             Some("bunny") => Self::Bunny,
             Some("noise_caverns") => Self::NoiseCaverns,
+            Some("logo_wave") => Self::LogoWave,
             _ => Self::MengerOscillatingSphere,
         }
     }
@@ -188,6 +195,7 @@ impl SceneKind {
             Self::Gears => "gears",
             Self::Bunny => "bunny",
             Self::NoiseCaverns => "noise_caverns",
+            Self::LogoWave => "logo_wave",
         }
     }
 
@@ -287,6 +295,14 @@ impl SceneKind {
                 rad: 0.12,
                 kill_y: -5.0,
             },
+            // On the floor, front-right of the logo, outside the deepest
+            // (2-unit) extrusion sweep -- clearance asserted at max depth
+            // by the scene test.
+            Self::LogoWave => MarbleSpawn {
+                start: Vec3::new(0.9, 0.25, 1.5),
+                rad: 0.1,
+                kill_y: -5.0,
+            },
         }
     }
 }
@@ -324,6 +340,9 @@ pub enum SceneHandles {
     /// constants (a change rebuilds the primitive set -- structural, not
     /// a param edit), so nothing to expose.
     NoiseCaverns,
+    /// [`SceneKind::LogoWave`]'s three depth params -- all Expr-animated
+    /// (overwritten every tick), nothing to expose.
+    LogoWave(LogoWaveHandles),
 }
 
 /// The one live mesh-distance-grid image (`mesh_sdf_tex` in every
@@ -1240,6 +1259,13 @@ pub fn build_scene(kind: SceneKind, params: &mut Params) -> (Object, SceneHandle
         }
         SceneKind::Bunny => (bunny(params), SceneHandles::Bunny),
         SceneKind::NoiseCaverns => (noise_caverns(params), SceneHandles::NoiseCaverns),
+        SceneKind::LogoWave => {
+            let (object, h) = logo_wave(params);
+            animations.push((h.left, h.left_anim.clone()));
+            animations.push((h.center, h.center_anim.clone()));
+            animations.push((h.right, h.right_anim.clone()));
+            (object, SceneHandles::LogoWave(h))
+        }
     };
     (object, handles, animations)
 }
@@ -1321,6 +1347,13 @@ pub fn setup(
         // (~0.91) out to a ~2.8 orbit that frames bunny + floor.
         camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(0.6, 0.25);
         camera_orbit.zoom = 3.1;
+    }
+    if kind == SceneKind::LogoWave {
+        // Front-quarter view: enough yaw to read the extrusion depth,
+        // mostly facing the logo plane. The rad-0.1 marble framing
+        // (~0.91) zoomed to a ~3.8-unit orbit frames the 2.1-wide logo.
+        camera_orbit.orientation = CameraOrbit::orientation_from_yaw_pitch(-0.5, 0.2);
+        camera_orbit.zoom = 4.6;
     }
     if kind == SceneKind::NoiseCaverns {
         // High vantage over the 6-unit arena so the rock formations read

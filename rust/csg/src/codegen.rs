@@ -276,6 +276,13 @@ impl CodeWriter {
                 // find_trimesh`'s doc).
                 self.writeln("d = de_mesh(p);");
             }
+            Object::Slab { axis, half_depth } => {
+                let comp = ["x", "y", "z"][axis.index()];
+                self.writeln(&format!(
+                    "d = (abs(p.{comp}) - {}) / p.w;",
+                    half_depth.wgsl()
+                ));
+            }
             Object::NoiseSolid { .. } => {
                 // Same baked-grid arrangement as TriMesh (one baked node
                 // per scene, `Object::find_baked`); the helper is the
@@ -2749,6 +2756,25 @@ struct VertexOutput {
         ] {
             validate_wgsl(&full);
         }
+    }
+
+    #[test]
+    fn slab_emission_and_logo_wave_shader_validate() {
+        let mut params = Params::new();
+        let h = params.alloc_scalar(0.75);
+        let obj = Object::Slab {
+            axis: crate::Axis::Z,
+            half_depth: ScalarValue::Param(h),
+        };
+        let src = generate_scene_functions(&obj);
+        assert!(src.contains("d = (abs(p.z) - params["), "{src}");
+
+        let mut params = Params::new();
+        let (obj, _handles) = scenes::logo_wave(&mut params);
+        validate_wgsl(&full_source(&obj));
+        validate_wgsl(&full_coarse_source(&obj));
+        validate_wgsl(&full_shadow_source(&obj));
+        validate_wgsl(&full_stepdata_source(&obj));
     }
 
     #[test]

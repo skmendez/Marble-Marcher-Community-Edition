@@ -248,6 +248,19 @@ mod tests {
     }
 
     #[test]
+    fn slab_and_logo_wave_round_trip() {
+        let mut params = Params::new();
+        let h = params.alloc_scalar(0.75);
+        assert_object_round_trips(&Object::Slab {
+            axis: Axis::Z,
+            half_depth: ScalarValue::Param(h),
+        });
+        let mut params = Params::new();
+        let (object, _handles) = scenes::logo_wave(&mut params);
+        assert_object_round_trips(&object);
+    }
+
+    #[test]
     fn deeply_nested_tree_round_trips() {
         let nested = Object::Union(
             Box::new(Object::Fractal {

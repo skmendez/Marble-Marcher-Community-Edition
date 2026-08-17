@@ -1002,6 +1002,160 @@ pub fn noise_caverns(_params: &mut Params) -> Object {
     Object::Union(Box::new(floor), Box::new(rock))
 }
 
+/// Parameter handles for [`logo_wave`]: one extrusion **half-depth**
+/// param per shape (left chevron, diamond, right chevron), each
+/// `Expr`-driven on the shared tick clock -- register all three
+/// `(param, anim)` pairs. The params are the [`Object::Slab`] depths
+/// themselves, in world units.
+#[derive(Clone, Debug)]
+pub struct LogoWaveHandles {
+    pub left: ScalarParam,
+    pub left_anim: Expr,
+    pub center: ScalarParam,
+    pub center_anim: Expr,
+    pub right: ScalarParam,
+    pub right_anim: Expr,
+}
+
+/// [`logo_wave`] geometry, derived offline from the source SVG (viewBox
+/// 2041 x 2048) with the diamond's width (742 svg units) as the world
+/// unit and the diamond's bottom tip on the floor: `x_w = (x - 1021.5)/
+/// 742`, `y_w = (1395 - y)/742`. Each chevron decomposes exactly into
+/// two 45-degree-rotated rectangles meeting at its corner (the polygon's
+/// six edges lie on `x + y = const` / `x - y = const` lines); the
+/// diamond is one rotated square. Tuples: (center, half-extents, world
+/// rotation degrees).
+const LOGO_DIAMOND: (Vec2, Vec2, f32) =
+    (Vec2::new(0.0, 0.5), Vec2::new(0.353553, 0.353553), 45.0);
+const LOGO_LEFT_ARMS: [(Vec2, Vec2, f32); 2] = [
+    (Vec2::new(-0.744609, 0.626685), Vec2::new(0.119122, 0.298281), -45.0),
+    (Vec2::new(-0.744609, 0.373315), Vec2::new(0.298281, 0.119122), -45.0),
+];
+const LOGO_RIGHT_ARMS: [(Vec2, Vec2, f32); 2] = [
+    (Vec2::new(0.744609, 0.626685), Vec2::new(0.119122, 0.298281), 45.0),
+    (Vec2::new(0.744609, 0.373315), Vec2::new(0.298281, 0.119122), 45.0),
+];
+
+/// Depth animation: each shape's extrusion depth runs between the
+/// diamond's width (`LOGO_DEPTH_MIN` = 1 world unit by construction) and
+/// twice that, on a 4-second cycle, phase-staggered by a third of a
+/// cycle per shape left to right -- a traveling wave across the logo.
+pub const LOGO_DEPTH_MIN: f32 = 1.0;
+pub const LOGO_DEPTH_MAX: f32 = 2.0;
+const LOGO_WAVE_PERIOD_TICKS: f32 = 240.0;
+/// Far larger than any in-scene coordinate: the prisms' "infinite"
+/// z-extent and the slabs' xy extent.
+const LOGO_BIG: f32 = 8.0;
+const LOGO_DIAMOND_COLOR: Vec3 = Vec3::new(2.2, 1.35, 0.2);
+const LOGO_CHEVRON_COLOR: Vec3 = Vec3::new(0.35, 0.55, 1.9);
+const LOGO_FLOOR_COLOR: Vec3 = Vec3::new(0.22, 0.22, 0.3);
+const LOGO_FLOOR_HALF: Vec3 = Vec3::new(4.0, 0.15, 4.0);
+
+/// One rotated-rectangle prism, extruded along Z "to infinity"
+/// (`LOGO_BIG`; the per-shape slab intersect supplies the real depth).
+fn logo_prism_rect(rect: (Vec2, Vec2, f32)) -> Object {
+    let (center, half, angle_deg) = rect;
+    Object::Fractal {
+        fold: Fold::Series(vec![
+            Fold::ScaleTranslate {
+                scale: ScalarValue::Const(1.0),
+                shift: Vec3Value::Const(Vec3::new(-center.x, -center.y, 0.0)),
+            },
+            // `rotation_mat2(-a)` as a Z-axis fold renders the base
+            // rotated by `+a` in the world XY plane (the fold transforms
+            // the query point, so the rendered object gets the inverse;
+            // verified by the interior/exterior probes in the scene test,
+            // which catch a flipped sign as a ~90-degree-off chevron arm).
+            Fold::Rotate {
+                axis: Axis::Z,
+                mat: Mat2Value::Const(rotation_mat2(angle_deg.to_radians())),
+            },
+        ]),
+        base: Box::new(Object::Cuboid {
+            half_extent: Vec3Value::Const(Vec3::new(half.x, half.y, LOGO_BIG)),
+        }),
+    }
+}
+
+/// One logo shape: its (unioned) prism rectangles, cut by an
+/// [`Object::Slab`] along Z whose `half_depth` is this shape's animated
+/// param -- `Intersect(prism, Slab)` IS a box whose depth is live
+/// geometry (the slab's whole reason to exist; its doc).
+fn logo_shape(rects: &[(Vec2, Vec2, f32)], color: Vec3, half_depth: ScalarParam) -> Object {
+    let mut prism = logo_prism_rect(rects[0]);
+    for r in &rects[1..] {
+        prism = Object::Union(Box::new(prism), Box::new(logo_prism_rect(*r)));
+    }
+    let depth = Object::Slab {
+        axis: Axis::Z,
+        half_depth: ScalarValue::Param(half_depth),
+    };
+    Object::Fractal {
+        fold: Fold::OrbitInit(Vec3Value::Const(color)),
+        base: Box::new(Object::Intersect(Box::new(prism), Box::new(depth))),
+    }
+}
+
+/// The uploaded SVG logo -- a diamond flanked by two chevrons -- extruded
+/// into Z and depth-animated: each shape's extrusion oscillates between
+/// the diamond's width and twice that, a third of a cycle out of phase
+/// with its neighbor, so a wave rolls through the logo left to right.
+pub fn logo_wave(params: &mut Params) -> (Object, LogoWaveHandles) {
+    let omega = std::f32::consts::TAU / LOGO_WAVE_PERIOD_TICKS;
+    // half_depth(t) oscillates between LOGO_DEPTH_MIN/2 and
+    // LOGO_DEPTH_MAX/2: mid 0.75, amplitude 0.25 (world units).
+    let mid = (LOGO_DEPTH_MIN + LOGO_DEPTH_MAX) / 4.0;
+    let amp = (LOGO_DEPTH_MAX - LOGO_DEPTH_MIN) / 4.0;
+    let wave = |phase: f32| {
+        Expr::Add(
+            Box::new(Expr::Const(mid)),
+            Box::new(Expr::Mul(
+                Box::new(Expr::Const(amp)),
+                Box::new(Expr::Sin(Box::new(Expr::Sub(
+                    Box::new(Expr::Mul(Box::new(Expr::Tick), Box::new(Expr::Const(omega)))),
+                    Box::new(Expr::Const(phase)),
+                )))),
+            )),
+        )
+    };
+    let third = std::f32::consts::TAU / 3.0;
+    let (left_anim, center_anim, right_anim) = (wave(0.0), wave(third), wave(2.0 * third));
+    // Initial values match the anims at tick 0 (the standing convention:
+    // the first pre-tick frame must not be briefly wrong).
+    let left = params.alloc_scalar(left_anim.eval(0));
+    let center = params.alloc_scalar(center_anim.eval(0));
+    let right = params.alloc_scalar(right_anim.eval(0));
+    let handles = LogoWaveHandles {
+        left,
+        left_anim,
+        center,
+        center_anim,
+        right,
+        right_anim,
+    };
+
+    let shapes = Object::Union(
+        Box::new(logo_shape(&LOGO_LEFT_ARMS, LOGO_CHEVRON_COLOR, left)),
+        Box::new(Object::Union(
+            Box::new(logo_shape(std::slice::from_ref(&LOGO_DIAMOND), LOGO_DIAMOND_COLOR, center)),
+            Box::new(logo_shape(&LOGO_RIGHT_ARMS, LOGO_CHEVRON_COLOR, right)),
+        )),
+    );
+    let floor = Object::Fractal {
+        fold: Fold::Series(vec![
+            Fold::OrbitInit(Vec3Value::Const(LOGO_FLOOR_COLOR)),
+            Fold::ScaleTranslate {
+                scale: ScalarValue::Const(1.0),
+                shift: Vec3Value::Const(Vec3::new(0.0, LOGO_FLOOR_HALF.y, 0.0)),
+            },
+        ]),
+        base: Box::new(Object::Cuboid {
+            half_extent: Vec3Value::Const(LOGO_FLOOR_HALF),
+        }),
+    };
+    (Object::Union(Box::new(floor), Box::new(shapes)), handles)
+}
+
 /// Writes a full parameter set for the classic fractal tree built by
 /// [`classic`]/[`demo_scene`]. `ang1`/`ang2` are turned into rotation
 /// matrices via [`rotation_mat2`].
@@ -1723,6 +1877,86 @@ mod tests {
 
         // 8-byte noise payload: the whole scene stays tiny on the wire.
         assert!(object.to_bytes().len() < 200, "encoded scene unexpectedly large");
+    }
+
+    /// Sign probes at SVG-derived points (mapped through the same
+    /// transform as the geometry constants), plus the depth wave.
+    #[test]
+    fn logo_wave_matches_the_svg_and_oscillates_depth() {
+        let mut params = Params::new();
+        let (object, handles) = logo_wave(&mut params);
+
+        // svg -> world helper matching the constants' derivation
+        let w = |x: f32, y: f32| Vec2::new((x - 1021.5) / 742.0, (1395.0 - y) / 742.0);
+
+        // Pin all half-depths to the minimum for the planar checks.
+        for h in [handles.left, handles.center, handles.right] {
+            params.set_scalar(h, LOGO_DEPTH_MIN / 2.0);
+        }
+        // Interior points of each polygon (z = 0).
+        for (x, y) in [
+            (1021.5, 1024.0),          // diamond center
+            (560.0, 900.0),            // left chevron upper arm
+            (560.0, 1150.0),           // left chevron lower arm
+            (1483.0, 900.0),           // right chevron upper arm
+            (1483.0, 1150.0),          // right chevron lower arm
+        ] {
+            let p = w(x, y);
+            let d = object.de(Vec4::new(p.x, p.y, 0.0, 1.0), &params);
+            assert!(d < -0.01, "svg point ({x},{y}) should be inside, de={d}");
+        }
+        // Exterior points: gaps beside the diamond, above the top tip,
+        // inside the left chevron's notch.
+        for (x, y) in [
+            (600.0, 1024.0),
+            (1443.0, 1024.0),
+            (1021.5, 600.0),
+            // the notch proper: right of the inner corner (500, 1024)
+            (560.0, 1024.0),
+        ] {
+            let p = w(x, y);
+            let d = object.de(Vec4::new(p.x, p.y, 0.0, 1.0), &params);
+            assert!(d > 0.01, "svg point ({x},{y}) should be outside, de={d}");
+        }
+
+        // Depth is the slab param, exactly: faces at +-half_depth.
+        let center = w(1021.5, 1024.0);
+        let probe = |z: f32, params: &Params| {
+            object.de(Vec4::new(center.x, center.y, z, 1.0), params)
+        };
+        assert!(probe(0.45, &params) < 0.0, "inside min-depth extrusion");
+        assert!(probe(0.55, &params) > 0.0, "outside min-depth extrusion");
+        params.set_scalar(handles.center, LOGO_DEPTH_MAX / 2.0);
+        assert!(probe(0.95, &params) < 0.0, "inside max-depth extrusion");
+        assert!(probe(1.05, &params) > 0.0, "outside max-depth extrusion");
+
+        // The wave: all three anims stay within [min/2, max/2], share the
+        // period, and sit a third of a cycle apart.
+        let anims = [&handles.left_anim, &handles.center_anim, &handles.right_anim];
+        for a in anims {
+            for tick in (0..240).step_by(10) {
+                let v = a.eval(tick);
+                assert!(
+                    (LOGO_DEPTH_MIN / 2.0 - 1e-4..=LOGO_DEPTH_MAX / 2.0 + 1e-4).contains(&v),
+                    "wave out of range: {v}"
+                );
+            }
+            assert!((a.eval(37) - a.eval(37 + 240)).abs() < 1e-3, "period != 240");
+        }
+        // the wave reaches each shape a third of a period after its left
+        // neighbor: center at tick 80 matches left at tick 0, etc.
+        assert!((handles.center_anim.eval(80) - handles.left_anim.eval(0)).abs() < 1e-3);
+        assert!((handles.right_anim.eval(80) - handles.center_anim.eval(0)).abs() < 1e-3);
+        // initial params matched the anims at tick 0
+        assert!((handles.left_anim.eval(0) - 0.75).abs() < 1e-6);
+
+        // Marble spawn (render.rs: (0.9, 0.25, 1.5)) stays clear even at
+        // max depth on every shape.
+        for h in [handles.left, handles.center, handles.right] {
+            params.set_scalar(h, LOGO_DEPTH_MAX / 2.0);
+        }
+        let d = object.de(Vec4::new(0.9, 0.25, 1.5, 1.0), &params);
+        assert!(d > 0.15, "spawn clearance de={d}");
     }
 
     /// CPU physics path: nearest-point queries on the gears scene must be
