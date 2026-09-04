@@ -118,6 +118,34 @@ jobs:
           mv dist/marble-marcher_bg.wasm.opt dist/marble-marcher_bg.wasm
           ls -la dist/marble-marcher_bg.wasm
 
+      # A manifest naming the deploy: the commit it was built from, when, and
+      # a sha256 per file another site would need to run the game. por.bi
+      # embeds this build (its tools/marble.mjs pulls exactly these files
+      # from the deployed site), and without this it has to be told by hand
+      # which commit a deploy came from — the wasm carries MM_COMMIT for the
+      # debug overlay, but a downstream copy should not have to grep a binary
+      # for its own provenance. `built` is the deploy's own clock, not the
+      # commit's; two deploys of one commit are two builds and say so.
+      - name: Write manifest.json
+        working-directory: dist
+        run: |
+          {
+            echo '{'
+            echo "  \"commit\": \"$GITHUB_SHA\","
+            echo "  \"built\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+            echo '  "files": {'
+            first=1
+            for f in marble-marcher.js marble-marcher_bg.wasm $(find assets -type f | sort); do
+              [ $first = 1 ] || echo ','
+              first=0
+              printf '    "%s": "%s"' "$f" "$(sha256sum "$f" | cut -d' ' -f1)"
+            done
+            echo
+            echo '  }'
+            echo '}'
+          } > manifest.json
+          cat manifest.json
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
